@@ -58,7 +58,7 @@ struct Source {
     files: BTreeMap<String, String>,
 }
 
-fn authed(cfg: &CheckConfig, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+pub(crate) fn authed(cfg: &CheckConfig, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
     crate::with_node_secret(request.bearer_auth(&cfg.node_token).header("X-Node-Id", cfg.node_id.to_string()))
 }
 
@@ -69,7 +69,7 @@ fn safe_relative(name: &str) -> bool {
 }
 
 /// 把脚本写成 pytest 能直接收集的 `generated/` 包，返回包所在的目录。
-fn write_package(parent: &Path, files: &BTreeMap<String, String>) -> anyhow::Result<PathBuf> {
+pub(crate) fn write_package(parent: &Path, files: &BTreeMap<String, String>) -> anyhow::Result<PathBuf> {
     let root = parent.join(format!("selfcheck_{}", Uuid::new_v4()));
     let package = root.join("generated");
     std::fs::create_dir_all(package.join("pages")).context("无法创建自检临时目录")?;
@@ -85,17 +85,26 @@ fn write_package(parent: &Path, files: &BTreeMap<String, String>) -> anyhow::Res
 }
 
 /// 环境问题的特征：这些失败发生在脚本本体之前或之后，和脚本对错无关。
-fn environment_failure(output: &str) -> Option<&'static str> {
+pub(crate) fn environment_failure(output: &str) -> Option<&'static str> {
     ["准备前置状态失败", "关房失败"].into_iter().find(|marker| output.contains(marker))
 }
 
-fn tail(text: &str) -> String {
+pub(crate) fn tail(text: &str) -> String {
     let chars: Vec<char> = text.trim().chars().collect();
     chars[chars.len().saturating_sub(DETAIL_CHARS)..].iter().collect()
 }
 
+/// 给人看的结论说明：通过时是 pytest 的最后一行摘要，失败时是退出码加原始输出末尾（规则 7）。
+pub(crate) fn describe(passed: bool, code: Option<i32>, output: &str, case_code: &str, version: i64) -> String {
+    if passed {
+        format!("{}（用例 {case_code}，版本 {version}）", tail(output).lines().last().unwrap_or("通过"))
+    } else {
+        format!("退出码 {}：\n{}", code.map_or_else(|| "未知".into(), |c| c.to_string()), tail(output))
+    }
+}
+
 /// 跑 pytest，返回（退出码，合并后的输出）。超时杀整个进程组并报错。
-async fn run_pytest(cfg: &CheckConfig, root: &Path) -> anyhow::Result<(Option<i32>, String)> {
+pub(crate) async fn run_pytest(cfg: &CheckConfig, root: &Path) -> anyhow::Result<(Option<i32>, String)> {
     let mut spec = SetupSpec::new(&cfg.python, &cfg.automation_dir, &cfg.serial, &cfg.package, &cfg.activity);
     spec.bottom_shift = cfg.bottom_shift;
     spec.audio_dir = cfg.audio_dir.clone();
@@ -170,11 +179,7 @@ pub async fn self_check(cfg: &CheckConfig, script_id: Uuid) -> anyhow::Result<(O
         bail!("{marker}，属于环境问题，脚本保持候选。原始输出：\n{}", tail(&output));
     }
     let passed = code == Some(0);
-    let detail = if passed {
-        format!("{}（用例 {}，版本 {}）", tail(&output).lines().last().unwrap_or("通过"), source.case_code, source.version)
-    } else {
-        format!("退出码 {}：\n{}", code.map_or_else(|| "未知".into(), |c| c.to_string()), tail(&output))
-    };
+    let detail = describe(passed, code, &output, &source.case_code, source.version);
 
     let body = json!({"passed": passed, "detail": detail});
     let response = authed(cfg, client.put(url(&format!("api/scripts/{script_id}/self-check"))?)).json(&body).send().await.context("回报自检结果时连不上平台服务端")?;

@@ -164,6 +164,14 @@ export interface Models {
 
 export type ScriptStatus = "candidate" | "self_check_passed" | "approved" | "rejected" | "retired";
 
+export interface Regression {
+  passed: boolean;
+  serial: string;
+  detail: string;
+  duration_ms: number;
+  created_at: string;
+}
+
 /** 回归脚本的一个版本（只有元数据，不含源码） */
 export interface ScriptRow {
   id: string;
@@ -179,6 +187,7 @@ export interface ScriptRow {
   notes: string;
   status: ScriptStatus;
   status_note: string | null;
+  last_regression: Regression | null;
   created_at: string;
   updated_at: string;
 }

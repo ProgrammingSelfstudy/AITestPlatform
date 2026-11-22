@@ -259,7 +259,8 @@ fn import_from_cli(yaml: &str, device: Option<&str>, database_url: &str) -> Outp
         .current_dir(&dir)
         .env("DATABASE_URL", database_url)
         .env("HAFA_ACCOUNTS_KEY", "ab".repeat(32))
-        .env("RUST_LOG", "warn")
+        // sqlx 在迁移抢咨询锁超过 1 秒时会打慢语句警告：多个测试并行迁移同一个库时必然出现，和被测行为无关
+        .env("RUST_LOG", "warn,sqlx::query=error")
         .args(["import-accounts", "--file"])
         .arg(&file)
         .args(["--project", PROJECT]);
@@ -308,8 +309,8 @@ async fn 导入设备字段覆盖命令行_重导更新绑定且只输出数量(
     );
     let import = |device: Option<&str>| {
         let output = import_from_cli(&yaml, device, &url);
-        assert!(output.status.success(), "导入命令失败");
-        assert!(output.stdout == "已导入 2 个账号\n".as_bytes());
+        assert!(output.status.success(), "导入命令失败（{}）：{}", output.status, String::from_utf8_lossy(&output.stderr));
+        assert!(output.stdout == "已导入 2 个账号\n".as_bytes(), "导入命令的输出不对：{:?}", String::from_utf8_lossy(&output.stdout));
         assert!(output.stderr.is_empty());
     };
     let read_bindings = || {

@@ -120,6 +120,19 @@ export default function ScriptsPage() {
       title: "来源执行", dataIndex: "source_run_id", width: 110,
       render: (id: string) => <a className="run-code-link mono" href={`#/runs/${id}`}>{id.slice(0, 8)}</a>,
     },
+    {
+      title: "最近回归", key: "regression", width: 190,
+      render: (_, row) => {
+        const r = row.last_regression;
+        if (!r) return row.status === "approved" ? <span className="device-model-sub">还没回归过</span> : "—";
+        return (
+          <span className="device-model-cell">
+            <Pill kind={r.passed ? "passed" : "failed"}>{r.passed ? "回归通过" : "回归失败"}</Pill>
+            <span className="device-model-sub mono">{formatDate(r.created_at)} · {r.serial}</span>
+          </span>
+        );
+      },
+    },
     { title: "更新时间", dataIndex: "updated_at", width: 170, render: (t: string) => <span className="mono">{formatDate(t)}</span> },
     {
       title: "操作", key: "actions", width: 150, fixed: "right",
@@ -143,7 +156,7 @@ export default function ScriptsPage() {
           <Typography.Title level={3}>回归脚本</Typography.Title>
           <p className="page-desc">
             通过的执行会生成脚本版本：候选 → 在真机上自检 → 人工获准。只有「已获准」的版本才能被平台选来回归，
-            同一用例同时只有一个获准版本。生成和自检在执行节点上进行，这里只做获准、下线和拒绝的决定。
+            同一用例同时只有一个获准版本。生成、自检和回归在执行节点上用命令行进行（node gen-script / self-check / regress），这里显示结果并做获准、下线和拒绝的决定。
           </p>
         </div>
       </div>
@@ -162,12 +175,18 @@ export default function ScriptsPage() {
             columns={columns}
             dataSource={data}
             pagination={false}
-            scroll={{ x: 960 }}
+            scroll={{ x: 1150 }}
             expandable={{
               expandedRowRender: (row) => (
                 <div className="script-detail">
                   <p><strong>文件：</strong><span className="mono">{row.file_names.join("、")}</span>（依据用例版本 {row.case_version}）</p>
                   {row.notes && <p><strong>生成备注：</strong>{row.notes}</p>}
+                  {row.last_regression && (
+                    <div>
+                      <strong>最近一次回归（{row.last_regression.passed ? "通过" : "失败，可能是产品退化，也可能是脚本随界面改版失效，需要人判断"}，用时 {(row.last_regression.duration_ms / 1000).toFixed(0)} 秒）：</strong>
+                      <pre className="script-note">{row.last_regression.detail}</pre>
+                    </div>
+                  )}
                   {row.status_note && (
                     <div>
                       <strong>状态说明（自检输出和人的决定）：</strong>

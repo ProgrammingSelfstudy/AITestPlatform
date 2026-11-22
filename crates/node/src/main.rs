@@ -54,19 +54,14 @@ async fn gen_script(args: &[String]) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `node self-check <脚本编号> [--serial <设备序列号>]`：在本节点的真机上自检一条候选脚本。
-/// 不花模型额度，但会占用这台手机：先确认节点没有正在这台手机上跑任务。
-/// 序列号默认取 `HAFA_DEVICE_ALLOW`（只有一台时）。没有账号租约，手机上要已经登录好目标账号。
-async fn self_check(args: &[String]) -> anyhow::Result<()> {
-    const USAGE: &str = "用法：node self-check <脚本编号> [--serial <设备序列号>]";
-    let (script, rest) = args.split_first().context(USAGE)?;
-    let script_id: uuid::Uuid = script.parse().context("脚本编号必须是 UUID")?;
+/// 自检和回归共用的配置：真实执行配置加上要用的那台设备。
+/// 序列号取 `--serial`，没给就取 `HAFA_DEVICE_ALLOW`（只有一台时）。
+fn check_config(serial: Option<String>) -> anyhow::Result<node::selfcheck_run::CheckConfig> {
     let allow: Vec<String> = std::env::var("HAFA_DEVICE_ALLOW").unwrap_or_default().split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
-    let serial = match rest {
-        [flag, serial] if flag == "--serial" => serial.clone(),
-        [] if allow.len() == 1 => allow[0].clone(),
-        [] => bail!("没有指定设备：加 --serial，或让 HAFA_DEVICE_ALLOW 只含一台设备"),
-        _ => bail!("{USAGE}"),
+    let serial = match serial {
+        Some(serial) => serial,
+        None if allow.len() == 1 => allow[0].clone(),
+        None => bail!("没有指定设备：加 --serial，或让 HAFA_DEVICE_ALLOW 只含一台设备"),
     };
     let token = std::env::var("NODE_TOKEN").unwrap_or_default();
     if token.is_empty() {
@@ -76,8 +71,8 @@ async fn self_check(args: &[String]) -> anyhow::Result<()> {
     let state_dir = PathBuf::from(std::env::var("NODE_STATE_DIR").unwrap_or_else(|_| "data/node".into()));
     let node_id = node::load_node_id(&state_dir).context("没有找到本节点的 node_id：节点还没有连过服务端，或 NODE_STATE_DIR 不对")?;
     node::load_node_secret(&state_dir);
-    let real = real_config(&NodeConfig::new(ws, token, state_dir))?.context("自检需要 HAFA_PYTHON 等真实执行配置")?;
-    let cfg = node::selfcheck_run::CheckConfig {
+    let real = real_config(&NodeConfig::new(ws, token, state_dir))?.context("需要 HAFA_PYTHON 等真实执行配置")?;
+    Ok(node::selfcheck_run::CheckConfig {
         platform_http: real.platform_http.clone(),
         node_token: real.node_token.clone(),
         node_id,
@@ -91,12 +86,56 @@ async fn self_check(args: &[String]) -> anyhow::Result<()> {
         serial,
         timeout: std::time::Duration::from_secs(15 * 60),
         work_dir: std::env::temp_dir().join("hafa_selfcheck"),
+    })
+}
+
+/// `node self-check <脚本编号> [--serial <设备序列号>]`：在本节点的真机上自检一条候选脚本。
+/// 不花模型额度，但会占用这台手机：先确认节点没有正在这台手机上跑任务。
+/// 没有账号租约，手机上要已经登录好目标账号。
+async fn self_check(args: &[String]) -> anyhow::Result<()> {
+    const USAGE: &str = "用法：node self-check <脚本编号> [--serial <设备序列号>]";
+    let (script, rest) = args.split_first().context(USAGE)?;
+    let script_id: uuid::Uuid = script.parse().context("脚本编号必须是 UUID")?;
+    let serial = match rest {
+        [flag, serial] if flag == "--serial" => Some(serial.clone()),
+        [] => None,
+        _ => bail!("{USAGE}"),
     };
+    let cfg = check_config(serial)?;
     println!("开始在设备 {} 上自检，会占用这台手机，请确认节点没有在它上面跑任务", cfg.serial);
     let (outcome, detail) = node::selfcheck_run::self_check(&cfg, script_id).await?;
     match outcome {
         node::selfcheck_run::Outcome::Passed => println!("自检通过：{detail}\n脚本状态已改为「自检通过」，获准要由人来决定"),
         node::selfcheck_run::Outcome::Rejected => println!("自检失败，脚本已标记为「已拒绝」。原始输出：\n{detail}"),
+    }
+    Ok(())
+}
+
+/// `node regress <用例编号> [--project <项目>] [--serial <设备序列号>]`：用该用例当前已获准的脚本版本在本节点真机上回归，
+/// 结果记到平台。失败是回归的结论，如实记录，不改脚本状态。会占用这台手机。
+async fn regress(args: &[String]) -> anyhow::Result<()> {
+    const USAGE: &str = "用法：node regress <用例编号> [--project <项目，默认 hafa>] [--serial <设备序列号>]";
+    let (case_code, mut rest) = args.split_first().context(USAGE)?;
+    let (mut project, mut serial) = ("hafa".to_string(), None);
+    while let [flag, value, tail @ ..] = rest {
+        match flag.as_str() {
+            "--project" => project = value.clone(),
+            "--serial" => serial = Some(value.clone()),
+            _ => bail!("{USAGE}"),
+        }
+        rest = tail;
+    }
+    if !rest.is_empty() {
+        bail!("{USAGE}");
+    }
+    let cfg = check_config(serial)?;
+    println!("开始在设备 {} 上回归 {project} 的 {case_code}，会占用这台手机，请确认节点没有在它上面跑任务", cfg.serial);
+    let outcome = node::regress_run::regress(&cfg, &project, case_code).await?;
+    if outcome.passed {
+        println!("回归通过（脚本版本 {}）：{}", outcome.version, outcome.detail);
+    } else {
+        println!("回归失败（脚本版本 {}），已如实记录。可能是产品退化，也可能是脚本随界面改版失效，需要人判断。原始输出：\n{}", outcome.version, outcome.detail);
+        std::process::exit(1);
     }
     Ok(())
 }
@@ -113,6 +152,9 @@ async fn main() -> anyhow::Result<()> {
     }
     if args.first().map(String::as_str) == Some("self-check") {
         return self_check(&args[1..]).await;
+    }
+    if args.first().map(String::as_str) == Some("regress") {
+        return regress(&args[1..]).await;
     }
 
     // 令牌必须显式给出；不写日志

@@ -459,3 +459,106 @@ async fn 按项目列出所有脚本_带用例编号和标题_不带源码() {
     let (status, body) = send(&world.app, Method::GET, "/api/projects/不存在的项目/scripts", &[], "").await;
     assert_eq!((status, json_body(&body)), (StatusCode::OK, json!([])));
 }
+
+// ---------------------------------------------------------------- 回归
+
+async fn project_of(world: &World, run: Uuid) -> String {
+    sqlx::query_scalar("select p.name from projects p join test_cases c on c.project_id = p.id where c.id = $1").bind(case_of(world, run).await).fetch_one(world.state.pool()).await.unwrap()
+}
+
+/// 归档、自检通过并获准一条脚本，返回编号。
+async fn approved_script(world: &World, run: Uuid) -> Uuid {
+    let script = archived(world, run).await;
+    self_check_passed(world, script, "ok").await;
+    assert_eq!(human(world, script, "approve", None, Some(REVIEW_TOKEN)).await.0, StatusCode::OK);
+    script
+}
+
+fn regression_body(passed: bool, detail: &str) -> String {
+    json!({"serial": "DEV0", "passed": passed, "detail": detail, "duration_ms": 1234}).to_string()
+}
+
+#[tokio::test]
+async fn 节点取已获准的脚本_没有获准版本是404_要节点认证() {
+    let world = World::new().await;
+    let run = world.run().await;
+    let project = project_of(&world, run).await;
+    let route = format!("/api/projects/{project}/cases/TC-04/approved-script");
+
+    let candidate = archived(&world, run).await;
+    let (status, _) = send(&world.app, Method::GET, &route, &node_headers(world.node), "").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "候选不能被拿去回归");
+    self_check_passed(&world, candidate, "ok").await;
+    let (status, _) = send(&world.app, Method::GET, &route, &node_headers(world.node), "").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "自检通过但没获准也不行");
+
+    human(&world, candidate, "approve", None, Some(REVIEW_TOKEN)).await;
+    let (status, body) = send(&world.app, Method::GET, &route, &node_headers(world.node), "").await;
+    assert_eq!(status, StatusCode::OK, "{}", text(&body));
+    let got = json_body(&body);
+    assert_eq!((got["id"].as_str(), got["version"].as_i64()), (Some(candidate.to_string().as_str()), Some(1)));
+    assert_eq!(got["files"]["test_tc04.py"], "def test_a():\n    assert 1\n");
+
+    assert_eq!(send(&world.app, Method::GET, &route, &[], "").await.0, StatusCode::UNAUTHORIZED);
+    human(&world, candidate, "retire", Some("换新版"), Some(REVIEW_TOKEN)).await;
+    assert_eq!(send(&world.app, Method::GET, &route, &node_headers(world.node), "").await.0, StatusCode::NOT_FOUND, "下线后不能再回归");
+    let (status, _) = send(&world.app, Method::GET, &format!("/api/projects/{project}/cases/TC-99/approved-script"), &node_headers(world.node), "").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn 回归结果只能记在已获准的版本上_页面行带最近一次() {
+    let world = World::new().await;
+    let run = world.run().await;
+    let project = project_of(&world, run).await;
+    let script = archived(&world, run).await;
+    let route = format!("/api/scripts/{script}/regressions");
+    let headers = node_headers(world.node);
+
+    let (status, body) = send(&world.app, Method::PUT, &route, &headers, regression_body(true, "1 passed")).await;
+    assert_eq!(status, StatusCode::CONFLICT, "候选不能记回归");
+    assert!(text(&body).contains("只有已获准"), "{}", text(&body));
+
+    self_check_passed(&world, script, "ok").await;
+    human(&world, script, "approve", None, Some(REVIEW_TOKEN)).await;
+    assert_eq!(send(&world.app, Method::PUT, &route, &headers, regression_body(true, "1 passed in 70s")).await.0, StatusCode::CREATED);
+    let (status, _) = send(&world.app, Method::PUT, &route, &headers, regression_body(false, "AssertionError: 回归了")).await;
+    assert_eq!(status, StatusCode::CREATED, "失败也要如实记下");
+
+    let (_, body) = send(&world.app, Method::GET, &format!("/api/projects/{project}/scripts"), &[], "").await;
+    let last = &json_body(&body)[0]["last_regression"];
+    assert_eq!((last["passed"].as_bool(), last["serial"].as_str(), last["duration_ms"].as_i64()), (Some(false), Some("DEV0"), Some(1234)), "页面显示最近一次：{last}");
+    assert!(last["detail"].as_str().unwrap().contains("回归了"));
+
+    // 没跑过回归的版本是 null
+    let other = archive_another(&world, run, "2").await;
+    let (_, body) = send(&world.app, Method::GET, &format!("/api/projects/{project}/scripts"), &[], "").await;
+    let rows = json_body(&body);
+    let row = rows.as_array().unwrap().iter().find(|r| r["id"].as_str() == Some(other.to_string().as_str())).unwrap();
+    assert!(row["last_regression"].is_null());
+}
+
+#[tokio::test]
+async fn 回归回报的格式和认证() {
+    let world = World::new().await;
+    let run = world.run().await;
+    let script = approved_script(&world, run).await;
+    let route = format!("/api/scripts/{script}/regressions");
+    let headers = node_headers(world.node);
+
+    assert_eq!(send(&world.app, Method::PUT, &route, &[], regression_body(true, "x")).await.0, StatusCode::UNAUTHORIZED);
+    assert_eq!(send(&world.app, Method::PUT, &route, &headers, "not json").await.0, StatusCode::BAD_REQUEST);
+    assert_eq!(send(&world.app, Method::PUT, &route, &headers, json!({"serial": "", "passed": true, "detail": "", "duration_ms": 1}).to_string()).await.0, StatusCode::UNPROCESSABLE_ENTITY, "序列号不能为空");
+    assert_eq!(send(&world.app, Method::PUT, &route, &headers, regression_body(false, &"x".repeat(1801))).await.0, StatusCode::UNPROCESSABLE_ENTITY, "输出超限要拒收，而不是写库时才报错");
+    assert_eq!(send(&world.app, Method::PUT, &route, &headers, json!({"serial": "D", "passed": true, "detail": "", "duration_ms": 1, "extra": 1}).to_string()).await.0, StatusCode::BAD_REQUEST, "未知字段拒绝");
+    assert_eq!(send(&world.app, Method::PUT, &format!("/api/scripts/{}/regressions", Uuid::new_v4()), &headers, regression_body(true, "x")).await.0, StatusCode::NOT_FOUND);
+    let count: i64 = sqlx::query_scalar("select count(*) from script_regressions").fetch_one(world.state.pool()).await.unwrap();
+    assert_eq!(count, 0, "被拒绝的回报不能留下记录");
+
+    // 获准的脚本是项目资产：别的节点也可以拿去在自己的设备上回归，结果记在它名下。
+    let other = Uuid::new_v4();
+    sqlx::query("insert into nodes (id, caps, online) values ($1, '{\"model_sources\":[]}'::jsonb, true)").bind(other).execute(world.state.pool()).await.unwrap();
+    assert_eq!(send(&world.app, Method::PUT, &route, &node_headers(other), regression_body(true, "ok")).await.0, StatusCode::CREATED);
+    let owner: Uuid = sqlx::query_scalar("select node_id from script_regressions").fetch_one(world.state.pool()).await.unwrap();
+    assert_eq!(owner, other);
+}

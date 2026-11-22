@@ -88,6 +88,8 @@ pub enum ScriptError {
     AnotherApproved { version: i32 },
     #[error("这个脚本依据的是用例版本 {script}，用例现在是版本 {current}，用例内容变过，旧脚本不能获准")]
     CaseChanged { script: i32, current: i32 },
+    #[error("脚本的状态是 {}，只有已获准的版本才能记录回归", .0.as_str())]
+    NotApproved(ScriptStatus),
     #[error("数据库错误：{0}")]
     Db(#[from] sqlx::Error),
 }
@@ -353,6 +355,62 @@ pub async fn get(pool: &PgPool, id: Uuid) -> Result<Option<ScriptRecord>, sqlx::
 /// 一个用例的全部脚本版本，新的在前。
 pub async fn list_by_case(pool: &PgPool, case_id: Uuid) -> Result<Vec<ScriptRecord>, sqlx::Error> {
     sqlx::query(concat!("select ", columns!(), " from scripts where case_id = $1 order by version desc")).bind(case_id).fetch_all(pool).await?.iter().map(record).collect()
+}
+
+/// 一次回归的结果。
+#[derive(Debug, Clone, Serialize)]
+pub struct Regression {
+    pub passed: bool,
+    pub serial: String,
+    pub detail: String,
+    pub duration_ms: i32,
+    pub created_at: DateTime<Utc>,
+}
+
+/// 某用例当前已获准的版本及源码。没有获准版本返回 None。
+pub async fn approved_for_case(pool: &PgPool, project: &str, case_code: &str) -> Result<Option<(Uuid, i32, BTreeMap<String, String>)>, sqlx::Error> {
+    let row = sqlx::query(
+        "select s.id, s.version, s.files from scripts s join test_cases c on c.id = s.case_id join projects p on p.id = c.project_id
+         where p.name = $1 and c.code = $2 and s.status = 'approved'",
+    )
+    .bind(project)
+    .bind(case_code)
+    .fetch_optional(pool)
+    .await?;
+    row.map(|row| {
+        let files: serde_json::Value = row.try_get("files")?;
+        Ok((row.try_get("id")?, row.try_get("version")?, serde_json::from_value(files).expect("库里的 files 约束为字符串表")))
+    })
+    .transpose()
+}
+
+/// 记录一次回归。只有已获准的版本可以记；脚本不存在或不是已获准返回对应错误。
+pub async fn record_regression(pool: &PgPool, script_id: Uuid, node_id: Uuid, serial: &str, passed: bool, detail: &str, duration_ms: i32) -> Result<(), ScriptError> {
+    let mut tx = pool.begin().await?;
+    let status: Option<String> = sqlx::query_scalar("select status from scripts where id = $1 for share").bind(script_id).fetch_optional(&mut *tx).await?;
+    let Some(status) = status else { return Err(ScriptError::NotFound) };
+    let from = ScriptStatus::parse(&status).ok_or_else(|| sqlx::Error::Decode(format!("未知的脚本状态：{status}").into()))?;
+    if from != ScriptStatus::Approved {
+        return Err(ScriptError::NotApproved(from));
+    }
+    sqlx::query("insert into script_regressions (script_id, node_id, serial, passed, detail, duration_ms) values ($1, $2, $3, $4, $5, $6)")
+        .bind(script_id).bind(node_id).bind(serial).bind(passed).bind(detail).bind(duration_ms).execute(&mut *tx).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// 每个脚本最近一次回归，按脚本编号。
+pub async fn latest_regressions(pool: &PgPool, script_ids: &[Uuid]) -> Result<std::collections::HashMap<Uuid, Regression>, sqlx::Error> {
+    let rows = sqlx::query(
+        "select distinct on (script_id) script_id, passed, serial, detail, duration_ms, created_at
+         from script_regressions where script_id = any($1) order by script_id, created_at desc",
+    )
+    .bind(script_ids)
+    .fetch_all(pool)
+    .await?;
+    rows.iter()
+        .map(|row| Ok((row.try_get("script_id")?, Regression { passed: row.try_get("passed")?, serial: row.try_get("serial")?, detail: row.try_get("detail")?, duration_ms: row.try_get("duration_ms")?, created_at: row.try_get("created_at")? })))
+        .collect()
 }
 
 /// 取脚本源码（执行节点回归时用）。

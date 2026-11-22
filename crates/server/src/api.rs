@@ -79,6 +79,8 @@ pub(crate) fn routes(app: AppState, paths: Paths) -> Router {
         .route("/api/runs/{id}/script-source", get(crate::scripts_api::source))
         .route("/api/cases/{id}/scripts", get(crate::scripts_api::list))
         .route("/api/projects/{project}/scripts", get(crate::scripts_api::list_project))
+        .route("/api/projects/{project}/cases/{code}/approved-script", get(crate::scripts_api::approved))
+        .route("/api/scripts/{id}/regressions", put(crate::scripts_api::regression))
         .route("/api/scripts/{id}/files", get(crate::scripts_api::files))
         .route("/api/scripts/{id}/self-check", put(crate::scripts_api::self_check))
         .route("/api/scripts/{id}/approve", post(crate::scripts_api::approve).route_layer(authorize_write.clone()))

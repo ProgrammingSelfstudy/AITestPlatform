@@ -192,7 +192,9 @@ fn checked_bind(value: &str, allow_lan: bool) -> anyhow::Result<SocketAddr> {
 async fn main() -> anyhow::Result<()> {
     // 仓库根目录的 .env（已被 git 忽略）里放 DATABASE_URL；环境变量优先
     let _ = dotenvy::dotenv();
+    // 日志写 stderr：stdout 留给 import-cases、import-accounts 等命令的输出，脚本和测试才能只读到命令本身的结果
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
         .init();
 

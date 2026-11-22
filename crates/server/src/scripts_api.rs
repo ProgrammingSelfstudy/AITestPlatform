@@ -85,7 +85,7 @@ pub(crate) async fn put(State(state): State<ApiState>, RoutePath(id): RoutePath<
         Err(e @ (ScriptError::InvalidFiles(_) | ScriptError::HashMismatch(_) | ScriptError::SourceRun(_))) => Err((StatusCode::UNPROCESSABLE_ENTITY, e.to_string())),
         Err(ScriptError::CaseNotFound) => Err(fail(StatusCode::NOT_FOUND, "用例不存在")),
         Err(ScriptError::Db(e)) => Err(internal(&e)),
-        Err(e @ (ScriptError::NotFound | ScriptError::BadTransition { .. } | ScriptError::AnotherApproved { .. } | ScriptError::CaseChanged { .. })) => {
+        Err(e @ (ScriptError::NotFound | ScriptError::BadTransition { .. } | ScriptError::AnotherApproved { .. } | ScriptError::CaseChanged { .. } | ScriptError::NotApproved(_))) => {
             tracing::error!("归档候选时出现不该出现的错误：{e}");
             Err(fail(StatusCode::INTERNAL_SERVER_ERROR, "归档失败"))
         }
@@ -282,12 +282,58 @@ pub(crate) struct ProjectScript {
     case_title: String,
     #[serde(flatten)]
     script: ScriptRecord,
+    /// 最近一次回归，没跑过就是 null
+    last_regression: Option<scripts::Regression>,
 }
 
 /// `GET /api/projects/{project}/scripts`：项目里所有用例的全部脚本版本，只有元数据，不含源码。
 pub(crate) async fn list_project(State(state): State<ApiState>, RoutePath(project): RoutePath<String>) -> Result<Json<Vec<ProjectScript>>, Failure> {
     let rows = scripts::list_by_project(state.app.pool(), &project).await.map_err(|e| internal(&e))?;
-    Ok(Json(rows.into_iter().map(|(case_code, case_title, script)| ProjectScript { case_code, case_title, script }).collect()))
+    let ids: Vec<Uuid> = rows.iter().map(|(_, _, script)| script.id).collect();
+    let mut latest = scripts::latest_regressions(state.app.pool(), &ids).await.map_err(|e| internal(&e))?;
+    Ok(Json(rows.into_iter().map(|(case_code, case_title, script)| ProjectScript { last_regression: latest.remove(&script.id), case_code, case_title, script }).collect()))
+}
+
+/// `GET /api/projects/{project}/cases/{code}/approved-script`：节点取某用例当前已获准的脚本版本和源码，去本机回归。
+/// 没有获准版本返回 404：没有人批准过的脚本不能被拿去回归。
+pub(crate) async fn approved(State(state): State<ApiState>, RoutePath((project, code)): RoutePath<(String, String)>, request: Request) -> Result<Json<serde_json::Value>, Failure> {
+    crate::node_identity(&state.app, request.headers()).await.map_err(|status| (status, String::new()))?;
+    let found = scripts::approved_for_case(state.app.pool(), &project, &code).await.map_err(|e| internal(&e))?;
+    let (id, version, files) = found.ok_or_else(|| fail(StatusCode::NOT_FOUND, "这个用例没有已获准的脚本"))?;
+    Ok(Json(serde_json::json!({"id": id, "version": version, "case_code": code, "files": files})))
+}
+
+/// 节点回报的一次回归结果。
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RegressionReport {
+    serial: String,
+    passed: bool,
+    detail: String,
+    duration_ms: u32,
+}
+
+/// `PUT /api/scripts/{id}/regressions`：节点回报一次回归。只有已获准的版本能记；脚本不必来自这个节点
+/// （获准的脚本是项目资产，任何认证节点都可以拿去在自己的设备上回归），但结果记在回报的节点名下。
+pub(crate) async fn regression(State(state): State<ApiState>, RoutePath(id): RoutePath<String>, request: Request) -> Result<StatusCode, Failure> {
+    let node_id = crate::node_identity(&state.app, request.headers()).await.map_err(|status| (status, String::new()))?;
+    let script_id: Uuid = id.parse().map_err(|_| fail(StatusCode::NOT_FOUND, "没有这个脚本"))?;
+    let bytes = to_bytes(request.into_body(), 64 * 1024).await.map_err(|_| fail(StatusCode::PAYLOAD_TOO_LARGE, "请求体太大"))?;
+    let report: RegressionReport = serde_json::from_slice(&bytes).map_err(|_| fail(StatusCode::BAD_REQUEST, "请求格式不对"))?;
+    if report.detail.chars().count() > MAX_DETAIL_CHARS || report.serial.trim().is_empty() || report.serial.chars().count() > 128 {
+        return Err(fail(StatusCode::UNPROCESSABLE_ENTITY, "设备序列号为空，或输出太长（最多 1800 字）"));
+    }
+    let duration = i32::try_from(report.duration_ms).map_err(|_| fail(StatusCode::UNPROCESSABLE_ENTITY, "耗时不合理"))?;
+    match scripts::record_regression(state.app.pool(), script_id, node_id, &report.serial, report.passed, &report.detail, duration).await {
+        Ok(()) => Ok(StatusCode::CREATED),
+        Err(ScriptError::NotFound) => Err(fail(StatusCode::NOT_FOUND, "没有这个脚本")),
+        Err(e @ ScriptError::NotApproved(_)) => Err((StatusCode::CONFLICT, e.to_string())),
+        Err(ScriptError::Db(e)) => Err(internal(&e)),
+        Err(e) => {
+            tracing::error!("记录回归时出现不该出现的错误：{e}");
+            Err(fail(StatusCode::INTERNAL_SERVER_ERROR, "记录失败"))
+        }
+    }
 }
 
 /// 原始数据库错误只写日志，不返回给调用方。
