@@ -6,12 +6,14 @@ use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 
 use axum::body::{Body, Bytes, to_bytes};
-use axum::extract::{Path as RoutePath, Request, State};
+use axum::extract::rejection::{PathRejection, QueryRejection};
+use axum::extract::{Path as RoutePath, Query, Request, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
+use chrono::Utc;
 use futures_util::StreamExt;
 use protocol::recording::{MAX_RECORDING_INDEX_SIZE, MAX_RECORDING_SIZE, RecordingIndex, recording_seq};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::fs::{self, File, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom};
@@ -117,7 +119,8 @@ pub(crate) async fn names(
 #[derive(Serialize)]
 pub(crate) struct RecordingView {
     pub(crate) seq: i32,
-    url: String,
+    #[serde(skip)]
+    pub(crate) name: String,
     size: i64,
     pub(crate) start_epoch_ms: Option<i64>,
     pub(crate) duration_ms: Option<i64>,
@@ -135,7 +138,11 @@ pub(crate) async fn recordings(conn: &mut sqlx::PgConnection, run_id: Uuid) -> R
     Ok(rows.into_iter().filter_map(|(seq, path, size, start_epoch_ms, duration_ms)| {
         let name = path.strip_prefix(&prefix)?;
         (recording_seq(name) == Some(seq)).then(|| RecordingView {
-            seq, url: format!("/api/runs/{run_id}/files/{name}"), size, start_epoch_ms, duration_ms,
+            seq,
+            name: name.into(),
+            size,
+            start_epoch_ms,
+            duration_ms,
         })
     }).collect())
 }
@@ -252,12 +259,26 @@ async fn recording_response(mut file: File, headers: &HeaderMap) -> Result<Respo
     Ok(response)
 }
 
+#[derive(Deserialize)]
+pub(crate) struct EvidenceQuery {
+    exp: i64,
+    sig: String,
+}
+
 pub(crate) async fn get(
     State(state): State<ApiState>,
-    RoutePath((id, name)): RoutePath<(String, String)>,
+    path: Result<RoutePath<(Uuid, String)>, PathRejection>,
+    query: Result<Query<EvidenceQuery>, QueryRejection>,
     headers: HeaderMap,
 ) -> Result<Response, StatusCode> {
-    let run_id = id.parse().map_err(|_| StatusCode::NOT_FOUND)?;
+    let RoutePath((run_id, name)) = path.map_err(|_| StatusCode::FORBIDDEN)?;
+    let Query(EvidenceQuery { exp, sig }) = query.map_err(|_| StatusCode::FORBIDDEN)?;
+    if !state
+        .evidence_signer
+        .verify(run_id, &name, exp, &sig, Utc::now().timestamp())
+    {
+        return Err(StatusCode::FORBIDDEN);
+    }
     let kind = EvidenceKind::from_name(&name).ok_or(StatusCode::NOT_FOUND)?;
     let path = prefix(run_id) + &name;
     let registered: bool =

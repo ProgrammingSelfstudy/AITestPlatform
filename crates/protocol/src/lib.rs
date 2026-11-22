@@ -8,6 +8,7 @@
 //! - 账号密码**不出现在任何协议类型里**：`RunAssign` 只带 `lease_id`，凭证走单独的 HTTPS 接口。
 
 use chrono::{DateTime, Utc};
+use serde::de::{DeserializeOwned, value::MapDeserializer};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -43,20 +44,46 @@ pub enum Parsed<B> {
     UnknownType { v: u32, id: Uuid, type_name: String },
 }
 
+#[derive(Deserialize)]
+struct MessageTag {
+    #[serde(rename = "type")]
+    name: String,
+}
+
+#[derive(Debug, thiserror::Error)]
+enum MessageTagError {
+    #[error("未知消息类型")]
+    UnknownVariant,
+    #[error("消息类型解析失败")]
+    Invalid,
+}
+
+impl serde::de::Error for MessageTagError {
+    fn custom<T: std::fmt::Display>(_: T) -> Self {
+        Self::Invalid
+    }
+
+    fn unknown_variant(_: &str, _: &'static [&'static str]) -> Self {
+        Self::UnknownVariant
+    }
+}
+
 /// 解析一条消息。未知 `type` 返回 `UnknownType`，其他格式错误照常返回 `Err`。
-pub fn parse<B: serde::de::DeserializeOwned>(text: &str) -> Result<Parsed<B>, serde_json::Error> {
+pub fn parse<B: DeserializeOwned>(text: &str) -> Result<Parsed<B>, serde_json::Error> {
     let value: serde_json::Value = serde_json::from_str(text)?;
-    match serde_json::from_value::<Envelope<B>>(value.clone()) {
-        Ok(env) => Ok(Parsed::Known(env)),
-        Err(e) if e.to_string().starts_with("unknown variant") => {
-            let get = |k: &str| value.get(k).cloned().unwrap_or(serde_json::Value::Null);
-            Ok(Parsed::UnknownType {
-                v: get("v").as_u64().unwrap_or(0) as u32,
-                id: get("id").as_str().and_then(|s| s.parse().ok()).unwrap_or_default(),
-                type_name: get("type").as_str().unwrap_or("").to_string(),
-            })
-        }
-        Err(e) => Err(e),
+    let error = match Envelope::<B>::deserialize(&value) {
+        Ok(env) => return Ok(Parsed::Known(env)),
+        Err(error) => error,
+    };
+    let Ok(Envelope { v, id, body, .. }) = Envelope::<MessageTag>::deserialize(&value) else {
+        return Err(error);
+    };
+    let type_name = body.name;
+    // 只传入顶层 type 来检查消息枚举。真实 payload 的解析错误原样返回。
+    let tag = MapDeserializer::<_, MessageTagError>::new([("type", type_name.as_str())].into_iter());
+    match B::deserialize(tag) {
+        Err(MessageTagError::UnknownVariant) => Ok(Parsed::UnknownType { v, id, type_name }),
+        _ => Err(error),
     }
 }
 
@@ -532,6 +559,39 @@ mod tests {
         // run_cancel 缺 run_id：不能被当成「未知类型」悄悄忽略，否则会吞掉真正的协议错误
         let text = r#"{"v":1,"id":"00000000-0000-0000-0000-000000000000","ts":"2026-11-20T10:00:00Z","type":"run_cancel","payload":{}}"#;
         assert!(parse::<ServerMsg>(text).is_err());
+    }
+
+    #[test]
+    fn 欢迎消息的非法恢复决定返回解析错误() {
+        let text = json!({
+            "v": 1,
+            "id": Uuid::nil(),
+            "ts": "2026-11-20T10:00:00Z",
+            "type": "welcome",
+            "payload": {
+                "node_id": Uuid::nil(),
+                "heartbeat_s": DEFAULT_HEARTBEAT_S,
+                "resume": [{"run_id": Uuid::nil(), "decision": "welcome"}]
+            }
+        }).to_string();
+        assert!(parse::<ServerMsg>(&text).is_err());
+    }
+
+    #[test]
+    fn 旧版欢迎消息省略恢复列表时默认为空() {
+        let text = json!({
+            "v": 1,
+            "id": Uuid::nil(),
+            "ts": "2026-11-20T10:00:00Z",
+            "type": "welcome",
+            "payload": {"node_id": Uuid::nil(), "heartbeat_s": DEFAULT_HEARTBEAT_S}
+        }).to_string();
+        let Parsed::Known(Envelope { body: ServerMsg::Welcome(welcome), .. }) =
+            parse::<ServerMsg>(&text).unwrap()
+        else {
+            panic!("应解析为欢迎消息");
+        };
+        assert!(welcome.resume.is_empty());
     }
 
     #[test]

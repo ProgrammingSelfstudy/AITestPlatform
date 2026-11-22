@@ -30,12 +30,13 @@ struct Fake {
     swipes: Mutex<Vec<(i32, i32, i32, i32)>>,
     calls: Mutex<Vec<String>>,
     fail_tap: AtomicBool,
+    fail_dump_after_tap: AtomicBool,
     empty_dump: Mutex<Option<String>>,
 }
 
 impl Fake {
     fn new(pages: Vec<Vec<Element>>, next: NextFn) -> Arc<Self> {
-        Arc::new(Self { pages, cur: AtomicUsize::new(0), next, taps: Mutex::new(vec![]), swipes: Mutex::new(vec![]), calls: Mutex::new(vec![]), fail_tap: AtomicBool::new(false), empty_dump: Mutex::new(None) })
+        Arc::new(Self { pages, cur: AtomicUsize::new(0), next, taps: Mutex::new(vec![]), swipes: Mutex::new(vec![]), calls: Mutex::new(vec![]), fail_tap: AtomicBool::new(false), fail_dump_after_tap: AtomicBool::new(false), empty_dump: Mutex::new(None) })
     }
     /// 点击后页面不变的单页设备
     fn still(page: Vec<Element>) -> Arc<Self> {
@@ -70,6 +71,9 @@ impl DeviceApi for Fake {
         self.taps.lock().unwrap().push((x, y));
         let c = self.cur.load(Ordering::SeqCst);
         self.cur.store((self.next)(c, (x, y)), Ordering::SeqCst);
+        if self.fail_dump_after_tap.load(Ordering::SeqCst) {
+            self.set_empty_dump("mCurrentFocus=null");
+        }
         Ok(())
     }
     async fn swipe(&self, x1: i32, y1: i32, x2: i32, y2: i32, _ms: u32) -> device::Result<()> {
@@ -115,6 +119,14 @@ fn server(dev: Arc<Fake>, max_steps: u32) -> (DeviceServer, std::path::PathBuf) 
 
 fn txt(r: &CallToolResult) -> String {
     r.content.iter().filter_map(|c| c.as_text().map(|t| t.text.clone())).collect::<Vec<_>>().join("\n")
+}
+
+fn assert_need_human(r: &CallToolResult, keyword: &str) {
+    assert_eq!(r.is_error, Some(true));
+    let result = r.structured_content.as_ref().expect("应返回结构化的人工介入结果");
+    assert_eq!(result["status"], "need_human");
+    let reason = result["reason"].as_str().expect("应说明人工介入原因");
+    assert!(reason.contains("高危") && reason.contains(keyword), "{reason}");
 }
 
 async fn tap(s: &DeviceServer, id: u32) -> String {
@@ -231,6 +243,29 @@ async fn 观察降级后不能用旧控件树点击或拖动() {
 }
 
 #[tokio::test]
+async fn 有观察缓存时动作前取树失败也拒绝并要求观察() {
+    let fake = Fake::still(list_page());
+    let dir = run_dir();
+    let mut config = cfg(&dir, 40);
+    config.secrets = vec![("虚构密码123".into(), "{{account.password}}".into())];
+    let s = DeviceServer::new(fake.clone(), config).unwrap();
+    s.observe().await.unwrap();
+    fake.set_empty_dump("mCurrentFocus=null 虚构密码123");
+    let replies = [
+        s.tap(Parameters(TapArgs { element_id: 2 })).await,
+        s.tap_xy(Parameters(TapXyArgs { x: 360, y: 1532 })).await,
+        s.drag(Parameters(DragArgs { x1: 360, y1: 1532, x2: 360, y2: 500, duration_ms: None })).await,
+    ];
+    for reply in replies {
+        let err = reply.unwrap_err();
+        assert!(err.message.contains("请先 observe") && err.message.contains("mCurrentFocus=null"), "{err:?}");
+        assert!(err.message.contains("{{account.password}}") && !err.message.contains("虚构密码123"), "{err:?}");
+    }
+    assert!(fake.taps().is_empty() && fake.swipes.lock().unwrap().is_empty());
+    assert_eq!(status(&s).await["steps"], 0);
+}
+
+#[tokio::test]
 async fn 按编号点击_点元素中心并写轨迹() {
     let fake = Fake::new(vec![list_page(), vec![el("Local Music Library(22)", false, 0, 100, 720, 160)]], Box::new(|_, _| 1));
     let (s, d) = server(fake.clone(), 40);
@@ -281,17 +316,59 @@ async fn 高危目标被拦截_设备没被点_之后不能绕过继续点别的
     let fake = Fake::still(pay_page());
     let (s, _d) = server(fake.clone(), 40);
     s.observe().await.unwrap();
-    let m = tap(&s, 2).await; // Pay Now
-    assert!(m.contains("高危") && m.contains("need_human"), "{m}");
+    let reply = s.tap(Parameters(TapArgs { element_id: 2 })).await.unwrap();
+    assert_need_human(&reply, "Pay Now");
     assert!(fake.taps().is_empty(), "高危目标绝不能真的点下去");
 
     // 拦截之后换个安全的按钮也不行：必须先让人处理
-    let m2 = tap(&s, 3).await;
-    assert!(m2.contains("need_human"), "拦截后不能绕过继续操作：{m2}");
+    let reply = s.tap(Parameters(TapArgs { element_id: 3 })).await.unwrap();
+    assert_need_human(&reply, "Pay Now");
+    assert_need_human(&s.back().await.unwrap(), "Pay Now");
+    let reply = s.finish(Parameters(FinishArgs { result: "passed".into(), reason: "全部符合".into() })).await.unwrap();
+    assert_need_human(&reply, "Pay Now");
     assert!(fake.taps().is_empty());
+    assert!(fake.calls.lock().unwrap().is_empty());
     // 但可以只读观察，让模型能向人说明
     s.observe().await.expect("拦截后仍允许观察");
-    assert!(status(&s).await["need_human"].as_str().unwrap().contains("Pay Now"));
+    let state = status(&s).await;
+    assert!(state["need_human"].as_str().unwrap().contains("Pay Now"));
+    assert!(state["finished"].is_null());
+    assert_eq!(state["steps"], 0);
+}
+
+#[tokio::test]
+async fn 观察后页面变成高危页时点击和拖动均拒绝且不计步() {
+    let mut danger = list_page();
+    danger[1].desc = "确认注销".into();
+    for action in ["tap", "tap_xy", "drag"] {
+        let fake = Fake::new(vec![list_page(), danger.clone()], Box::new(|c, _| c));
+        let (s, _) = server(fake.clone(), 40);
+        s.observe().await.unwrap();
+        fake.cur.store(1, Ordering::SeqCst);
+
+        let reply = match action {
+            "tap" => s.tap(Parameters(TapArgs { element_id: 2 })).await,
+            "tap_xy" => s.tap_xy(Parameters(TapXyArgs { x: 360, y: 1532 })).await,
+            "drag" => s.drag(Parameters(DragArgs { x1: 360, y1: 1532, x2: 360, y2: 500, duration_ms: None })).await,
+            _ => unreachable!(),
+        }.unwrap();
+        assert_need_human(&reply, "注销");
+        assert!(fake.taps().is_empty() && fake.swipes.lock().unwrap().is_empty(), "{action} 不应发送到设备");
+        assert_eq!(status(&s).await["steps"], 0, "拒绝的 {action} 不应计步");
+    }
+}
+
+#[tokio::test]
+async fn 编号目标已变更时拒绝点击原坐标() {
+    let mut changed = list_page();
+    changed[1].desc = "Settings".into();
+    let fake = Fake::new(vec![list_page(), changed], Box::new(|c, _| c));
+    let (s, _) = server(fake.clone(), 40);
+    s.observe().await.unwrap();
+    fake.cur.store(1, Ordering::SeqCst);
+    assert!(tap(&s, 2).await.contains("请先 observe"));
+    assert!(fake.taps().is_empty());
+    assert_eq!(status(&s).await["steps"], 0);
 }
 
 #[tokio::test]
@@ -351,6 +428,44 @@ async fn 超过最大步数判阻塞_之后一切被拒绝() {
 }
 
 #[tokio::test]
+async fn 等待期间并发动作耗尽步数后等待不再计步() {
+    let (s, dir) = server(Fake::still(list_page()), 1);
+    let (waiting, action) = tokio::join!(
+        biased;
+        s.wait(Parameters(WaitArgs { seconds: 1 })),
+        s.back(),
+    );
+    assert!(txt(&action.unwrap()).contains("返回"));
+    assert!(txt(&waiting.unwrap()).contains("已超过最大步数 1"));
+    let state = status(&s).await;
+    assert_eq!(state["steps"], 1);
+    assert_eq!(state["finished"], "blocked");
+    let trace: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("trace.json")).unwrap()).unwrap();
+    assert_eq!(trace["steps"].as_array().unwrap().len(), 1);
+    assert_eq!(trace["steps"][0]["action"], "back");
+    assert_eq!(trace["result"], "blocked");
+}
+
+#[tokio::test]
+async fn 步数受阻后结束工具不能改判通过_续跑也一样() {
+    let (s, dir) = server(Fake::still(list_page()), 1);
+    s.back().await.unwrap();
+    assert!(txt(&s.back().await.unwrap()).contains("已超过最大步数 1"));
+    let path = dir.join("trace.json");
+    let before = std::fs::read(&path).unwrap();
+    let resumed = DeviceServer::new(Fake::still(list_page()), cfg(&dir, 1)).unwrap();
+    for server in [s, resumed] {
+        let reply = server.finish(Parameters(FinishArgs { result: "passed".into(), reason: "全部符合".into() })).await.unwrap();
+        assert!(txt(&reply).contains("用例已结束（blocked）"));
+        assert_eq!(status(&server).await["finished"], "blocked");
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+    let trace: serde_json::Value = serde_json::from_slice(&before).unwrap();
+    assert_eq!(trace["result"], "blocked");
+    assert!(trace["reason"].as_str().unwrap().contains("最大步数"));
+}
+
+#[tokio::test]
 async fn 连续三次不同坐标页面不变判卡住() {
     let (s, _d) = server(Fake::still(list_page()), 40);
     s.observe().await.unwrap();
@@ -358,6 +473,32 @@ async fn 连续三次不同坐标页面不变判卡住() {
     tap_xy(&s, 20, 20).await;
     let m = tap_xy(&s, 30, 30).await;
     assert!(m.contains("疑似卡住"), "{m}");
+}
+
+#[tokio::test]
+async fn 连续三次动作后取树失败仍计步并降级且不误报卡住() {
+    let fake = Fake::still(list_page());
+    fake.fail_dump_after_tap.store(true, Ordering::SeqCst);
+    let (s, dir) = server(fake.clone(), 40);
+    s.observe().await.unwrap();
+    for x in [10, 20, 30] {
+        *fake.empty_dump.lock().unwrap() = None;
+        let reply = tap_xy(&s, x, 120).await;
+        assert!(reply.contains("已点击坐标"), "{reply}");
+        assert!(!reply.contains("没有任何变化") && !reply.contains("疑似卡住"), "{reply}");
+    }
+    assert_eq!(fake.taps(), [(10, 120), (20, 120), (30, 120)]);
+    assert_eq!(status(&s).await["steps"], 3);
+    let trace: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("trace.json")).unwrap()).unwrap();
+    let steps = trace["steps"].as_array().unwrap();
+    assert_eq!(steps.len(), 3);
+    for step in steps {
+        assert_eq!(step["action"], "tap_xy");
+        assert_eq!(step["degraded"], true);
+        assert_eq!(step["after_labels"], serde_json::json!([]));
+        assert_eq!(step["new_labels"], serde_json::json!([]));
+        assert!(dir.join(step["shot"].as_str().unwrap()).exists());
+    }
 }
 
 #[tokio::test]

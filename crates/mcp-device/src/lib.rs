@@ -3,7 +3,7 @@
 //! 护栏全部做在这一层，不依赖模型自觉（仓库 CLAUDE.md 规则 4、6）：
 //! - 步数上限：超过判阻塞，之后一切操作被拒绝；
 //! - 卡住检测：连续 3 步页面不变 / 连续 3 次相同动作，在返回里提醒；
-//! - 高危拦截：支付、删除账号、注销类目标（含按坐标点击反查）直接拒绝，之后必须先 `need_human`；
+//! - 高危拦截：触摸前检查当前控件树，命中支付、删除账号、注销类目标时返回结构化的 `need_human` 并锁住设备动作；
 //! - 轨迹：每一步落盘，账号密码一律脱敏成占位符。
 //!
 //! 定位优先级：content-desc > 坐标。Hafa 是 Flutter，控件树里 text 为空，可读信息全在 content-desc。
@@ -114,9 +114,18 @@ impl DeviceServer {
         let mut guard = Guard::new(cfg.max_steps, cfg.high_risk.clone());
         // 续跑：接着已有轨迹的步数计数，但不带旧的页面签名（避免误判卡住）
         for _ in 0..trace.counted_steps() {
-            guard.record(String::new(), 0);
+            guard.record(String::new(), None);
         }
         guard.human_resolved();
+        // 从轨迹恢复终态，避免续跑覆盖已结束用例的结果。
+        #[derive(Deserialize)]
+        struct SavedResult {
+            result: Option<String>,
+        }
+        let saved: SavedResult = serde_json::from_slice(&std::fs::read(trace.dir().join("trace.json"))?)?;
+        if let Some(result) = saved.result {
+            guard.finish(result);
+        }
         Ok(Self(Arc::new(Inner { dev, cfg, st: Mutex::new(State { guard, trace, last_elements: vec![], screen: None }) })))
     }
 }
@@ -185,17 +194,36 @@ fn text(s: impl Into<String>) -> ToolResult {
     Ok(CallToolResult::success(vec![ContentBlock::text(s)]))
 }
 
-/// 设备命令失败：把原始错误原样交给调用方（项目规则：失败要给用户看原始错误）。
-fn device_err(e: device::DeviceError) -> ErrorData {
-    ErrorData::internal_error(format!("设备命令失败：{e}"), None)
-}
-
 fn io_err(e: std::io::Error) -> ErrorData {
     ErrorData::internal_error(format!("写轨迹失败：{e}"), None)
 }
 
-fn refuse(r: Refusal) -> ToolResult {
-    text(r.message())
+impl State {
+    /// 设备命令失败时保留原始诊断，并替换其中的凭证。
+    fn device_err(&self, e: DeviceError) -> ErrorData {
+        ErrorData::internal_error(self.trace.redact(&format!("设备命令失败：{e}")), None)
+    }
+
+    fn block_risk(&mut self, labels: &str) -> Option<Refusal> {
+        let keyword = self.trace.redact(self.guard.risk(labels)?);
+        Some(self.guard.block_for_human(&keyword))
+    }
+
+    fn refuse(&mut self, r: Refusal) -> ToolResult {
+        let message = r.message();
+        match r {
+            Refusal::NeedHuman(reason) => Ok(CallToolResult::structured_error(serde_json::json!({
+                "status": "need_human",
+                "reason": reason,
+                "message": message,
+            }))),
+            Refusal::MaxSteps(_) => {
+                self.trace.finish("blocked", &message, vec![]).map_err(io_err)?;
+                text(message)
+            }
+            Refusal::Finished(_) => text(message),
+        }
+    }
 }
 
 fn is_timer_like(s: &str) -> bool {
@@ -227,7 +255,8 @@ fn note_new(new: &[String]) -> String {
 
 /// 动作之后的统一收尾结果。
 struct After {
-    changed: bool,
+    unchanged: bool,
+    degraded: bool,
     new: Vec<String>,
     stuck: Option<String>,
 }
@@ -237,45 +266,70 @@ impl Inner {
         if let Some(s) = st.screen {
             return Ok(s);
         }
-        let s = self.dev.screen_size().await.map_err(device_err)?;
+        let s = self.dev.screen_size().await.map_err(|e| st.device_err(e))?;
         st.screen = Some(s);
         Ok(s)
+    }
+
+    async fn page_elements(&self) -> device::Result<Vec<Element>> {
+        let mut els = self.dev.dump().await?;
+        els.retain(|e| !e.in_status_bar());
+        Ok(els)
+    }
+
+    /// 触摸动作必须在持有状态锁时取得当前控件树，才能检查实际触点。
+    async fn tree_before_touch(&self, st: &State) -> Result<Vec<Element>, ErrorData> {
+        match self.page_elements().await {
+            Ok(els) if !els.is_empty() => Ok(els),
+            Ok(_) => Err(ErrorData::internal_error("当前控件树没有页面节点。请先 observe。", None)),
+            Err(e) => {
+                let mut err = st.device_err(e);
+                err.message.to_mut().push_str("。请先 observe。");
+                Err(err)
+            }
+        }
     }
 
     /// 一次动作执行完后的统一收尾：等页面稳定 → 重新取控件树和截图 → 记护栏 → 写轨迹。
     async fn after_action(&self, st: &mut State, before: &[Element], action_sig: String, mut step: TraceStep, started: Instant) -> Result<After, ErrorData> {
         tokio::time::sleep(self.cfg.settle).await;
-        // 取不到动作后的控件树不能让动作白做：按「页面有变化」处理
-        let after: Vec<Element> = match self.dev.dump().await {
-            Ok(v) => v.into_iter().filter(|e| !e.in_status_bar()).collect(),
+        let after = match self.page_elements().await {
+            Ok(els) if !els.is_empty() => Some(els),
+            Ok(_) => None,
             Err(e) => {
-                tracing::warn!("动作后读取控件树失败：{e}");
-                vec![]
+                tracing::warn!("动作后读取控件树失败：{}", st.trace.redact(&e.to_string()));
+                None
             }
         };
-        let sig_before = guard::tree_signature(before);
-        let sig = guard::tree_signature(&after);
-        let changed = before.is_empty() || sig != sig_before;
-        let new = guard::new_labels(before, &after);
+        let sig = after.as_deref().map(guard::tree_signature);
+        let unchanged = sig.is_some_and(|sig| !before.is_empty() && sig == guard::tree_signature(before));
+        let degraded = sig.is_none();
+        let after = after.as_deref().unwrap_or_default();
+        let new = guard::new_labels(before, after);
 
         st.guard.record(action_sig, sig);
-        let stuck = st.guard.stuck();
+        let stuck = st.guard.stuck().map(|s| st.trace.redact(&s));
 
         let idx = st.trace.step_count() + 1;
         if let Ok(png) = self.dev.screenshot().await {
             step.shot = st.trace.save_shot(idx, "after", &png).ok();
         }
-        step.after_labels = after_labels(&after);
+        step.degraded = degraded;
+        step.after_labels = after_labels(after);
         step.new_labels = new.clone();
         step.duration_ms = started.elapsed().as_millis() as u64;
         st.trace.add_step(step).map_err(io_err)?;
-        Ok(After { changed, new, stuck })
+        let new = new.into_iter().map(|label| st.trace.redact(&label)).collect();
+        Ok(After { unchanged, degraded, new, stuck })
     }
 
     fn compose(&self, base: String, a: &After, warn_unchanged: bool) -> String {
         let mut msg = base + &note_new(&a.new);
-        if warn_unchanged && !a.changed {
+        if warn_unchanged && a.unchanged {
             msg.push_str("。注意：动作后页面元素没有任何变化，可能点偏（宽节点的中心不一定可点），请 observe 后对照截图改用 tap_xy");
+        }
+        if a.degraded {
+            msg.push_str("。动作后控件树暂不可用，请 observe 确认页面");
         }
         if let Some(s) = &a.stuck {
             msg.push_str(&format!("。注意：{s}"));
@@ -283,15 +337,13 @@ impl Inner {
         msg
     }
 
-    /// 点击一个坐标，并完成收尾。`target` 是稳定的名字（元素 content-desc），`prev_label` 用于脚本生成。
-    #[allow(clippy::too_many_arguments)]
-    async fn do_tap(&self, st: &mut State, x: i32, y: i32, action: &str, target: Option<String>, prev_label: Option<String>, tag: String) -> Result<After, ErrorData> {
-        let before = st.last_elements.clone();
-        let at_ms = now_ms();
+    /// 点击已经检查过的坐标，并按动作前的控件树比较页面变化。
+    async fn do_tap(&self, st: &mut State, before: &[Element], (x, y): (i32, i32), tag: String, mut step: TraceStep) -> Result<After, ErrorData> {
+        step.at_ms = now_ms();
+        step.point = Some((x, y));
         let started = Instant::now();
-        self.dev.tap(x, y).await.map_err(device_err)?;
-        let step = TraceStep { action: action.into(), at_ms, target, prev_label, point: Some((x, y)), ..Default::default() };
-        self.after_action(st, &before, tag, step, started).await
+        self.dev.tap(x, y).await.map_err(|e| st.device_err(e))?;
+        self.after_action(st, before, tag, step, started).await
     }
 }
 
@@ -302,18 +354,16 @@ impl DeviceServer {
         let me = &self.0;
         let mut st = me.st.lock().await;
         if let Err(r) = st.guard.begin_read() {
-            return refuse(r);
+            return st.refuse(r);
         }
         let at_ms = now_ms();
         let started = Instant::now();
-        let raw = me.dev.screenshot().await.map_err(device_err)?;
-        let (els, diag): (Vec<Element>, _) = match me.dev.dump().await {
-            Ok(els) => (els.into_iter().filter(|e| !e.in_status_bar()).collect(), None),
-            Err(DeviceError::EmptyDump { diag, .. }) => {
-                st.last_elements.clear();
-                (vec![], Some(diag))
-            }
-            Err(err) => return Err(device_err(err)),
+        st.last_elements.clear();
+        let raw = me.dev.screenshot().await.map_err(|e| st.device_err(e))?;
+        let (els, diag) = match me.page_elements().await {
+            Ok(els) => (els, None),
+            Err(DeviceError::EmptyDump { diag, .. }) => (vec![], Some(diag)),
+            Err(err) => return Err(st.device_err(err)),
         };
         let screen_w = if diag.is_none() { me.screen(&mut st).await.map(|s| s.0).unwrap_or(0) } else { 0 };
         let annotated = observe::annotate(&raw, &els).map_err(|e| ErrorData::internal_error(format!("截图标注失败：{e}"), None))?;
@@ -355,7 +405,7 @@ impl DeviceServer {
         let me = &self.0;
         let mut st = me.st.lock().await;
         if let Err(r) = st.guard.begin() {
-            return refuse(r);
+            return st.refuse(r);
         }
         let n = st.last_elements.len();
         let Some(el) = (a.element_id as usize).checked_sub(1).and_then(|i| st.last_elements.get(i)).cloned() else {
@@ -365,16 +415,19 @@ impl DeviceServer {
         if (cx, cy) == (0, 0) {
             return text(format!("元素 {} 没有有效坐标，请改用 tap_xy。", a.element_id));
         }
-        let label: String = observe::label(&el).chars().take(120).collect();
-        if let Some(k) = st.guard.risk(&label).map(str::to_string) {
-            return refuse(st.guard.block_for_human(&k));
+        let label = observe::label(&el);
+        let before = me.tree_before_touch(&st).await?;
+        if let Some(r) = st.block_risk(&guard::labels_at(&before, cx, cy)).or_else(|| st.block_risk(&label)) {
+            return st.refuse(r);
         }
-        let prev = {
-            let idx = a.element_id as usize - 1;
-            st.last_elements[..idx].iter().rev().map(|e| e.label().to_string()).find(|l| !l.is_empty())
+        let Some(index) = before.iter().position(|current| current == &el) else {
+            return text(format!("编号 {} 对应的控件已变化，请先 observe。", a.element_id));
         };
+        let prev_label = before[..index].iter().rev().map(|e| e.label().to_string()).find(|l| !l.is_empty());
         let target = if el.label().is_empty() { None } else { Some(el.label().to_string()) };
-        let after = me.do_tap(&mut st, cx, cy, "tap", target, prev, format!("tap:{label}")).await?;
+        let step = TraceStep { action: "tap".into(), target, prev_label, ..Default::default() };
+        let after = me.do_tap(&mut st, &before, (cx, cy), format!("tap:{label}"), step).await?;
+        let label: String = st.trace.redact(&label).chars().take(120).collect();
         text(me.compose(format!("已点击 [{}] {label}", a.element_id), &after, true))
     }
 
@@ -383,19 +436,16 @@ impl DeviceServer {
         let me = &self.0;
         let mut st = me.st.lock().await;
         if let Err(r) = st.guard.begin() {
-            return refuse(r);
-        }
-        // 从没 observe 过时现取一次控件树：否则按坐标点击就能绕过按文案的高危拦截
-        if st.last_elements.is_empty() {
-            st.last_elements = me.dev.dump().await.map_err(device_err)?.into_iter().filter(|e| !e.in_status_bar()).collect();
-        }
-        let under = guard::labels_at(&st.last_elements, a.x, a.y);
-        if let Some(k) = st.guard.risk(&under).map(str::to_string) {
-            return refuse(st.guard.block_for_human(&k));
+            return st.refuse(r);
         }
         let (w, h) = me.screen(&mut st).await.unwrap_or((720, 1600));
-        let named = guard::element_at(&st.last_elements, a.x, a.y, i64::from(w) * i64::from(h) * 4 / 10).map(|e| e.label().to_string());
-        let after = me.do_tap(&mut st, a.x, a.y, "tap_xy", named, None, format!("tap_xy:{},{}", a.x, a.y)).await?;
+        let before = me.tree_before_touch(&st).await?;
+        if let Some(r) = st.block_risk(&guard::labels_at(&before, a.x, a.y)) {
+            return st.refuse(r);
+        }
+        let target = guard::element_at(&before, a.x, a.y, i64::from(w) * i64::from(h) * 4 / 10).map(|e| e.label().to_string());
+        let step = TraceStep { action: "tap_xy".into(), target, ..Default::default() };
+        let after = me.do_tap(&mut st, &before, (a.x, a.y), format!("tap_xy:{},{}", a.x, a.y), step).await?;
         text(me.compose(format!("已点击坐标 ({}, {})", a.x, a.y), &after, true))
     }
 
@@ -404,7 +454,7 @@ impl DeviceServer {
         let me = &self.0;
         let mut st = me.st.lock().await;
         if let Err(r) = st.guard.begin() {
-            return refuse(r);
+            return st.refuse(r);
         }
         let (w, h) = me.screen(&mut st).await?;
         let (cx, cy) = (w / 2, h / 2);
@@ -418,7 +468,7 @@ impl DeviceServer {
         let before = st.last_elements.clone();
         let at_ms = now_ms();
         let started = Instant::now();
-        me.dev.swipe(x1, y1, x2, y2, 300).await.map_err(device_err)?;
+        me.dev.swipe(x1, y1, x2, y2, 300).await.map_err(|e| st.device_err(e))?;
         let step = TraceStep { action: "swipe".into(), at_ms, value: Some(a.direction.clone()), ..Default::default() };
         let after = me.after_action(&mut st, &before, format!("swipe:{}", a.direction), step, started).await?;
         text(me.compose(format!("已滑动 {}", a.direction), &after, false))
@@ -429,26 +479,21 @@ impl DeviceServer {
         let me = &self.0;
         let mut st = me.st.lock().await;
         if let Err(r) = st.guard.begin() {
-            return refuse(r);
+            return st.refuse(r);
         }
-        // 起点落在高危元素上也要拦（和 tap_xy 一样先确保有控件树可反查）
-        if st.last_elements.is_empty() {
-            st.last_elements = me.dev.dump().await.map_err(device_err)?.into_iter().filter(|e| !e.in_status_bar()).collect();
-        }
-        let under = guard::labels_at(&st.last_elements, a.x1, a.y1);
-        if let Some(k) = st.guard.risk(&under).map(str::to_string) {
-            return refuse(st.guard.block_for_human(&k));
+        let before = me.tree_before_touch(&st).await?;
+        if let Some(r) = st.block_risk(&guard::labels_at(&before, a.x1, a.y1)) {
+            return st.refuse(r);
         }
         let ms = a.duration_ms.unwrap_or(800).clamp(200, 5000);
-        let before = st.last_elements.clone();
+        let target = guard::element_at(&before, a.x1, a.y1, i64::MAX).map(|e| e.label().to_string());
         let at_ms = now_ms();
         let started = Instant::now();
-        me.dev.swipe(a.x1, a.y1, a.x2, a.y2, ms).await.map_err(device_err)?;
-        let named = guard::element_at(&st.last_elements, a.x1, a.y1, i64::MAX).map(|e| e.label().to_string());
+        me.dev.swipe(a.x1, a.y1, a.x2, a.y2, ms).await.map_err(|e| st.device_err(e))?;
         let step = TraceStep {
             action: "drag".into(),
             at_ms,
-            target: named,
+            target,
             value: Some(format!("({},{})->({},{}) {ms}ms", a.x1, a.y1, a.x2, a.y2)),
             point: Some((a.x1, a.y1)),
             ..Default::default()
@@ -462,12 +507,12 @@ impl DeviceServer {
         let me = &self.0;
         let mut st = me.st.lock().await;
         if let Err(r) = st.guard.begin() {
-            return refuse(r);
+            return st.refuse(r);
         }
         let before = st.last_elements.clone();
         let at_ms = now_ms();
         let started = Instant::now();
-        me.dev.back().await.map_err(device_err)?;
+        me.dev.back().await.map_err(|e| st.device_err(e))?;
         let after = me.after_action(&mut st, &before, "back".into(), TraceStep { action: "back".into(), at_ms, ..Default::default() }, started).await?;
         text(me.compose("已返回".into(), &after, false))
     }
@@ -489,13 +534,17 @@ impl DeviceServer {
         {
             let mut st = me.st.lock().await;
             if let Err(r) = st.guard.begin() {
-                return refuse(r);
+                return st.refuse(r);
             }
         }
         let at_ms = now_ms();
         let started = Instant::now();
         tokio::time::sleep(Duration::from_secs(secs)).await; // 不持锁等待，status 等调用不被挡住
         let mut st = me.st.lock().await;
+        // 等待期间其他工具可能用完步数、触发人工介入或结束用例。
+        if let Err(r) = st.guard.begin() {
+            return st.refuse(r);
+        }
         let before = st.last_elements.clone();
         let step = TraceStep { action: "wait".into(), at_ms, value: Some(secs.to_string()), ..Default::default() };
         let after = me.after_action(&mut st, &before, format!("wait:{secs}"), step, started).await?;
@@ -507,6 +556,9 @@ impl DeviceServer {
         let me = &self.0;
         let (req, done) = {
             let mut st = me.st.lock().await;
+            if let Err(r) = st.guard.check_unfinished() {
+                return st.refuse(r);
+            }
             let at_ms = now_ms();
             let reason = st.trace.redact(&a.reason);
             st.guard.request_human(reason.clone());
@@ -523,8 +575,12 @@ impl DeviceServer {
             if let Ok(t) = std::fs::read_to_string(&done) {
                 let note = serde_json::from_str::<serde_json::Value>(&t).ok().and_then(|v| v["note"].as_str().map(str::to_string)).unwrap_or_default();
                 let _ = std::fs::remove_file(&req);
-                me.st.lock().await.guard.human_resolved();
-                return text(format!("人工已处理完成（{note}）。请先 observe 确认当前页面，再继续后面的步骤。"));
+                let mut st = me.st.lock().await;
+                if let Err(r) = st.guard.check_unfinished() {
+                    return st.refuse(r);
+                }
+                st.guard.human_resolved();
+                return text(format!("人工已处理完成（{}）。请先 observe 确认当前页面，再继续后面的步骤。", st.trace.redact(&note)));
             }
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
@@ -540,11 +596,17 @@ impl DeviceServer {
             return text("result 只能是 passed / failed / uncertain / blocked。");
         }
         let mut st = me.st.lock().await;
+        if let Err(r) = st.guard.check_unfinished() {
+            return st.refuse(r);
+        }
+        if result == "passed" && let Some(reason) = st.guard.need_human_reason() {
+            let refusal = Refusal::NeedHuman(reason.to_owned());
+            return st.refuse(refusal);
+        }
         let mut evidence = vec![];
         // 取证失败不能影响结束
-        match (me.dev.screenshot().await, me.dev.dump().await) {
+        match (me.dev.screenshot().await, me.page_elements().await) {
             (Ok(png), Ok(els)) => {
-                let els: Vec<Element> = els.into_iter().filter(|e| !e.in_status_bar()).collect();
                 let idx = st.trace.step_count() + 1;
                 if let Ok(rel) = st.trace.save_shot(idx, "final", &png) {
                     evidence.push(rel);
@@ -554,7 +616,11 @@ impl DeviceServer {
                     evidence.push("final_page.txt".into());
                 }
             }
-            (a, b) => evidence.push(format!("取证失败：{:?} / {:?}", a.err().map(|e| e.to_string()), b.err().map(|e| e.to_string()))),
+            (a, b) => {
+                let shot_err = a.err().map(|e| st.trace.redact(&e.to_string()));
+                let tree_err = b.err().map(|e| st.trace.redact(&e.to_string()));
+                evidence.push(format!("取证失败：{shot_err:?} / {tree_err:?}"));
+            }
         }
         st.trace.finish(&result, &a.reason, evidence).map_err(io_err)?;
         st.guard.finish(result.clone());
@@ -581,7 +647,7 @@ impl DeviceServer {
         let me = &self.0;
         let mut st = me.st.lock().await;
         if let Err(r) = st.guard.begin() {
-            return refuse(r);
+            return st.refuse(r);
         }
         let (Some(pkg), Some(act)) = (me.cfg.package.clone(), me.cfg.activity.clone()) else {
             return text("没有配置被测应用的包名 / Activity（HAFA_APP_PACKAGE / HAFA_APP_ACTIVITY），无法启动应用。");
@@ -590,9 +656,9 @@ impl DeviceServer {
         let at_ms = now_ms();
         let started = Instant::now();
         if stop_first {
-            me.dev.stop_app(&pkg).await.map_err(device_err)?;
+            me.dev.stop_app(&pkg).await.map_err(|e| st.device_err(e))?;
         }
-        me.dev.launch_app(&pkg, &act).await.map_err(device_err)?;
+        me.dev.launch_app(&pkg, &act).await.map_err(|e| st.device_err(e))?;
         let name = if stop_first { "restart_app" } else { "launch_app" };
         // 冷启动要几秒：多等一会儿再取页面
         tokio::time::sleep(me.cfg.settle * 8).await;

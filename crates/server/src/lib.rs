@@ -5,6 +5,7 @@
 pub mod accounts;
 mod api;
 pub mod cases;
+mod evidence_sign;
 mod files;
 pub mod recording_retention;
 mod reviews;

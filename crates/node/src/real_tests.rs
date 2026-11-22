@@ -113,10 +113,20 @@ impl Fixture {
 
     fn judge_opts(&self, script: &str) -> ClaudeOpts {
         let claude = self.dir.join("claude.sh");
+        // 登录检查单独返回会员状态，实际判定才记录提示词和参数。
         fs::write(
             &claude,
             format!(
-                "set -eu\ncat > \"$0.prompt\"\nprintf '%s\\n' \"$@\" > \"$0.args\"\n{script}\n"
+                r#"set -eu
+if [ "$#" -eq 5 ] && [ "$1" = --setting-sources ] && [ -z "$2" ] &&
+    [ "$3" = auth ] && [ "$4" = status ] && [ "$5" = --json ]; then
+    printf '%s\n' '{{"loggedIn":true,"authMethod":"claude.ai","apiProvider":"firstParty","subscriptionType":"pro"}}'
+    exit 0
+fi
+cat > "$0.prompt"
+printf '%s\n' "$@" > "$0.args"
+{script}
+"#
             ),
         )
         .unwrap();

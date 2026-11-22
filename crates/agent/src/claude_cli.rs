@@ -23,6 +23,7 @@ use tokio::time::Instant;
 /// 需要剔除的环境变量：名字完全匹配，或以 `OPENAI_` 开头。
 const STRIPPED_EXACT: [&str; 3] = ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL"];
 const STRIPPED_PREFIX: &str = "OPENAI_";
+const SETTING_ARGS: [&str; 2] = ["--setting-sources", ""];
 
 /// 给定当前环境变量名，返回应当从子进程里剔除的那些。独立成纯函数，方便测试。
 pub fn env_to_strip<'a>(names: impl IntoIterator<Item = &'a str>) -> Vec<String> {
@@ -219,7 +220,7 @@ fn build_args(o: &ClaudeOpts) -> Vec<String> {
         .map(String::from)
         .into();
     // 不加载用户 / 项目的设置，避免本机的钩子、插件影响执行；会员登录不受影响
-    a.extend(["--setting-sources".into(), String::new()]);
+    a.extend(SETTING_ARGS.map(String::from));
     // `--tools ""` = 一个内置工具都不给；有列表时按列表给
     a.extend(["--tools".into(), o.tools.join(",")]);
     if let Some(m) = &o.model {
@@ -240,6 +241,52 @@ fn build_args(o: &ClaudeOpts) -> Vec<String> {
     a
 }
 
+fn command(opts: &ClaudeOpts) -> Command {
+    let mut cmd = Command::new(&opts.bin);
+    // 调用方放弃等待时清理直接子进程。
+    cmd.args(&opts.pre_args).kill_on_drop(true);
+    if let Some(d) = &opts.cwd {
+        cmd.current_dir(d);
+    }
+    let names: Vec<String> = std::env::vars_os().filter_map(|(k, _)| k.into_string().ok()).collect();
+    for n in env_to_strip(names.iter().map(String::as_str)) {
+        cmd.env_remove(n);
+    }
+    cmd
+}
+
+/// 判定前在与模型调用相同的环境下确认本机 Claude 会员登录。
+pub(crate) async fn check_login(opts: &ClaudeOpts) -> Result<(), &'static str> {
+    let out = tokio::time::timeout(
+        Duration::from_secs(15),
+        command(opts)
+            .args(SETTING_ARGS)
+            .args(["auth", "status", "--json"])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output(),
+    )
+    .await
+    .map_err(|_| "Claude 会员登录检查超时（15 秒）")?
+    .map_err(|_| "无法运行 Claude 命令行检查会员登录")?;
+    // 登录状态可能含账号信息，只返回固定的错误文案。
+    let status: Value = serde_json::from_slice(&out.stdout)
+        .map_err(|_| "Claude 会员登录检查失败，无法读取 `claude auth status --json` 的状态")?;
+    if !out.status.success()
+        || status["loggedIn"].as_bool() != Some(true)
+        || status["authMethod"].as_str() != Some("claude.ai")
+        || status["apiProvider"].as_str() != Some("firstParty")
+        || !status["apiKeySource"].is_null()
+        || !matches!(
+            status["subscriptionType"].as_str(),
+            Some("pro" | "max" | "ultra" | "team" | "enterprise")
+        )
+    {
+        return Err("未检测到 Claude 会员登录，请在本机用 `claude auth login` 登录会员账号");
+    }
+    Ok(())
+}
+
 /// 调用一次。提示词走 stdin。出现的任何问题都放进 `Outcome.failure`，不 panic、不吞错。
 pub async fn run(opts: &ClaudeOpts, prompt: &str) -> Outcome {
     run_inner(opts, prompt, false).await
@@ -253,17 +300,12 @@ pub(crate) async fn run_text_only(opts: &ClaudeOpts, prompt: &str) -> Outcome {
 async fn run_inner(opts: &ClaudeOpts, prompt: &str, text_only: bool) -> Outcome {
     let mut out = Outcome::default();
 
-    let mut cmd = Command::new(&opts.bin);
-    cmd.args(&opts.pre_args)
-        .args(build_args(opts))
+    let mut cmd = command(opts);
+    cmd.args(build_args(opts))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .kill_on_drop(true) // 调用方放弃等待时，直接子进程不能留成孤儿
         .process_group(0); // 独立进程组：命令行会拉起 MCP 服务等子进程，卡住时要整组杀，否则它们抓着管道不放
-    if let Some(d) = &opts.cwd {
-        cmd.current_dir(d);
-    }
     if text_only {
         const KEEP: &[&str] = &[
             "HOME", "PATH", "SHELL", "TMPDIR", "TEMP", "TMP", "LANG", "LC_ALL", "LC_CTYPE",
@@ -276,11 +318,6 @@ async fn run_inner(opts: &ClaudeOpts, prompt: &str, text_only: bool) -> Outcome 
             .env_clear()
             .envs(std::env::vars_os().filter(|(name, _)| name.to_str().is_some_and(|n| KEEP.contains(&n))));
     }
-    let names: Vec<String> = std::env::vars_os().filter_map(|(k, _)| k.into_string().ok()).collect();
-    for n in env_to_strip(names.iter().map(String::as_str)) {
-        cmd.env_remove(n);
-    }
-
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {

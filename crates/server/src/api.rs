@@ -18,7 +18,7 @@ use sqlx::Row;
 use uuid::Uuid;
 
 use crate::runs::{self, NewTask, RunError, RunStatus, RunView, TaskCreated};
-use crate::{AppState, files, internal, reviews};
+use crate::{AppState, evidence_sign, files, internal, reviews};
 
 type ApiError = (StatusCode, String);
 
@@ -43,6 +43,7 @@ impl Paths {
 pub(crate) struct ApiState {
     pub app: AppState,
     pub paths: Paths,
+    pub evidence_signer: &'static evidence_sign::Signer,
 }
 
 pub(crate) fn routes(app: AppState, paths: Paths) -> Router {
@@ -74,7 +75,11 @@ pub(crate) fn routes(app: AppState, paths: Paths) -> Router {
             get(files::get).put(files::put),
         )
         .route("/api/runs/{id}/recording-index", put(files::put_recording_index))
-        .with_state(ApiState { app, paths })
+        .with_state(ApiState {
+            app,
+            paths,
+            evidence_signer: evidence_sign::process_signer(),
+        })
 }
 
 /// 允许哪些 Host / Origin：回环地址一直允许；`lan` 为真时再加上**私有网段的 IPv4 字面量**
@@ -532,25 +537,38 @@ struct RunDetail {
     run_steps: Vec<StepView>,
     judge_items: Vec<JudgeItemView>,
     files: Vec<String>,
-    recordings: Vec<files::RecordingView>,
+    file_urls: BTreeMap<String, String>,
+    recordings: Vec<SignedRecording>,
+    evidence_expires_at: i64,
+    evidence_key_id: Uuid,
+}
+
+#[derive(Serialize)]
+struct SignedRecording {
+    #[serde(flatten)]
+    recording: files::RecordingView,
+    url: String,
 }
 
 async fn run_detail(
     State(state): State<ApiState>,
     Path(id): Path<String>,
-) -> Result<Json<RunDetail>, ApiError> {
+) -> Result<impl IntoResponse, ApiError> {
     let id: Uuid = id
         .parse()
         .map_err(|_| (StatusCode::NOT_FOUND, "没有这个 run".into()))?;
-    let detail = load_run(state.app.pool(), id)
+    let detail = load_run(state.app.pool(), id, state.evidence_signer)
         .await
-        .map_err(|e| internal("查询 run 详情失败", e))?;
-    detail
-        .map(Json)
-        .ok_or_else(|| (StatusCode::NOT_FOUND, "没有这个 run".into()))
+        .map_err(|e| internal("查询 run 详情失败", e))?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "没有这个 run".into()))?;
+    Ok(([(header::CACHE_CONTROL, "no-store")], Json(detail)))
 }
 
-async fn load_run(pool: &sqlx::PgPool, id: Uuid) -> Result<Option<RunDetail>, sqlx::Error> {
+async fn load_run(
+    pool: &sqlx::PgPool,
+    id: Uuid,
+    signer: &evidence_sign::Signer,
+) -> Result<Option<RunDetail>, sqlx::Error> {
     let mut tx = pool.begin().await?;
     // 防止本次读取跨过判定完成的事务，状态和逐条预期从同一快照读取。
     sqlx::query("set transaction isolation level repeatable read read only")
@@ -615,12 +633,28 @@ async fn load_run(pool: &sqlx::PgPool, id: Uuid) -> Result<Option<RunDetail>, sq
         item.evidence = public_text(&item.evidence);
         item.file_refs.retain(|reference| files::valid_judge_reference(reference));
     }
+
+    let evidence_expires_at = Utc::now().timestamp() + evidence_sign::TTL_SECS;
+    let file_urls = files
+        .iter()
+        .map(|name| (name.clone(), signer.url(id, name, evidence_expires_at)))
+        .collect();
+    let recordings = recordings
+        .into_iter()
+        .map(|recording| SignedRecording {
+            url: signer.url(id, &recording.name, evidence_expires_at),
+            recording,
+        })
+        .collect();
     Ok(Some(RunDetail {
         record,
         run_steps,
         judge_items,
         files,
+        file_urls,
         recordings,
+        evidence_expires_at,
+        evidence_key_id: signer.id,
     }))
 }
 
@@ -694,6 +728,80 @@ fn scrub_fields(value: &mut Value) {
 #[cfg(test)]
 #[path = "api_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod evidence_tests {
+    use std::convert::Infallible;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use axum::ServiceExt;
+    use axum::body::{Body, to_bytes};
+    use sqlx::postgres::PgPoolOptions;
+
+    use super::*;
+
+    async fn get(
+        mut service: impl ServiceExt<Request, Response = Response, Error = Infallible>,
+        uri: &str,
+    ) -> Response {
+        let req = axum::http::Request::builder()
+            .uri(uri)
+            .body(Body::empty())
+            .unwrap();
+        service.call(req).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn 证据读取统一拒绝无效签名() {
+        // 使用关闭的连接池，确保签名校验在访问数据库之前完成。
+        let pool = PgPoolOptions::new()
+            .connect_lazy("postgres://127.0.0.1/unused_evidence_db")
+            .unwrap();
+        pool.close().await;
+        let app = routes(
+            AppState(Arc::new(crate::Inner {
+                cfg: crate::Config {
+                    node_token: "synthetic-node-token".into(),
+                    hello_timeout: Duration::from_secs(1),
+                    heartbeat_s: 1,
+                    lost_grace: Duration::from_secs(1),
+                },
+                pool,
+                accounts: None,
+                review_auth: reviews::ReviewAuth::new(None),
+                conns: Default::default(),
+            })),
+            Paths {
+                models: PathBuf::new(),
+                data: PathBuf::new(),
+            },
+        );
+        let run_id = Uuid::from_u128(1);
+        let signer = evidence_sign::process_signer();
+        let now = Utc::now().timestamp();
+        let exp = now + evidence_sign::TTL_SECS;
+        let bare = format!("/api/runs/{run_id}/files/01_after.png");
+        let signed = signer.url(run_id, "01_after.png", exp);
+        for path in [
+            bare.clone(),
+            bare.replace("01_after.png", "shot..png"),
+            format!("{bare}?exp={exp}"),
+            format!("{bare}?exp=invalid&sig=00"),
+            format!("{signed}&exp={exp}"),
+            signer.url(run_id, "01_after.png", now - 1),
+            signed.replace("01_after.png", "02_after.png"),
+        ] {
+            let response = get(app.clone().into_service(), &path).await;
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+            assert!(to_bytes(response.into_body(), 0).await.unwrap().is_empty());
+        }
+
+        let invalid_name = signer.url(run_id, "shot..png", exp);
+        let response = get(app.into_service(), &invalid_name).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+}
 
 #[cfg(test)]
 mod expand_tests {

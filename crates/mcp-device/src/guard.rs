@@ -62,12 +62,14 @@ pub fn new_labels(before: &[Element], after: &[Element]) -> Vec<String> {
     labels(after).into_iter().filter(|l| !old.contains(l) && !is_timer_like(l)).collect()
 }
 
-/// 坐标落在哪些元素上（取包含该点的最小的至多 3 个元素的文案）。
-/// 高危拦截靠它：不能因为模型改用坐标点击，就绕过按文案的拦截。
+/// 收集触点覆盖的所有元素文案，供高危检查。同一位置的装饰节点可能与按钮重叠。
 pub fn labels_at(els: &[Element], x: i32, y: i32) -> String {
-    let mut hits: Vec<&Element> = els.iter().filter(|e| e.bounds.contains(x, y)).collect();
-    hits.sort_by_key(|e| i64::from(e.bounds.right - e.bounds.left) * i64::from(e.bounds.bottom - e.bounds.top));
-    hits.iter().take(3).map(|e| e.label()).filter(|l| !l.is_empty()).collect::<Vec<_>>().join(" ")
+    els.iter()
+        .filter(|e| e.bounds.contains(x, y))
+        .flat_map(|e| [e.desc.as_str(), e.text.as_str()])
+        .filter(|l| !l.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// 坐标落在哪个元素上：取「有文字、面积不超过 `max_area`」的最小元素。
@@ -108,7 +110,7 @@ pub struct Guard {
     max_steps: u32,
     steps: u32,
     high_risk: Vec<String>,
-    sigs: VecDeque<u64>,
+    sigs: VecDeque<Option<u64>>,
     actions: VecDeque<String>,
     finished: Option<String>,
     need_human: Option<String>,
@@ -138,13 +140,7 @@ impl Guard {
     /// 每个会动设备的工具调用之前先过这一关。
     /// 超过最大步数时直接把用例标成 blocked，之后一切操作都会被拒绝。
     pub fn begin(&mut self) -> Result<(), Refusal> {
-        if let Some(r) = &self.finished {
-            return Err(Refusal::Finished(r.clone()));
-        }
-        if self.steps >= self.max_steps {
-            self.finished = Some("blocked".into());
-            return Err(Refusal::MaxSteps(self.max_steps));
-        }
+        self.begin_read()?;
         if let Some(r) = &self.need_human {
             return Err(Refusal::NeedHuman(r.clone()));
         }
@@ -154,14 +150,19 @@ impl Guard {
     /// 只读观察的入口：用例结束 / 超过最大步数仍然要拒绝，但被高危拦截时允许观察——
     /// 模型需要看一眼页面才能向人说明情况；真正动设备的操作用 [`Guard::begin`]。
     pub fn begin_read(&mut self) -> Result<(), Refusal> {
-        if let Some(r) = &self.finished {
-            return Err(Refusal::Finished(r.clone()));
-        }
+        self.check_unfinished()?;
         if self.steps >= self.max_steps {
-            self.finished = Some("blocked".into());
+            self.finish("blocked".into());
             return Err(Refusal::MaxSteps(self.max_steps));
         }
         Ok(())
+    }
+
+    pub(crate) fn check_unfinished(&self) -> Result<(), Refusal> {
+        match &self.finished {
+            Some(result) => Err(Refusal::Finished(result.clone())),
+            None => Ok(()),
+        }
     }
 
     /// 目标文案里是否含高危关键词；大小写不敏感。
@@ -189,8 +190,8 @@ impl Guard {
         self.actions.clear();
     }
 
-    /// 一次动作执行完：记动作签名和动作后的页面签名，步数 +1。
-    pub fn record(&mut self, action: String, page_sig: u64) {
+    /// 一次动作执行完后计一步。页面签名未知时中断页面不变的连续计数。
+    pub fn record(&mut self, action: String, page_sig: Option<u64>) {
         self.actions.push_back(action);
         self.sigs.push_back(page_sig);
         while self.actions.len() > KEEP {
@@ -204,11 +205,13 @@ impl Guard {
 
     /// 卡住检测：连续 3 步页面控件树不变，或连续 3 次相同动作。
     pub fn stuck(&self) -> Option<String> {
-        let last_n = |len: usize| len >= STUCK_N;
-        if last_n(self.sigs.len()) && self.sigs.iter().rev().take(STUCK_N).all(|s| *s == self.sigs[self.sigs.len() - 1]) {
+        if let Some(Some(last)) = self.sigs.back()
+            && self.sigs.len() >= STUCK_N
+            && self.sigs.iter().rev().take(STUCK_N).all(|sig| *sig == Some(*last))
+        {
             return Some("连续 3 步页面控件树没有变化，疑似卡住".into());
         }
-        if last_n(self.actions.len()) {
+        if self.actions.len() >= STUCK_N {
             let last = &self.actions[self.actions.len() - 1];
             if self.actions.iter().rev().take(STUCK_N).all(|a| a == last) {
                 return Some(format!("连续 3 次重复动作: {last}"));
@@ -218,7 +221,9 @@ impl Guard {
     }
 
     pub fn finish(&mut self, result: String) {
-        self.finished = Some(result);
+        if self.finished.is_none() {
+            self.finished = Some(result);
+        }
     }
 }
 
@@ -277,10 +282,10 @@ mod tests {
     #[test]
     fn 连续三步页面不变判卡住() {
         let mut g = Guard::new(40, vec![]);
-        g.record("tap:A".into(), 1);
-        g.record("tap:B".into(), 1);
+        g.record("tap:A".into(), Some(1));
+        g.record("tap:B".into(), Some(1));
         assert_eq!(g.stuck(), None, "只有两步不算");
-        g.record("tap:C".into(), 1);
+        g.record("tap:C".into(), Some(1));
         assert!(g.stuck().unwrap().contains("页面控件树没有变化"));
     }
 
@@ -288,16 +293,27 @@ mod tests {
     fn 页面中途变化不算卡住() {
         let mut g = Guard::new(40, vec![]);
         for (a, s) in [("a", 1), ("b", 1), ("c", 2), ("d", 2)] {
-            g.record(a.into(), s);
+            g.record(a.into(), Some(s));
         }
         assert_eq!(g.stuck(), None);
+    }
+
+    #[test]
+    fn 未知页面中断连续不变判定() {
+        let mut g = Guard::new(40, vec![]);
+        for (action, sig) in [("a", Some(1)), ("b", Some(1)), ("c", None), ("d", Some(1)), ("e", Some(1))] {
+            g.record(action.into(), sig);
+        }
+        assert_eq!(g.stuck(), None);
+        g.record("f".into(), Some(1));
+        assert!(g.stuck().unwrap().contains("页面控件树没有变化"));
     }
 
     #[test]
     fn 连续三次相同动作判卡住() {
         let mut g = Guard::new(40, vec![]);
         for s in [1, 2, 3] {
-            g.record("tap:Add".into(), s);
+            g.record("tap:Add".into(), Some(s));
         }
         assert!(g.stuck().unwrap().contains("重复动作"), "页面在变，但动作一直重复");
     }
@@ -307,10 +323,11 @@ mod tests {
     fn 超过最大步数判阻塞且之后全部拒绝() {
         let mut g = Guard::new(2, vec![]);
         g.begin().unwrap();
-        g.record("a".into(), 1);
+        g.record("a".into(), Some(1));
         g.begin().unwrap();
-        g.record("b".into(), 2);
+        g.record("b".into(), Some(2));
         assert_eq!(g.begin(), Err(Refusal::MaxSteps(2)));
+        g.finish("passed".into());
         assert_eq!(g.finished(), Some("blocked"));
         assert!(matches!(g.begin(), Err(Refusal::Finished(_))), "阻塞之后任何操作都要被拒绝");
     }
@@ -356,10 +373,12 @@ mod tests {
 
     #[test]
     fn 坐标点击不能绕过高危拦截() {
-        // 「Pay Now」按钮被一个大容器包着；按坐标点击时要能反查到按钮的文案
-        let els = [el("", 0, 0, 720, 1600), el("Checkout", 0, 1200, 720, 1500), el("Pay Now", 100, 1300, 620, 1400)];
+        // 支付按钮的文字与多个小节点重叠，坐标反查仍应命中。
+        let mut pay = el("确认", 100, 1300, 620, 1400);
+        pay.text = "Pay Now".into();
+        let els = [pay, el("", 355, 1345, 365, 1355), el("", 350, 1340, 370, 1360), el("", 345, 1335, 375, 1365)];
         let label = labels_at(&els, 360, 1350);
-        assert!(label.contains("Pay Now"), "坐标反查要拿到最小元素的文案：{label}");
+        assert!(label.contains("Pay Now"), "坐标反查要拿到支付按钮的文案：{label}");
         let g = Guard::new(40, risk_list());
         assert!(g.risk(&label).is_some());
     }

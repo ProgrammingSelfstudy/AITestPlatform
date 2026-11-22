@@ -238,10 +238,41 @@ pub struct Checked {
     pub disagreement: String,
 }
 
-/// 逐条采用唯一、证据充分的判定，再按 PoC 的优先级汇总。
+fn step_has_text(trace: &Value, idx: &str) -> bool {
+    let Ok(idx) = idx.parse::<u64>() else {
+        return false;
+    };
+    trace["steps"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|step| step["idx"].as_u64() == Some(idx))
+        .is_some_and(|step| {
+            ["after_labels", "new_labels"]
+                .into_iter()
+                .filter_map(|key| step[key].as_array())
+                .flatten()
+                .filter_map(Value::as_str)
+                .any(|label| !label.trim().is_empty())
+        })
+}
+
+/// 仅有查看记录时，通过项需要引用截图。
 pub fn checked(parsed: Option<&Parsed>, expected: &[String], served: &HashSet<String>) -> Checked {
+    checked_with_text(parsed, expected, served, &Value::Null, "")
+}
+
+/// 逐条采用唯一、证据充分的判定，再按 PoC 的优先级汇总。
+fn checked_with_text(
+    parsed: Option<&Parsed>,
+    expected: &[String],
+    served: &HashSet<String>,
+    trace: &Value,
+    page_text: &str,
+) -> Checked {
     let payload = parsed.map_or(&Value::Null, |parsed| &parsed.payload);
     let rows = payload["items"].as_array();
+    let has_final_text = !page_text.trim().is_empty();
     let items: Vec<JudgeItem> = expected
         .iter()
         .enumerate()
@@ -271,7 +302,7 @@ pub fn checked(parsed: Option<&Parsed>, expected: &[String], served: &HashSet<St
                 .filter(|reference| served.contains(*reference))
                 .map(str::to_owned)
                 .collect();
-            let (verdict, evidence) = match (verdict, note) {
+            let (mut verdict, mut evidence) = match (verdict, note) {
                 (Some(v), Some(note))
                     if v == Verdict::Uncertain
                         || (!file_refs.is_empty()
@@ -285,6 +316,18 @@ pub fn checked(parsed: Option<&Parsed>, expected: &[String], served: &HashSet<St
                 ),
                 _ => (Verdict::Uncertain, "缺少唯一、有效的逐项判定或证据说明"),
             };
+            // 这里只核验文字证据是否有内容。证据是否相关、支持还是反驳预期，由模型判断。
+            if verdict == Verdict::Passed
+                && !has_final_text
+                && file_refs.iter().all(|reference| {
+                    reference
+                        .strip_prefix("step:")
+                        .is_some_and(|idx| !step_has_text(trace, idx))
+                })
+            {
+                verdict = Verdict::Uncertain;
+                evidence = "所引步骤与终态页面均无可用文字，转待人工确认";
+            }
             JudgeItem {
                 idx,
                 verdict,
@@ -473,6 +516,12 @@ pub async fn run_judge(
         outcome.reason = "判定失败，无法定位本次执行的轨迹目录".into();
         return outcome;
     };
+    let start = Instant::now();
+    if let Err(reason) = claude_cli::check_login(opts).await {
+        outcome.wall_s = start.elapsed().as_secs_f64();
+        outcome.reason = format!("判定调用失败，{reason}，转待人工确认");
+        return outcome;
+    }
     let config = match McpConfig::new(&run_dir, evidence_bin) {
         Ok(config) => config,
         Err(e) => {
@@ -511,7 +560,6 @@ pub async fn run_judge(
         &steps,
         &human_records(&run_dir, &trace),
     );
-    let start = Instant::now();
     let response = claude_cli::run(&opts, &prompt).await;
     outcome.wall_s = start.elapsed().as_secs_f64();
     outcome.cost_usd = response.cost_usd;
@@ -542,7 +590,7 @@ pub async fn run_judge(
     let served = read_run_text(&run_dir, "served.json")
         .and_then(|text| serde_json::from_str(&text).ok())
         .unwrap_or_default();
-    let verdict = checked(Some(&parsed), &expected, &served);
+    let verdict = checked_with_text(Some(&parsed), &expected, &served, &trace, &page);
     outcome.status = JudgeStatus::Completed;
     outcome.final_result = verdict.final_result;
     outcome.items = verdict.items;

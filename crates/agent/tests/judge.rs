@@ -132,35 +132,23 @@ fn 未查看的步骤文字引用使该项待确认() {
 }
 
 #[test]
-fn 仅引用已查看的步骤文字可判passed() {
-    let r = check(
-        "passed",
-        json!([row(1, "passed", json!(["step:8"]))]),
-        1,
-        &["step:8"],
-    );
-    assert_eq!(
-        (r.final_result, r.items[0].verdict),
-        (FinalResult::Passed, Verdict::Passed)
-    );
-    assert_eq!(r.items[0].file_refs, ["step:8"]);
-}
-
-#[test]
 fn 有效failed优先于条数不符和待确认() {
-    let r = check(
-        "passed",
+    for items in [
         json!([row(2, "failed", json!([SHOT]))]),
-        2,
-        &[SHOT],
-    );
-    assert_eq!(r.final_result, FinalResult::Failed);
-    assert_eq!(
-        r.items.iter().map(|i| i.verdict).collect::<Vec<_>>(),
-        [Verdict::Uncertain, Verdict::Failed]
-    );
-    assert_eq!(r.reason, "按逐项结论及实际查看的证据汇总");
-    assert_eq!(r.disagreement, "与执行员有分歧");
+        json!([
+            row(1, "passed", json!(["step:8"])),
+            row(2, "failed", json!([SHOT]))
+        ]),
+    ] {
+        let r = check("passed", items, 2, &[SHOT, "step:8"]);
+        assert_eq!(r.final_result, FinalResult::Failed);
+        assert_eq!(
+            r.items.iter().map(|i| i.verdict).collect::<Vec<_>>(),
+            [Verdict::Uncertain, Verdict::Failed]
+        );
+        assert_eq!(r.reason, "按逐项结论及实际查看的证据汇总");
+        assert_eq!(r.disagreement, "与执行员有分歧");
+    }
 }
 
 #[test]
@@ -304,6 +292,32 @@ fn 同序号重复的完整与损坏判定都不采信() {
 }
 
 impl FakeClaude {
+    fn judge(script: &str) -> Self {
+        Self::judge_with_login(
+            r#"printf '%s\n' '{"loggedIn":true,"authMethod":"claude.ai","apiProvider":"firstParty","subscriptionType":"pro"}'"#,
+            script,
+        )
+    }
+
+    fn judge_with_login(auth: &str, script: &str) -> Self {
+        let fake = Self::new(script);
+        let path = fake.dir.join("claude.sh");
+        let model_script = fs::read_to_string(&path).unwrap();
+        fs::write(
+            path,
+            format!(
+                r#"if [ "$#" -eq 5 ] && [ "$1" = --setting-sources ] && [ -z "$2" ] &&
+    [ "$3" = auth ] && [ "$4" = status ] && [ "$5" = --json ]; then
+    {auth}
+    exit 0
+fi
+{model_script}"#
+            ),
+        )
+        .unwrap();
+        fake
+    }
+
     fn add_shot(&self) {
         fs::write(self.run_dir.join("shots").join(SHOT), b"\x89PNG\r\n\x1a\n").unwrap();
     }
@@ -354,6 +368,84 @@ async fn 截图和步骤文字清单都为空时不启动_claude() {
 }
 
 #[tokio::test]
+async fn 只引用无文字步骤且终态无文字时通过降为待人工确认() {
+    let result = json!({
+        "result": "passed", "items": [{
+            "index": 1, "verdict": "passed", "screenshots": ["step:8", "step:9"],
+            "evidence": "显示测试曲目",
+        }],
+    })
+    .to_string();
+    let fake = FakeClaude::judge(&format!(
+        "printf '%s\\n' '[\"step:8\",\"step:9\"]' > run/served.json\n{}",
+        success(&result)
+    ));
+    fs::write(
+        fake.run_dir.join("trace.json"),
+        json!({"evidence": ["final_page.txt"], "steps": [
+            {"idx": 7, "action": "tap", "after_labels": ["测试曲目"]},
+            {"idx": 8, "action": "tap", "target": "测试曲目", "after_labels": []},
+            {"idx": 9, "action": "tap", "after_labels": [" \t "], "new_labels": ["\n"]},
+        ]})
+        .to_string(),
+    )
+    .unwrap();
+    let mut case = case();
+    case.expected[0].text = "显示测试曲目".into();
+
+    fs::write(fake.run_dir.join("final_page.txt"), " \n").unwrap();
+    let r = fake.run_case(&case).await;
+    assert_eq!(
+        (r.status, r.final_result, r.items[0].verdict),
+        (
+            JudgeStatus::Completed,
+            FinalResult::Uncertain,
+            Verdict::Uncertain
+        )
+    );
+    assert_eq!(r.items[0].file_refs, ["step:8", "step:9"]);
+    assert_eq!(
+        r.items[0].evidence,
+        "所引步骤与终态页面均无可用文字，转待人工确认"
+    );
+
+    fs::write(fake.run_dir.join("final_page.txt"), "测试曲目").unwrap();
+    let r = fake.run_case(&case).await;
+    assert_eq!(
+        (r.final_result, r.items[0].verdict),
+        (FinalResult::Passed, Verdict::Passed)
+    );
+}
+
+#[tokio::test]
+async fn 仅引用已查看的有效步骤文字可判passed() {
+    let result = json!({
+        "result": "passed", "items": [{
+            "index": 1, "verdict": "passed", "screenshots": ["step:8"],
+            "evidence": "测试曲目",
+        }],
+    })
+    .to_string();
+    let fake = FakeClaude::judge(&format!(
+        "printf '%s\\n' '[\"step:8\"]' > run/served.json\n{}",
+        success(&result)
+    ));
+    fs::write(
+        fake.run_dir.join("trace.json"),
+        r#"{"steps":[{"idx":8,"action":"tap","after_labels":[" "],"new_labels":["测试曲目"]}]}"#,
+    )
+    .unwrap();
+    let mut case = case();
+    case.expected[0].text = "显示测试曲目".into();
+    let r = fake.run_case(&case).await;
+    assert_eq!(
+        (r.final_result, r.items[0].verdict),
+        (FinalResult::Passed, Verdict::Passed)
+    );
+    assert_eq!(r.items[0].file_refs, ["step:8"]);
+}
+
+#[tokio::test]
 async fn 只有步骤文字时启动假_claude并接受已查看的失败引用() {
     let actual = "Music size cannot exceed 50MB";
     let result = json!({"result": "failed", "items": [{
@@ -361,7 +453,7 @@ async fn 只有步骤文字时启动假_claude并接受已查看的失败引用(
         "evidence": actual,
     }]})
     .to_string();
-    let fake = FakeClaude::new(&format!(
+    let fake = FakeClaude::judge(&format!(
         "printf '%s\\n' '[\"step:8\"]' > run/served.json\n{}",
         success(&result)
     ));
@@ -403,7 +495,7 @@ async fn 只有步骤文字时启动假_claude并接受已查看的失败引用(
 
 #[tokio::test]
 async fn 只启用证据_mcp且沿用角色参数和本次取图记录() {
-    let mut fake = FakeClaude::new(&format!(
+    let mut fake = FakeClaude::judge(&format!(
         r#"
 previous=''
 for arg do
@@ -485,7 +577,7 @@ printf '%s\n' '["{SHOT}"]' > run/served.json
 
 #[tokio::test]
 async fn 旧查看记录清零且终态文字必须列在轨迹中() {
-    let fake = FakeClaude::new(&success(&passed()));
+    let fake = FakeClaude::judge(&success(&passed()));
     fake.add_shot();
     fs::write(fake.run_dir.join("served.json"), json!([SHOT]).to_string()).unwrap();
     fs::write(fake.run_dir.join("final_page.txt"), "未列入轨迹的文字").unwrap();
@@ -507,8 +599,33 @@ async fn 旧查看记录清零且终态文字必须列在轨迹中() {
 }
 
 #[tokio::test]
+async fn 会员登录检查失败时明确报错并跳过判定() {
+    for auth in [
+        r#"printf '%s\n' '{"loggedIn":false,"authMethod":"none"}'
+echo '虚构的登录诊断详情' >&2
+exit 1"#,
+        r#"printf '%s\n' '{"loggedIn":true,"authMethod":"api_key","apiProvider":"firstParty"}'"#,
+        r#"printf '%s\n' '{"loggedIn":true,"authMethod":"claude.ai","apiProvider":"firstParty","subscriptionType":null}'"#,
+    ] {
+        let fake = FakeClaude::judge_with_login(auth, &success(&passed()));
+        fake.add_shot();
+        let r = fake.run().await;
+        assert_eq!(
+            (r.status, r.final_result, r.quota_exhausted),
+            (JudgeStatus::Failed, FinalResult::Uncertain, false)
+        );
+        assert_eq!(
+            r.reason,
+            "判定调用失败，未检测到 Claude 会员登录，请在本机用 `claude auth login` 登录会员账号，转待人工确认"
+        );
+        assert!(r.raw.is_empty());
+        assert!(!fake.dir.join("claude.sh.prompt").exists());
+    }
+}
+
+#[tokio::test]
 async fn 会员额度耗尽标记且判定失败待确认() {
-    let fake = FakeClaude::new(
+    let fake = FakeClaude::judge(
         r#"echo '{"type":"rate_limit_event","rate_limit_info":{"status":"rejected"}}'
 echo '{"type":"result","is_error":true,"result":"已达上限"}'"#,
     );
@@ -524,7 +641,7 @@ echo '{"type":"result","is_error":true,"result":"已达上限"}'"#,
 
 #[tokio::test]
 async fn 命令成功但结果不可解析时判定失败待确认() {
-    let fake = FakeClaude::new(&success("{结果损坏}"));
+    let fake = FakeClaude::judge(&success("{结果损坏}"));
     fake.add_shot();
     let r = fake.run().await;
     assert_eq!(
@@ -537,7 +654,7 @@ async fn 命令成功但结果不可解析时判定失败待确认() {
 
 #[tokio::test]
 async fn 命令超时判定失败待确认() {
-    let mut fake = FakeClaude::new("sleep 10");
+    let mut fake = FakeClaude::judge("sleep 10");
     fake.add_shot();
     fake.opts.total_timeout = Duration::from_millis(200);
     let r = fake.run().await;

@@ -738,8 +738,47 @@ async fn 正确口令可创建并取消执行且无口令可查看详情() {
     assert_eq!(detail["status"], "cancelled");
 }
 
-fn file_route(run: Uuid, name: &str) -> String {
+/// 不带签名的文件路径，用于节点上传（上传走节点令牌，不走签名）。
+fn bare_file_route(run: Uuid, name: &str) -> String {
     format!("/api/runs/{run}/files/{name}")
+}
+
+/// 带有效签名的读取地址：读文件必须验签，测试用进程内同一把签名密钥生成。
+fn file_route(run: Uuid, name: &str) -> String {
+    let exp = chrono::Utc::now().timestamp() + crate::evidence_sign::TTL_SECS;
+    crate::evidence_sign::process_signer().url(run, name, exp)
+}
+
+/// 名字含百分号编码时：服务端对解码后的名字验签，所以对解码名签名，路径里放编码名。
+fn file_route_encoded(run: Uuid, decoded: &str, encoded: &str) -> String {
+    let signed = file_route(run, decoded);
+    let query = signed.split_once('?').expect("签名地址带查询串").1;
+    format!("{}?{query}", bare_file_route(run, encoded))
+}
+
+#[tokio::test]
+async fn 文件读取没有有效签名一律拒绝() {
+    let world = World::new().await;
+    let run = world.run().await;
+    assert_eq!(
+        upload(&world.app, run, world.node, "sig.png", PNG.to_vec()).await.0,
+        StatusCode::NO_CONTENT
+    );
+    // 签名正确时可读，作为对照。
+    assert_eq!(
+        request(&world.app, Method::GET, &file_route(run, "sig.png"), &[], "").await.0,
+        StatusCode::OK
+    );
+    let signed = file_route(run, "sig.png");
+    let bare = bare_file_route(run, "sig.png");
+    let tampered = signed.replacen("sig=", "sig=00", 1);
+    for url in [bare, tampered] {
+        assert_eq!(
+            request(&world.app, Method::GET, &url, &[], "").await.0,
+            StatusCode::FORBIDDEN,
+            "没有有效签名必须拒绝：{url}"
+        );
+    }
 }
 
 async fn upload(
@@ -752,7 +791,7 @@ async fn upload(
     request(
         app,
         Method::PUT,
-        &file_route(run, name),
+        &bare_file_route(run, name),
         &[
             ("authorization", &format!("Bearer {TOKEN}")),
             ("x-node-id", &node.to_string()),
@@ -766,15 +805,15 @@ async fn upload(
 async fn 文件读取拒绝路径穿越() {
     let temp = TempPaths::new();
     let app = temp.app(lazy_state());
-    for invalid in [
-        "%2e%2e%2fother.png",
-        "shot%5Cother.png",
-        "shot..png",
-        "sub/file.png",
-        "终态.txt",
+    // (解码后的名字, 路径里的编码写法)：签名有效但文件名非法，仍必须返回 404。
+    for (decoded, encoded) in [
+        ("../other.png", "%2e%2e%2fother.png"),
+        ("shot\\other.png", "shot%5Cother.png"),
+        ("shot..png", "shot..png"),
+        ("sub/file.png", "sub/file.png"),
+        ("终态.txt", "%E7%BB%88%E6%80%81.txt"),
     ] {
-        let path = file_route(Uuid::new_v4(), invalid);
-        let path = path.replace("终态", "%E7%BB%88%E6%80%81");
+        let path = file_route_encoded(Uuid::new_v4(), decoded, encoded);
         assert_eq!(
             request(&app, Method::GET, &path, &[], "").await.0,
             StatusCode::NOT_FOUND
@@ -1056,7 +1095,7 @@ async fn 录屏播放支持完整和单区间读取并拒绝非法区间与路�
         assert_eq!(headers[header::CONTENT_RANGE], "bytes */16");
         assert!(body.is_empty());
     }
-    let bad_url = file_route(run, "%2e%2e%2frec_01.mp4");
+    let bad_url = file_route_encoded(run, "../rec_01.mp4", "%2e%2e%2frec_01.mp4");
     assert_eq!(request(&world.app, Method::GET, &bad_url, &[("range", "bytes=0-3")], "").await.0, StatusCode::NOT_FOUND);
     #[cfg(unix)]
     {
@@ -1099,9 +1138,18 @@ async fn run详情按段返回录屏索引和步骤开始时间() {
     assert_eq!(detail["run_steps"][0]["at_ms"], epoch + 500);
     assert!(detail["run_steps"][1]["at_ms"].is_null());
     assert_eq!(detail["files"], json!([]));
-    assert_eq!(detail["recordings"], json!([
-        {"seq": 1, "url": file_route(run_id, "rec_01.mp4"), "size": MP4.len(), "start_epoch_ms": epoch, "duration_ms": 4999},
-        {"seq": 2, "url": file_route(run_id, "rec_02.mp4"), "size": MP4.len(), "start_epoch_ms": epoch + 5000, "duration_ms": 500}
+    // 详情返回的录屏地址必须是带 exp 和 sig 的签名地址；签名含过期时间不能整串比较，
+    // 先逐条确认前缀和签名参数，再去掉签名部分比较其余字段。
+    let mut recordings = detail["recordings"].clone();
+    for (item, name) in recordings.as_array_mut().unwrap().iter_mut().zip(["rec_01.mp4", "rec_02.mp4"]) {
+        let bare = bare_file_route(run_id, name);
+        let url = item["url"].as_str().unwrap().to_string();
+        assert!(url.starts_with(&format!("{bare}?exp=")) && url.contains("&sig="), "录屏地址缺少签名：{url}");
+        item["url"] = json!(bare);
+    }
+    assert_eq!(recordings, json!([
+        {"seq": 1, "url": bare_file_route(run_id, "rec_01.mp4"), "size": MP4.len(), "start_epoch_ms": epoch, "duration_ms": 4999},
+        {"seq": 2, "url": bare_file_route(run_id, "rec_02.mp4"), "size": MP4.len(), "start_epoch_ms": epoch + 5000, "duration_ms": 500}
     ]));
 }
 
