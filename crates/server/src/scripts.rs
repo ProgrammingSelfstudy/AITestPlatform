@@ -84,6 +84,10 @@ pub enum ScriptError {
     NotFound,
     #[error("状态不能从 {} 改为 {}", from.as_str(), to.as_str())]
     BadTransition { from: ScriptStatus, to: ScriptStatus },
+    #[error("同一用例已有获准的版本 {version}，请先下线它再获准新版本")]
+    AnotherApproved { version: i32 },
+    #[error("这个脚本依据的是用例版本 {script}，用例现在是版本 {current}，用例内容变过，旧脚本不能获准")]
+    CaseChanged { script: i32, current: i32 },
     #[error("数据库错误：{0}")]
     Db(#[from] sqlx::Error),
 }
@@ -287,17 +291,59 @@ pub async fn create_candidate(pool: &PgPool, new: &NewScript) -> Result<ScriptRe
 /// 改状态。只允许 [`ScriptStatus::can_move_to`] 规定的路径；`note` 记录原因（如自检失败的输出摘要、拒绝理由）。
 pub async fn transition(pool: &PgPool, id: Uuid, to: ScriptStatus, note: Option<&str>) -> Result<ScriptRecord, ScriptError> {
     let mut tx = pool.begin().await?;
-    let current: Option<String> = sqlx::query_scalar("select status from scripts where id = $1 for update").bind(id).fetch_optional(&mut *tx).await?;
-    let Some(current) = current else { return Err(ScriptError::NotFound) };
+    let current: Option<(String, Uuid, i32)> = sqlx::query_as("select status, case_id, case_version from scripts where id = $1 for update").bind(id).fetch_optional(&mut *tx).await?;
+    let Some((current, case_id, case_version)) = current else { return Err(ScriptError::NotFound) };
     let from = ScriptStatus::parse(&current).ok_or_else(|| sqlx::Error::Decode(format!("未知的脚本状态：{current}").into()))?;
     if !from.can_move_to(to) {
         return Err(ScriptError::BadTransition { from, to });
+    }
+    if to == ScriptStatus::Approved {
+        // 锁住用例行：两个脚本同时获准时串行化；库里还有唯一索引兜底。
+        let live: i32 = sqlx::query_scalar("select version from test_cases where id = $1 for update").bind(case_id).fetch_one(&mut *tx).await?;
+        if live != case_version {
+            return Err(ScriptError::CaseChanged { script: case_version, current: live });
+        }
+        let other: Option<i32> = sqlx::query_scalar("select version from scripts where case_id = $1 and status = 'approved' and id <> $2").bind(case_id).bind(id).fetch_optional(&mut *tx).await?;
+        if let Some(version) = other {
+            return Err(ScriptError::AnotherApproved { version });
+        }
     }
     let row = sqlx::query(concat!("update scripts set status = $2, status_note = $3, updated_at = clock_timestamp() where id = $1 returning ", columns!()))
         .bind(id).bind(to.as_str()).bind(note).fetch_one(&mut *tx).await?;
     let updated = record(&row)?;
     tx.commit().await?;
     Ok(updated)
+}
+
+/// 状态说明的字数上限（库里的约束是 2000）。
+pub const NOTE_LIMIT: usize = 2000;
+/// 人给的原因最多这么长；留出空间给之前的自检输出。
+pub const REASON_LIMIT: usize = 300;
+
+/// 在原有说明（如自检输出）后面追加这次人的决定，总长不超过 [`NOTE_LIMIT`]；放不下时截掉原说明的开头，保留末尾。
+pub fn append_note(old: Option<&str>, label: &str, reason: &str) -> String {
+    let tail = format!("\n—— {label}：{reason}");
+    let room = NOTE_LIMIT.saturating_sub(tail.chars().count());
+    let old = old.unwrap_or("").trim();
+    let count = old.chars().count();
+    let kept: String = if count > room { format!("…{}", old.chars().skip(count - room + 1).collect::<String>()) } else { old.to_string() };
+    if kept.is_empty() { tail.trim_start().to_string() } else { format!("{kept}{tail}") }
+}
+
+/// 一个项目里所有用例的全部脚本版本，按用例编号、版本从新到旧。带用例编号和标题，给页面直接展示。
+pub async fn list_by_project(pool: &PgPool, project: &str) -> Result<Vec<(String, String, ScriptRecord)>, sqlx::Error> {
+    // 列清单里的列名会和 test_cases 的同名列冲突，所以把脚本表单独包成子查询
+    sqlx::query(concat!(
+        "select c.code as case_code, c.title as case_title, s.* from (select ", columns!(), " from scripts) s ",
+        "join test_cases c on c.id = s.case_id join projects p on p.id = c.project_id ",
+        "where p.name = $1 order by c.code, s.version desc"
+    ))
+    .bind(project)
+    .fetch_all(pool)
+    .await?
+    .iter()
+    .map(|row| Ok((row.try_get("case_code")?, row.try_get("case_title")?, record(row)?)))
+    .collect()
 }
 
 pub async fn get(pool: &PgPool, id: Uuid) -> Result<Option<ScriptRecord>, sqlx::Error> {
@@ -321,6 +367,17 @@ mod tests {
 
     fn files(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
         pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    }
+
+    #[test]
+    fn 追加说明_短的原样保留_长的截掉开头保留末尾和原因() {
+        assert_eq!(append_note(Some("1 passed"), "获准", "可以"), "1 passed\n—— 获准：可以");
+        assert_eq!(append_note(None, "下线", "改版"), "—— 下线：改版".to_string());
+        assert_eq!(append_note(Some("  "), "下线", "改版"), "—— 下线：改版".to_string());
+        let long = format!("{}尾巴", "头".repeat(5000));
+        let note = append_note(Some(&long), "获准", &"因".repeat(300));
+        assert!(note.chars().count() <= NOTE_LIMIT, "{}", note.chars().count());
+        assert!(note.starts_with('…') && note.contains("尾巴\n—— 获准：") && note.ends_with(&"因".repeat(300)));
     }
 
     #[test]

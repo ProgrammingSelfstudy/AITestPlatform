@@ -85,7 +85,7 @@ pub(crate) async fn put(State(state): State<ApiState>, RoutePath(id): RoutePath<
         Err(e @ (ScriptError::InvalidFiles(_) | ScriptError::HashMismatch(_) | ScriptError::SourceRun(_))) => Err((StatusCode::UNPROCESSABLE_ENTITY, e.to_string())),
         Err(ScriptError::CaseNotFound) => Err(fail(StatusCode::NOT_FOUND, "用例不存在")),
         Err(ScriptError::Db(e)) => Err(internal(&e)),
-        Err(e @ (ScriptError::NotFound | ScriptError::BadTransition { .. })) => {
+        Err(e @ (ScriptError::NotFound | ScriptError::BadTransition { .. } | ScriptError::AnotherApproved { .. } | ScriptError::CaseChanged { .. })) => {
             tracing::error!("归档候选时出现不该出现的错误：{e}");
             Err(fail(StatusCode::INTERNAL_SERVER_ERROR, "归档失败"))
         }
@@ -180,7 +180,8 @@ pub(crate) async fn files(State(state): State<ApiState>, RoutePath(id): RoutePat
     })))
 }
 
-const MAX_DETAIL_CHARS: usize = 4000;
+/// 自检输出：库里状态说明上限 2000，要给之后获准或下线的原因留出空间。
+const MAX_DETAIL_CHARS: usize = 1800;
 
 /// 节点回报的自检结果。
 #[derive(Deserialize)]
@@ -214,6 +215,56 @@ pub(crate) async fn self_check(State(state): State<ApiState>, RoutePath(id): Rou
     }
 }
 
+/// 人的决定。原因是人写的，不是模型或脚本输出。
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct Decision {
+    #[serde(default)]
+    note: String,
+}
+
+/// 人工改状态：获准、下线、拒绝。认证用审核令牌（和创建任务、提交审核同一套，路由层校验），不是节点令牌：
+/// 「哪个版本能被平台拿去回归」是人的决定，节点不能替人决定。
+/// 状态机由 [`scripts::transition`] 保证：不能跳过自检直接获准，同一用例只能有一个获准版本，用例内容变过的旧脚本不能获准。
+async fn decide(state: ApiState, id: String, to: scripts::ScriptStatus, label: &str, reason_required: bool, body: Decision) -> Result<Json<ScriptRecord>, Failure> {
+    let script_id: Uuid = id.parse().map_err(|_| fail(StatusCode::NOT_FOUND, "没有这个脚本"))?;
+    let reason = body.note.trim();
+    if reason.chars().count() > scripts::REASON_LIMIT {
+        return Err(fail(StatusCode::UNPROCESSABLE_ENTITY, "原因太长，最多 300 字"));
+    }
+    if reason_required && reason.is_empty() {
+        return Err(fail(StatusCode::UNPROCESSABLE_ENTITY, &format!("{label}要写明原因")));
+    }
+    let pool = state.app.pool();
+    let old = scripts::get(pool, script_id).await.map_err(|e| internal(&e))?.ok_or_else(|| fail(StatusCode::NOT_FOUND, "没有这个脚本"))?;
+    let note = scripts::append_note(old.status_note.as_deref(), label, if reason.is_empty() { "（未写原因）" } else { reason });
+    match scripts::transition(pool, script_id, to, Some(&note)).await {
+        Ok(record) => Ok(Json(record)),
+        Err(e @ (ScriptError::BadTransition { .. } | ScriptError::AnotherApproved { .. } | ScriptError::CaseChanged { .. })) => Err((StatusCode::CONFLICT, e.to_string())),
+        Err(ScriptError::NotFound) => Err(fail(StatusCode::NOT_FOUND, "没有这个脚本")),
+        Err(ScriptError::Db(e)) => Err(internal(&e)),
+        Err(e) => {
+            tracing::error!("改脚本状态时出现不该出现的错误：{e}");
+            Err(fail(StatusCode::INTERNAL_SERVER_ERROR, "操作失败"))
+        }
+    }
+}
+
+/// `POST /api/scripts/{id}/approve`：获准，只有「自检通过」的脚本可以。原因可不写。
+pub(crate) async fn approve(State(state): State<ApiState>, RoutePath(id): RoutePath<String>, Json(body): Json<Decision>) -> Result<Json<ScriptRecord>, Failure> {
+    decide(state, id, scripts::ScriptStatus::Approved, "获准", false, body).await
+}
+
+/// `POST /api/scripts/{id}/retire`：下线已获准的脚本。要写明原因。
+pub(crate) async fn retire(State(state): State<ApiState>, RoutePath(id): RoutePath<String>, Json(body): Json<Decision>) -> Result<Json<ScriptRecord>, Failure> {
+    decide(state, id, scripts::ScriptStatus::Retired, "下线", true, body).await
+}
+
+/// `POST /api/scripts/{id}/reject`：人工拒绝候选或自检通过但不想用的脚本。要写明原因。
+pub(crate) async fn reject(State(state): State<ApiState>, RoutePath(id): RoutePath<String>, Json(body): Json<Decision>) -> Result<Json<ScriptRecord>, Failure> {
+    decide(state, id, scripts::ScriptStatus::Rejected, "拒绝", true, body).await
+}
+
 /// `GET /api/cases/{id}/scripts`：一个用例的全部脚本版本，新的在前。只有元数据，不含源码。
 pub(crate) async fn list(State(state): State<ApiState>, RoutePath(id): RoutePath<String>) -> Result<Json<Vec<ScriptRecord>>, Failure> {
     let case_id: Uuid = id.parse().map_err(|_| fail(StatusCode::NOT_FOUND, "没有这个用例"))?;
@@ -222,6 +273,21 @@ pub(crate) async fn list(State(state): State<ApiState>, RoutePath(id): RoutePath
         return Err(fail(StatusCode::NOT_FOUND, "没有这个用例"));
     }
     scripts::list_by_case(state.app.pool(), case_id).await.map(Json).map_err(|e| internal(&e))
+}
+
+/// 页面用的一行：脚本元数据加所属用例的编号和标题。
+#[derive(serde::Serialize)]
+pub(crate) struct ProjectScript {
+    case_code: String,
+    case_title: String,
+    #[serde(flatten)]
+    script: ScriptRecord,
+}
+
+/// `GET /api/projects/{project}/scripts`：项目里所有用例的全部脚本版本，只有元数据，不含源码。
+pub(crate) async fn list_project(State(state): State<ApiState>, RoutePath(project): RoutePath<String>) -> Result<Json<Vec<ProjectScript>>, Failure> {
+    let rows = scripts::list_by_project(state.app.pool(), &project).await.map_err(|e| internal(&e))?;
+    Ok(Json(rows.into_iter().map(|(case_code, case_title, script)| ProjectScript { case_code, case_title, script }).collect()))
 }
 
 /// 原始数据库错误只写日志，不返回给调用方。

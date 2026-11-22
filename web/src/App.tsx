@@ -2,17 +2,19 @@ import { Button, ConfigProvider, Empty, theme } from "antd";
 import zhCN from "antd/locale/zh_CN";
 import { useEffect, useState } from "react";
 import NodesPage from "./NodesPage";
+import ScriptsPage from "./ScriptsPage";
 import RunPage from "./RunPage";
 import { TaskPage, TasksPage } from "./TasksPage";
 import "./styles.css";
 
 type Mode = "light" | "dark";
-type Route = { page: "nodes" | "tasks" | "missing" } | { page: "task" | "run"; id: string };
+type Route = { page: "nodes" | "tasks" | "scripts" | "missing" } | { page: "task" | "run"; id: string };
 
 function readRoute(): Route {
   const hash = window.location.hash;
   if (!hash || hash === "#/nodes") return { page: "nodes" };
   if (hash === "#/tasks") return { page: "tasks" };
+  if (hash === "#/scripts") return { page: "scripts" };
   const match = /^#\/(tasks|runs)\/([a-z0-9-]+)$/i.exec(hash);
   if (match) return { page: match[1] === "tasks" ? "task" : "run", id: match[2] };
   return { page: "missing" };
@@ -32,6 +34,7 @@ function initialMode(): Mode {
 const BREADCRUMB: Record<Route["page"], string> = {
   nodes: "节点与设备",
   tasks: "测试任务",
+  scripts: "回归脚本",
   task: "任务详情",
   run: "运行详情",
   missing: "找不到这个页面",
@@ -109,7 +112,8 @@ function Shell({ mode, onToggle }: { mode: Mode; onToggle: () => void }) {
     return () => window.removeEventListener("hashchange", change);
   }, []);
   const nodes = route.page === "nodes";
-  const tasks = !nodes && route.page !== "missing";
+  const scripts = route.page === "scripts";
+  const tasks = !nodes && !scripts && route.page !== "missing";
 
   return (
     <div className="app-shell">
@@ -136,6 +140,13 @@ function Shell({ mode, onToggle }: { mode: Mode; onToggle: () => void }) {
                 <path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11" />
               </svg>
               <span>测试任务</span>
+            </a>
+            <a href="#/scripts" aria-current={scripts ? "page" : undefined}>
+              <svg className="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
+                <polyline points="16 18 22 12 16 6" />
+                <polyline points="8 6 2 12 8 18" />
+              </svg>
+              <span>回归脚本</span>
             </a>
           </nav>
         </div>
@@ -183,6 +194,7 @@ function Shell({ mode, onToggle }: { mode: Mode; onToggle: () => void }) {
         <main className="app-main">
           {route.page === "nodes" && <NodesPage />}
           {route.page === "tasks" && <TasksPage />}
+          {route.page === "scripts" && <ScriptsPage />}
           {route.page === "task" && <TaskPage key={route.id} id={route.id} />}
           {route.page === "run" && <RunPage key={route.id} id={route.id} />}
           {route.page === "missing" && (

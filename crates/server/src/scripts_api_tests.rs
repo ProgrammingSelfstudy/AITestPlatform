@@ -286,3 +286,176 @@ async fn 自检通过变自检通过_失败变已拒绝并记下原始输出_不
     let (status, _) = send(&world.app, Method::PUT, &format!("/api/scripts/{next}/self-check"), &headers, "not json").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
+
+// ---------------------------------------------------------------- 人工获准、下线、拒绝
+
+/// 人工操作：审核令牌 + 浏览器写保护要求的头。`token` 为 None 就不带令牌。
+async fn human(world: &World, script: Uuid, action: &str, note: Option<&str>, token: Option<&str>) -> (StatusCode, Value) {
+    let mut headers = WRITE_HEADERS.to_vec();
+    if let Some(token) = token {
+        headers.push(("x-review-token", token));
+    }
+    let body = note.map_or_else(|| json!({}), |n| json!({"note": n}));
+    let (status, _, bytes) = request(&world.app, Method::POST, &format!("/api/scripts/{script}/{action}"), &headers, body.to_string()).await;
+    (status, serde_json::from_slice(&bytes).unwrap_or_else(|_| json!(text(&bytes))))
+}
+
+async fn self_check_passed(world: &World, script: Uuid, detail: &str) {
+    let (status, _) = send(&world.app, Method::PUT, &format!("/api/scripts/{script}/self-check"), &node_headers(world.node), json!({"passed": true, "detail": detail}).to_string()).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+/// 同一次通过的执行再归档一条内容不同的候选。
+async fn archive_another(world: &World, run: Uuid, marker: &str) -> Uuid {
+    let body = upload_body(&files(&format!("def test_a():\n    assert {marker}\n")));
+    let (status, bytes) = send(&world.app, Method::PUT, &script_route(run), &node_headers(world.node), body.to_string()).await;
+    assert_eq!(status, StatusCode::CREATED, "{}", text(&bytes));
+    json_body(&bytes)["id"].as_str().unwrap().parse().unwrap()
+}
+
+#[tokio::test]
+async fn 完整流程_不能跳过自检_获准保留自检输出_下线要写原因() {
+    let world = World::new().await;
+    let run = world.run().await;
+    let script = archived(&world, run).await;
+
+    let (status, body) = human(&world, script, "approve", None, Some(REVIEW_TOKEN)).await;
+    assert_eq!(status, StatusCode::CONFLICT, "候选不能跳过自检直接获准");
+    assert!(body.as_str().unwrap().contains("candidate"), "{body}");
+
+    self_check_passed(&world, script, "1 passed in 70s").await;
+    let (status, body) = human(&world, script, "approve", Some("看过轨迹，可以用"), Some(REVIEW_TOKEN)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["status"], "approved");
+    let note = body["status_note"].as_str().unwrap();
+    assert!(note.contains("1 passed in 70s") && note.contains("获准：看过轨迹，可以用"), "自检输出要保留，后面追加人的决定：{note}");
+
+    let (status, _) = human(&world, script, "retire", None, Some(REVIEW_TOKEN)).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "下线要写原因");
+    let (status, _) = human(&world, script, "retire", Some("  "), Some(REVIEW_TOKEN)).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "只有空白也不算原因");
+    let (status, body) = human(&world, script, "retire", Some("界面改版了"), Some(REVIEW_TOKEN)).await;
+    assert_eq!((status, body["status"].as_str()), (StatusCode::OK, Some("retired")));
+    assert!(body["status_note"].as_str().unwrap().contains("下线：界面改版了"));
+
+    let (status, _) = human(&world, script, "retire", Some("再来一次"), Some(REVIEW_TOKEN)).await;
+    assert_eq!(status, StatusCode::CONFLICT, "下线是终点");
+    let (status, _) = human(&world, script, "approve", None, Some(REVIEW_TOKEN)).await;
+    assert_eq!(status, StatusCode::CONFLICT, "下线后不能再获准");
+}
+
+#[tokio::test]
+async fn 同一用例只能有一个获准版本_先下线才能获准新版本() {
+    let world = World::new().await;
+    let run = world.run().await;
+    let first = archived(&world, run).await;
+    let second = archive_another(&world, run, "2").await;
+    self_check_passed(&world, first, "ok").await;
+    self_check_passed(&world, second, "ok").await;
+
+    assert_eq!(human(&world, first, "approve", None, Some(REVIEW_TOKEN)).await.0, StatusCode::OK);
+    let (status, body) = human(&world, second, "approve", None, Some(REVIEW_TOKEN)).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(body.as_str().unwrap().contains("已有获准的版本 1"), "{body}");
+    let still: String = sqlx::query_scalar("select status from scripts where id = $1").bind(second).fetch_one(world.state.pool()).await.unwrap();
+    assert_eq!(still, "self_check_passed", "失败的获准不能改状态");
+
+    assert_eq!(human(&world, first, "retire", Some("换新版"), Some(REVIEW_TOKEN)).await.0, StatusCode::OK);
+    assert_eq!(human(&world, second, "approve", None, Some(REVIEW_TOKEN)).await.0, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn 用例内容变过的旧脚本不能获准() {
+    let world = World::new().await;
+    let run = world.run().await;
+    let script = archived(&world, run).await;
+    self_check_passed(&world, script, "ok").await;
+    sqlx::query("update test_cases set version = version + 1 where id = $1").bind(case_of(&world, run).await).execute(world.state.pool()).await.unwrap();
+    let (status, body) = human(&world, script, "approve", None, Some(REVIEW_TOKEN)).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(body.as_str().unwrap().contains("用例内容变过"), "{body}");
+}
+
+#[tokio::test]
+async fn 人工拒绝要写原因_候选和自检通过都可拒绝_获准后不能拒绝() {
+    let world = World::new().await;
+    let run = world.run().await;
+    let a = archived(&world, run).await;
+    let b = archive_another(&world, run, "2").await;
+    let c = archive_another(&world, run, "3").await;
+    assert_eq!(human(&world, a, "reject", None, Some(REVIEW_TOKEN)).await.0, StatusCode::UNPROCESSABLE_ENTITY);
+    let (status, body) = human(&world, a, "reject", Some("断言太弱"), Some(REVIEW_TOKEN)).await;
+    assert_eq!((status, body["status"].as_str()), (StatusCode::OK, Some("rejected")));
+    self_check_passed(&world, b, "ok").await;
+    assert_eq!(human(&world, b, "reject", Some("不想用"), Some(REVIEW_TOKEN)).await.0, StatusCode::OK);
+    self_check_passed(&world, c, "ok").await;
+    human(&world, c, "approve", None, Some(REVIEW_TOKEN)).await;
+    assert_eq!(human(&world, c, "reject", Some("反悔"), Some(REVIEW_TOKEN)).await.0, StatusCode::CONFLICT, "获准后只能下线");
+}
+
+#[tokio::test]
+async fn 人工操作要审核令牌_节点令牌不行_未知脚本404() {
+    let world = World::new().await;
+    let run = world.run().await;
+    let script = archived(&world, run).await;
+    self_check_passed(&world, script, "ok").await;
+    for token in [None, Some("wrong-token-0123456789")] {
+        for action in ["approve", "retire", "reject"] {
+            assert_eq!(human(&world, script, action, Some("x"), token).await.0, StatusCode::FORBIDDEN, "{action} {token:?}");
+        }
+    }
+    // 节点令牌和节点编号不是人的授权。
+    let mut headers = WRITE_HEADERS.to_vec();
+    let bearer = format!("Bearer {TOKEN}");
+    let node = world.node.to_string();
+    headers.extend([("authorization", bearer.as_str()), ("x-node-id", node.as_str())]);
+    let (status, _, _) = request(&world.app, Method::POST, &format!("/api/scripts/{script}/approve"), &headers, "{}").await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "节点不能替人决定");
+    let still: String = sqlx::query_scalar("select status from scripts where id = $1").bind(script).fetch_one(world.state.pool()).await.unwrap();
+    assert_eq!(still, "self_check_passed", "被拒绝的请求不能改状态");
+
+    assert_eq!(human(&world, Uuid::new_v4(), "approve", None, Some(REVIEW_TOKEN)).await.0, StatusCode::NOT_FOUND);
+    let (status, _, _) = request(&world.app, Method::POST, "/api/scripts/not-a-uuid/approve", &review_headers(REVIEW_TOKEN), "{}").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn 状态说明不超过库里的上限_自检输出长也能获准() {
+    let world = World::new().await;
+    let run = world.run().await;
+    let script = archived(&world, run).await;
+    let long = "长".repeat(1800);
+    self_check_passed(&world, script, &long).await;
+    let reason = "因".repeat(300);
+    let (status, body) = human(&world, script, "approve", Some(&reason), Some(REVIEW_TOKEN)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let note = body["status_note"].as_str().unwrap();
+    assert!(note.chars().count() <= 2000 && note.ends_with(&reason), "原因必须完整保留，截的是旧输出的开头");
+    assert_eq!(human(&world, script, "retire", Some(&"因".repeat(301)), Some(REVIEW_TOKEN)).await.0, StatusCode::UNPROCESSABLE_ENTITY);
+
+    let other = archive_another(&world, run, "2").await;
+    let too_long = "x".repeat(1801);
+    let (status, _) = send(&world.app, Method::PUT, &format!("/api/scripts/{other}/self-check"), &node_headers(world.node), json!({"passed": true, "detail": too_long}).to_string()).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "自检输出超过 1800 字要拒收，而不是写库时才报错");
+}
+
+#[tokio::test]
+async fn 按项目列出所有脚本_带用例编号和标题_不带源码() {
+    let world = World::new().await;
+    let run = world.run().await;
+    let first = archived(&world, run).await;
+    archive_another(&world, run, "2").await;
+    let project: String = sqlx::query_scalar("select p.name from projects p join test_cases c on c.project_id = p.id where c.id = $1").bind(case_of(&world, run).await).fetch_one(world.state.pool()).await.unwrap();
+    let (status, body) = send(&world.app, Method::GET, &format!("/api/projects/{project}/scripts"), &[], "").await;
+    assert_eq!(status, StatusCode::OK, "{}", text(&body));
+    let rows = json_body(&body);
+    let rows = rows.as_array().unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0]["case_code"], "TC-04");
+    assert!(rows[0]["case_title"].as_str().is_some_and(|t| !t.is_empty()));
+    assert_eq!((rows[0]["version"].as_i64(), rows[1]["version"].as_i64()), (Some(2), Some(1)), "同一用例新版本在前");
+    assert_eq!(rows[1]["id"].as_str(), Some(first.to_string().as_str()));
+    assert!(rows.iter().all(|r| r.get("files").is_none()), "不带源码");
+    let (status, body) = send(&world.app, Method::GET, "/api/projects/不存在的项目/scripts", &[], "").await;
+    assert_eq!((status, json_body(&body)), (StatusCode::OK, json!([])));
+}

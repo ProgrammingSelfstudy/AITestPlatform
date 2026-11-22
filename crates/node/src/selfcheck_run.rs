@@ -24,8 +24,8 @@ use uuid::Uuid;
 
 use crate::setup_runner::{kill_group, SetupSpec};
 
-/// 输出里保留的末尾字符数：足够看清失败原因，又不超过服务端状态说明的 4000 字上限。
-const DETAIL_CHARS: usize = 3500;
+/// 输出里保留的末尾字符数：足够看清失败原因；服务端状态说明总共 2000 字，还要给之后获准或下线的原因留空间。
+const DETAIL_CHARS: usize = 1500;
 
 pub struct CheckConfig {
     pub platform_http: Url,

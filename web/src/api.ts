@@ -162,6 +162,27 @@ export interface Models {
   judge: ModelGroup;
 }
 
+export type ScriptStatus = "candidate" | "self_check_passed" | "approved" | "rejected" | "retired";
+
+/** 回归脚本的一个版本（只有元数据，不含源码） */
+export interface ScriptRow {
+  id: string;
+  case_code: string;
+  case_title: string;
+  version: number;
+  case_version: number;
+  source_run_id: string;
+  file_names: string[];
+  gen_source: "claude_cli" | "codex_exec";
+  gen_model: string | null;
+  gen_effort: string | null;
+  notes: string;
+  status: ScriptStatus;
+  status_note: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
 export interface NewTask {
   project: string;
   node_id: string;
@@ -214,6 +235,8 @@ const runReviewsPath = (id: string) => `/api/runs/${encodeURIComponent(id)}/revi
 export const fetchRunReviews = (id: string, signal?: AbortSignal) => get<RunReviews>(runReviewsPath(id), signal);
 export const fetchReviewStats = (signal?: AbortSignal) => get<ReviewStats>("/api/reviews/stats", signal);
 export const fetchModels = (signal?: AbortSignal) => get<Models>("/api/models", signal);
+export const fetchScripts = (project: string, signal?: AbortSignal) =>
+  get<ScriptRow[]>(`/api/projects/${encodeURIComponent(project)}/scripts`, signal);
 export const fetchCases = (project: string, signal?: AbortSignal) =>
   get<CaseSummary[]>(`/api/projects/${encodeURIComponent(project)}/cases`, signal);
 
@@ -225,6 +248,11 @@ export async function createTask(task: NewTask, token: string, userToken: string
 
 export async function cancelRun(id: string, token: string): Promise<void> {
   await post(`/api/runs/${encodeURIComponent(id)}/cancel`, {}, token);
+}
+
+/** 获准、下线、拒绝脚本：人的决定，用审核口令。原因下线和拒绝必填，获准可不写。 */
+export async function decideScript(id: string, action: "approve" | "retire" | "reject", note: string, token: string): Promise<void> {
+  await post(`/api/scripts/${encodeURIComponent(id)}/${action}`, { note }, token);
 }
 
 export async function submitReview(id: string, review: ReviewSubmission, token: string): Promise<number> {

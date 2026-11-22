@@ -65,7 +65,7 @@ pub(crate) fn routes(app: AppState, paths: Paths) -> Router {
         .route(
             "/api/runs/{id}/reviews",
             post(reviews::submit)
-                .route_layer(authorize_write)
+                .route_layer(authorize_write.clone())
                 .get(reviews::list),
         )
         .route("/api/reviews/stats", get(reviews::stats))
@@ -78,8 +78,12 @@ pub(crate) fn routes(app: AppState, paths: Paths) -> Router {
         .route("/api/runs/{id}/scripts", put(crate::scripts_api::put))
         .route("/api/runs/{id}/script-source", get(crate::scripts_api::source))
         .route("/api/cases/{id}/scripts", get(crate::scripts_api::list))
+        .route("/api/projects/{project}/scripts", get(crate::scripts_api::list_project))
         .route("/api/scripts/{id}/files", get(crate::scripts_api::files))
         .route("/api/scripts/{id}/self-check", put(crate::scripts_api::self_check))
+        .route("/api/scripts/{id}/approve", post(crate::scripts_api::approve).route_layer(authorize_write.clone()))
+        .route("/api/scripts/{id}/retire", post(crate::scripts_api::retire).route_layer(authorize_write.clone()))
+        .route("/api/scripts/{id}/reject", post(crate::scripts_api::reject).route_layer(authorize_write.clone()))
         .with_state(ApiState {
             app,
             paths,
