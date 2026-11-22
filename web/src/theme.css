@@ -1,0 +1,146 @@
+/* 设计系统变量：参考智能评测工作台设计稿，提供浅色与深色两套主题 */
+:root {
+  /* 画布与表面色 */
+  --bg-canvas: #fafafa;
+  --bg-surface: #ffffff;
+  --bg-subtle: #f4f4f5;
+  --bg-hover: #f8fafc;
+
+  /* 边框色 */
+  --border-hairline: rgba(15, 23, 42, 0.08);
+  --border-strong: rgba(15, 23, 42, 0.14);
+
+  /* 文字色（浅色模式下确保清晰对比度） */
+  --text-primary: #09090b;
+  --text-secondary: #52525b;
+  --text-muted: #71717a;
+
+  /* 强调色 */
+  --accent: #2563eb;
+  --accent-solid: #2563eb;
+  --accent-hover: #1d4ed8;
+  --accent-soft: rgba(37, 99, 235, 0.08);
+
+  /* 8 种运行状态语义色（浅色主题，兼顾辨识度与 WCAG AA 对比度） */
+  /* 1. 通过 */
+  --st-pass-fg: #047857;
+  --st-pass-bg: rgba(5, 150, 105, 0.10);
+  /* 2. 失败 */
+  --st-fail-fg: #be123c;
+  --st-fail-bg: rgba(225, 29, 72, 0.10);
+  /* 3. 待人工确认 */
+  --st-unc-fg: #b45309;
+  --st-unc-bg: rgba(217, 119, 6, 0.11);
+  /* 4. 受阻 */
+  --st-blk-fg: #475569;
+  --st-blk-bg: rgba(71, 85, 105, 0.11);
+  /* 5. 运行中 / 判定中 */
+  --st-run-fg: #1d4ed8;
+  --st-run-bg: rgba(37, 99, 235, 0.10);
+  /* 6. 排队 / 已分配 */
+  --st-que-fg: #52525b;
+  --st-que-bg: rgba(113, 113, 122, 0.11);
+  /* 7. 已取消 */
+  --st-can-fg: #6b7280;
+  --st-can-bg: rgba(113, 113, 122, 0.08);
+  /* 8. 节点丢失 */
+  --st-lost-fg: #c2410c;
+  --st-lost-bg: rgba(234, 88, 12, 0.11);
+
+  /* 阴影层级 */
+  --shadow-xs: 0 1px 2px rgba(15, 23, 42, 0.04);
+  --shadow-sm: 0 4px 12px -2px rgba(15, 23, 42, 0.06), 0 1px 3px rgba(15, 23, 42, 0.04);
+  --shadow-pop: 0 10px 28px -4px rgba(15, 23, 42, 0.12), 0 2px 6px rgba(15, 23, 42, 0.05);
+  --shadow-lg: 0 24px 48px -12px rgba(15, 23, 42, 0.18);
+
+  /* 圆角与间距 */
+  --radius-sm: 8px;
+  --radius-md: 12px;
+  --radius-lg: 16px;
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+  --space-7: 28px;
+  --space-8: 32px;
+
+  /* 字体栈（仅使用本地系统字体，不联网加载） */
+  --font-sans: -apple-system, BlinkMacSystemFont, "PingFang SC", "Hiragino Sans GB", "Inter", "Microsoft YaHei", sans-serif;
+  --font-mono: "SF Mono", "JetBrains Mono", ui-monospace, Menlo, Consolas, monospace;
+
+  /* 兼容别名：供只读样式文件（如 runpage.css）复用 */
+  --surface: var(--bg-surface);
+  --soft: var(--bg-subtle);
+  --border: var(--border-hairline);
+  --text: var(--text-primary);
+  --text-2: var(--text-secondary);
+  --text-3: var(--text-muted);
+  --accent-bg: var(--accent-soft);
+  --app-font: var(--font-sans);
+  --mono: var(--font-mono);
+  --pass: var(--st-pass-fg);
+  --pass-bg: var(--st-pass-bg);
+  --fail: var(--st-fail-fg);
+  --fail-bg: var(--st-fail-bg);
+  --unc: var(--st-unc-fg);
+  --unc-bg: var(--st-unc-bg);
+  --blk: var(--st-blk-fg);
+  --blk-bg: var(--st-blk-bg);
+  --run: var(--st-run-fg);
+  --run-bg: var(--st-run-bg);
+  --que: var(--st-que-fg);
+  --que-bg: var(--st-que-bg);
+  --can: var(--st-can-fg);
+  --can-bg: var(--st-can-bg);
+  --lost: var(--st-lost-fg);
+  --lost-bg: var(--st-lost-bg);
+}
+
+:root[data-theme="dark"] {
+  /* 画布与表面色 */
+  --bg-canvas: #09090b;
+  --bg-surface: #111114;
+  --bg-subtle: #18181b;
+  --bg-hover: #1c1c21;
+
+  /* 边框色 */
+  --border-hairline: rgba(255, 255, 255, 0.08);
+  --border-strong: rgba(255, 255, 255, 0.16);
+
+  /* 文字色（深色模式下确保可读性） */
+  --text-primary: #fafafa;
+  --text-secondary: #a1a1aa;
+  --text-muted: #8b8b94;
+
+  /* 强调色 */
+  --accent: #60a5fa;
+  --accent-solid: #3b82f6;
+  --accent-hover: #93c5fd;
+  --accent-soft: rgba(59, 130, 246, 0.14);
+
+  /* 8 种运行状态语义色（深色主题，保持高对比度） */
+  --st-pass-fg: #34d399;
+  --st-pass-bg: rgba(52, 211, 153, 0.13);
+  --st-fail-fg: #fb7185;
+  --st-fail-bg: rgba(251, 113, 133, 0.13);
+  --st-unc-fg: #fbbf24;
+  --st-unc-bg: rgba(251, 191, 36, 0.14);
+  --st-blk-fg: #94a3b8;
+  --st-blk-bg: rgba(148, 163, 184, 0.15);
+  --st-run-fg: #60a5fa;
+  --st-run-bg: rgba(96, 165, 250, 0.15);
+  --st-que-fg: #a1a1aa;
+  --st-que-bg: rgba(161, 161, 170, 0.13);
+  --st-can-fg: #8b8b94;
+  --st-can-bg: rgba(113, 113, 122, 0.10);
+  --st-lost-fg: #fb923c;
+  --st-lost-bg: rgba(251, 146, 60, 0.15);
+
+  /* 阴影层级 */
+  --shadow-xs: 0 1px 2px rgba(0, 0, 0, 0.4);
+  --shadow-sm: 0 8px 24px -4px rgba(0, 0, 0, 0.5);
+  --shadow-pop: 0 12px 32px -4px rgba(0, 0, 0, 0.65);
+  --shadow-lg: 0 24px 56px -12px rgba(0, 0, 0, 0.7);
+}

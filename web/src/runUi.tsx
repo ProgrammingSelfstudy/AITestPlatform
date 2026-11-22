@@ -72,10 +72,12 @@ export function FinalTag({ run, large }: { run: RunView; large?: boolean }) {
   return <Pill kind={result.kind} large={large}>{result.text}</Pill>;
 }
 
+/** Judge 状态：只有判定失败才用警告色；还没轮到判定显示「—」，没运行是中性灰，避免排队中的用例也亮橙色警告 */
 export function JudgeTag({ status }: { status: JudgeStatus | null }) {
-  return status === "completed"
-    ? <Pill kind="info">Judge 已完成</Pill>
-    : <Pill kind="uncertain" title={status === "failed" ? "Judge 判定失败" : "尚无判定结果"}>Judge 未完成</Pill>;
+  if (status === "completed") return <Pill kind="info">Judge 已完成</Pill>;
+  if (status === "failed") return <Pill kind="uncertain" title="Judge 判定失败，需要人工确认">Judge 判定失败</Pill>;
+  if (status === "not_run") return <Pill kind="queued" title="这次执行没有运行 Judge">Judge 未运行</Pill>;
+  return <span title="尚未进入判定">—</span>;
 }
 
 /** 结果分段条：通过 / 失败 / 待确认 / 受阻 / 进行中的比例，旁边的文字由调用方给出 */

@@ -112,7 +112,10 @@ export interface RunDetail extends RunView {
   run_steps: RunStep[];
   judge_items: JudgeItem[];
   files: string[];
+  file_urls: Record<string, string>;
   recordings: Recording[];
+  evidence_expires_at: number;
+  evidence_key_id: string;
 }
 
 export type ReviewMark = "correct" | "passed" | "failed";
@@ -243,6 +246,6 @@ export async function submitReview(id: string, review: ReviewSubmission, token: 
   }
 }
 
-export function evidenceUrl(id: string, name: string): string {
-  return `/api/runs/${encodeURIComponent(id)}/files/${encodeURIComponent(name)}`;
+export function evidenceUrl(run: RunDetail, name: string): string | undefined {
+  return run.file_urls[name];
 }

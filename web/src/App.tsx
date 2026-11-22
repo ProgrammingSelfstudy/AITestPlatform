@@ -1,4 +1,4 @@
-import { ConfigProvider, Empty, theme } from "antd";
+import { Button, ConfigProvider, Empty, theme } from "antd";
 import zhCN from "antd/locale/zh_CN";
 import { useEffect, useState } from "react";
 import NodesPage from "./NodesPage";
@@ -29,7 +29,13 @@ function initialMode(): Mode {
   return window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
 }
 
-const BREADCRUMB: Record<Route["page"], string> = { nodes: "节点与设备", tasks: "任务", task: "任务详情", run: "运行详情", missing: "找不到这个页面" };
+const BREADCRUMB: Record<Route["page"], string> = {
+  nodes: "节点与设备",
+  tasks: "测试任务",
+  task: "任务详情",
+  run: "运行详情",
+  missing: "找不到这个页面",
+};
 
 export default function App() {
   const [mode, setMode] = useState<Mode>(initialMode);
@@ -51,6 +57,42 @@ export default function App() {
           colorBgContainer: dark ? "#111114" : "#ffffff",
           colorBgElevated: dark ? "#18181b" : "#ffffff",
           colorBgLayout: dark ? "#09090b" : "#fafafa",
+          colorBorder: dark ? "rgba(255, 255, 255, 0.10)" : "rgba(15, 23, 42, 0.10)",
+          colorBorderSecondary: dark ? "rgba(255, 255, 255, 0.08)" : "rgba(15, 23, 42, 0.08)",
+          colorText: dark ? "#fafafa" : "#09090b",
+          colorTextSecondary: dark ? "#a1a1aa" : "#52525b",
+          fontFamily: '-apple-system, BlinkMacSystemFont, "PingFang SC", "Hiragino Sans GB", "Inter", "Microsoft YaHei", sans-serif',
+        },
+        components: {
+          Button: {
+            primaryShadow: "none",
+            defaultShadow: "none",
+            defaultBg: dark ? "#111114" : "#ffffff",
+            defaultBorderColor: dark ? "rgba(255, 255, 255, 0.10)" : "rgba(15, 23, 42, 0.10)",
+          },
+          Select: {
+            optionSelectedBg: dark ? "rgba(59, 130, 246, 0.14)" : "rgba(37, 99, 235, 0.08)",
+            optionSelectedColor: dark ? "#60a5fa" : "#2563eb",
+            optionActiveBg: dark ? "#18181b" : "#f4f4f5",
+          },
+          Modal: {
+            borderRadiusLG: 16,
+            contentBg: dark ? "#111114" : "#ffffff",
+            headerBg: dark ? "#111114" : "#ffffff",
+          },
+          Table: {
+            headerBg: "transparent",
+            headerSplitColor: "transparent",
+            headerColor: dark ? "#8b8b94" : "#71717a",
+            rowHoverBg: dark ? "#1c1c21" : "#f8fafc",
+            borderColor: dark ? "rgba(255, 255, 255, 0.08)" : "rgba(15, 23, 42, 0.08)",
+            cellPaddingBlock: 14,
+            cellPaddingInline: 20,
+          },
+          Segmented: {
+            trackBg: dark ? "#18181b" : "#f4f4f5",
+            itemSelectedBg: dark ? "#111114" : "#ffffff",
+          },
         },
       }}
     >
@@ -76,26 +118,81 @@ function Shell({ mode, onToggle }: { mode: Mode; onToggle: () => void }) {
           <span className="app-brand-mark" aria-hidden="true">AI</span>
           <span className="app-name">AI 测试平台</span>
         </a>
-        <nav aria-label="主导航" className="app-nav">
+        <div className="app-nav-group">
           <div className="nav-label">核心工作台</div>
-          <a href="#/nodes" aria-current={nodes ? "page" : undefined}>节点与设备</a>
-          <a href="#/tasks" aria-current={tasks ? "page" : undefined}>任务</a>
-        </nav>
+          <nav aria-label="主导航" className="app-nav">
+            <a href="#/nodes" aria-current={nodes ? "page" : undefined}>
+              <svg className="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
+                <rect x="2" y="3" width="20" height="8" rx="2" />
+                <rect x="2" y="13" width="20" height="8" rx="2" />
+                <line x1="6" y1="7" x2="6.01" y2="7" />
+                <line x1="6" y1="17" x2="6.01" y2="17" />
+              </svg>
+              <span>节点与设备</span>
+            </a>
+            <a href="#/tasks" aria-current={tasks ? "page" : undefined}>
+              <svg className="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
+                <path d="M9 11l3 3L22 4" />
+                <path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11" />
+              </svg>
+              <span>测试任务</span>
+            </a>
+          </nav>
+        </div>
+        <div className="sidebar-note">
+          <div className="sidebar-note-title">执行隔离规则</div>
+          <div>任务只能在发起人自己的节点上执行，凭据仅在节点运行时注入。</div>
+        </div>
       </aside>
       <div className="app-body">
         <header className="app-topbar">
           <div className="breadcrumb" aria-label="当前位置">
-            {route.page === "task" || route.page === "run" ? <><a href="#/tasks">任务</a><span>/</span></> : null}
-            <strong>{BREADCRUMB[route.page]}</strong>
+            {route.page === "task" || route.page === "run" ? (
+              <>
+                <a href="#/tasks">测试任务</a>
+                <span className="breadcrumb-sep" aria-hidden="true">/</span>
+                <strong>
+                  {route.page === "task" ? "任务" : "运行"}{" "}
+                  <span className="mono">{route.id.slice(0, 8)}</span>
+                </strong>
+              </>
+            ) : (
+              <>
+                <span>工作区</span>
+                <span className="breadcrumb-sep" aria-hidden="true">/</span>
+                <strong>{BREADCRUMB[route.page]}</strong>
+              </>
+            )}
           </div>
-          <button type="button" className="theme-toggle" onClick={onToggle}>{mode === "dark" ? "浅色模式" : "深色模式"}</button>
+          <div className="topbar-actions">
+            <button type="button" className="theme-toggle" onClick={onToggle}>
+              {mode === "dark" ? (
+                <svg className="theme-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
+                  <circle cx="12" cy="12" r="4" />
+                  <path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41" />
+                </svg>
+              ) : (
+                <svg className="theme-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
+                  <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z" />
+                </svg>
+              )}
+              <span>{mode === "dark" ? "浅色模式" : "深色模式"}</span>
+            </button>
+          </div>
         </header>
         <main className="app-main">
           {route.page === "nodes" && <NodesPage />}
           {route.page === "tasks" && <TasksPage />}
           {route.page === "task" && <TaskPage key={route.id} id={route.id} />}
           {route.page === "run" && <RunPage key={route.id} id={route.id} />}
-          {route.page === "missing" && <Empty description="找不到这个页面" />}
+          {route.page === "missing" && (
+            <div className="card empty-state">
+              <Empty description="找不到这个页面" />
+              <div className="missing-actions">
+                <Button type="primary" href="#/tasks">返回任务列表</Button>
+              </div>
+            </div>
+          )}
         </main>
       </div>
     </div>

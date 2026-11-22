@@ -1,5 +1,5 @@
 import { Alert, Button, Descriptions, Empty, Modal, Skeleton, Space, Tag, Typography } from "antd";
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { evidenceUrl, fetchRun, type JudgeItem, type RunDetail, type RunStep } from "./api";
 import RecordingPlayer, { type RecordingControls } from "./RecordingPlayer";
 import { ReviewPanel, ReviewWorkspace } from "./RunReviews";
@@ -47,11 +47,40 @@ function targetFor(step: RunStep): string | undefined {
   if (typeof value === "string" && value) return value;
 }
 
-const runInProgress = (run: RunDetail) => !isTerminal(run);
+const EVIDENCE_RENEW_MS = 9 * 60 * 1000;
+type RunPoll = { run: RunDetail; renewInMs: number };
+const runInProgress = ({ run }: RunPoll) => !isTerminal(run);
 
 export default function RunPage({ id }: { id: string }) {
-  const load = useCallback((signal: AbortSignal) => fetchRun(id, signal), [id]);
-  const { data: run, error } = usePolling(load, REFRESH_MS, runInProgress);
+  const previous = useRef<RunDetail>(null);
+  const load = useCallback(async (signal: AbortSignal): Promise<RunPoll> => {
+    const run = await fetchRun(id, signal);
+    const last = previous.current;
+    let renewInMs = EVIDENCE_RENEW_MS;
+    if (last && last.run_id === run.run_id && last.evidence_key_id === run.evidence_key_id) {
+      const ageMs = (run.evidence_expires_at - last.evidence_expires_at) * 1000;
+      if (ageMs >= 0 && ageMs < EVIDENCE_RENEW_MS) {
+        // 保留可用的链接，避免常规轮询反复重新加载图片和录屏。
+        for (const name of Object.keys(run.file_urls)) {
+          run.file_urls[name] = evidenceUrl(last, name) ?? run.file_urls[name];
+        }
+        const recordingUrls = new Map(last.recordings.map(({ seq, url }) => [seq, url]));
+        run.recordings = run.recordings.map((segment) => ({ ...segment, url: recordingUrls.get(segment.seq) ?? segment.url }));
+        run.evidence_expires_at = last.evidence_expires_at;
+        renewInMs -= ageMs;
+      }
+    }
+    if (!signal.aborted) previous.current = run;
+    return { run, renewInMs };
+  }, [id]);
+  const { data, error, reload } = usePolling(load, REFRESH_MS, runInProgress);
+  useEffect(() => {
+    if (data && isTerminal(data.run)) {
+      const timer = window.setTimeout(reload, data.renewInMs);
+      return () => window.clearTimeout(timer);
+    }
+  }, [data, reload]);
+  const run = data?.run;
   if (error) return <LoadError title="无法加载执行详情" error={error} />;
   if (!run) return <Skeleton active />;
   return <ReviewWorkspace runId={id} finished={run.status === "finished"}><RunContent run={run} /></ReviewWorkspace>;
@@ -62,7 +91,9 @@ function RunContent({ run }: { run: RunDetail }) {
   const [activeStep, setActiveStep] = useState<number | null>(null);
   const player = useRef<RecordingControls>(null);
   const recordings = run.recordings ?? [];
-  const files = new Set(run.files);
+  const files = new Set(Object.keys(run.file_urls));
+  const finalPageUrl = evidenceUrl(run, "final_page.txt");
+  const previewUrl = preview ? evidenceUrl(run, preview) : undefined;
   const stepIds = new Set(run.run_steps.map((step) => step.idx));
   const judgeByIndex = new Map(run.judge_items.map((item) => [item.idx, item]));
   const expectedIds = new Set(run.case_spec.expected.map((item) => item.idx));
@@ -76,7 +107,7 @@ function RunContent({ run }: { run: RunDetail }) {
   function thumbnail(name: string, label: string) {
     return (
       <button className="thumbnail" type="button" key={name} onClick={() => setPreview(name)} aria-label={`放大${label} ${name}`}>
-        <img src={evidenceUrl(run.run_id, name)} alt={label} loading="lazy" />
+        <img src={evidenceUrl(run, name)} alt={label} loading="lazy" />
         <span>{label}</span>
       </button>
     );
@@ -225,8 +256,8 @@ function RunContent({ run }: { run: RunDetail }) {
             ) : (
               <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={isTerminal(run) ? "本次执行没有记录步骤" : "等待节点上报步骤"} />
             )}
-            {files.has("final_page.txt") && (
-              <a href={evidenceUrl(run.run_id, "final_page.txt")} target="_blank" rel="noreferrer">打开终态页面文字</a>
+            {finalPageUrl && (
+              <a href={finalPageUrl} target="_blank" rel="noreferrer">打开终态页面文字</a>
             )}
           </section>
 
@@ -267,9 +298,9 @@ function RunContent({ run }: { run: RunDetail }) {
           </section>
         </div>
       </div>
-      {preview && (
+      {preview && previewUrl && (
         <Modal open title="截图预览" footer={null} onCancel={() => setPreview(null)} width={680} centered>
-          <img className="preview" src={evidenceUrl(run.run_id, preview)} alt={preview} />
+          <img className="preview" src={previewUrl} alt={preview} />
         </Modal>
       )}
     </div>
