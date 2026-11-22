@@ -10,6 +10,16 @@ use expr::{call, expression, expression_list, target};
 pub(super) use expr::{Arg, argument, comma_parts, comprehension, primary_expression, split};
 pub(super) use lexer::{Kind, Line, Token, lex};
 
+/// 表达式里只有数字、运算符和括号，没有任何名字参与。
+pub(super) fn literal_only(tokens: &[Token<'_>]) -> bool {
+    !tokens.is_empty()
+        && tokens.iter().all(|token| match &token.kind {
+            Kind::Number(_) | Kind::Op(_) => true,
+            Kind::Group(_, inner) => literal_only(inner) || inner.is_empty(),
+            _ => false,
+        })
+}
+
 pub(super) struct SyntaxError {
     pub line: usize,
     pub message: &'static str,

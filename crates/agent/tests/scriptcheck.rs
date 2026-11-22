@@ -231,13 +231,36 @@ fn 规则三禁止执行文件进程网络和反射且忽略注释() {
 }
 
 #[test]
+fn 规则十_坐标不能写死成数字常量() {
+    for call in [
+        "ui.tap_xy(295, 1527)",
+        "ui.tap_xy(295, 1527, wait=1)",
+        "ui.tap_xy(x=295, y=1527)",
+        "ui.tap('Music', xy=(361, 1532))",
+        "ui.tap('Music', xy=(-3, 4))",
+    ] {
+        invalid(&source("", &format!("{call}\n{ASSERT}")), 1, 10, Some(6));
+    }
+    valid(
+        &source(
+            "",
+            &format!(
+                "row = ui.find('Music')\nui.tap_xy(row.center[0] - 220, row.center[1])\n\
+         ui.tap('Music', xy=(row.center[0], row.center[1] + 8))\n{ASSERT}"
+            ),
+        ),
+        1,
+    );
+}
+
+#[test]
 fn 规则四检查_ui_位置参数关键字和定长元组展开() {
     valid(
         &source(
             "",
             &format!(
-                "ui.tap('Music', exact=True, xy=(1, 2))\nui.wait_text(text='Music', timeout=2)\n\
-         point = (1, 2)\nui.tap_xy(*point, wait=1)\n{ASSERT}"
+                "ui.tap('Music', exact=True)\nui.wait_text(text='Music', timeout=2)\n\
+         row = ui.find('Music')\npoint = (row.center[0], row.center[1])\nui.tap_xy(*point, wait=1)\n{ASSERT}"
             ),
         ),
         1,

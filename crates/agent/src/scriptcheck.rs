@@ -392,11 +392,42 @@ impl FileCheck<'_, '_> {
         if !signature.accepts(positional, &keywords) {
             self.report(line, 4, "Ui 调用的位置参数个数或关键字参数与契约不符");
         }
+        self.literal_coordinates(line, method, args);
         if method.is("wait") && !valid_wait(Some(args), Some("seconds")) {
             self.report(
                 line,
                 9,
                 "ui.wait 必须使用不超过 3 秒的常量，请优先使用 wait_text",
+            );
+        }
+    }
+
+    /// 规则 10：坐标不能是写死的数字常量。
+    /// 屏幕尺寸、系统字体和布局都会变，字面坐标只在录制那台机器上成立；坐标必须由页面上找到的元素推出
+    /// （例如 `ui.find(...).center` 再加偏移），名字参与计算才算有依据。
+    /// 已知缺口：先把字面元组绑给变量再 `*变量` 展开，这里看不出来。
+    fn literal_coordinates(&mut self, line: usize, method: &Token<'_>, args: &[Token<'_>]) {
+        let coordinate_arg = |index: usize, arg: &Arg<'_>| match (method.name(), arg) {
+            (Some("tap_xy"), Arg::Positional(_)) => index < 2,
+            (Some("tap_xy"), Arg::Keyword(name, _)) => matches!(*name, "x" | "y"),
+            (Some("tap"), Arg::Keyword(name, _)) => *name == "xy",
+            _ => false,
+        };
+        if args.is_empty() {
+            return;
+        }
+        let literal = comma_parts(args).map(argument).enumerate().any(|(index, arg)| {
+            let value = match &arg {
+                Arg::Positional(value) | Arg::Keyword(_, value) => value,
+                _ => return false,
+            };
+            coordinate_arg(index, &arg) && python::literal_only(value)
+        });
+        if literal {
+            self.report(
+                line,
+                10,
+                "坐标不能写死成数字常量，请由 ui.find 等找到的元素位置推出",
             );
         }
     }
