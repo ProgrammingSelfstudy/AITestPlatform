@@ -195,7 +195,7 @@ impl RealExecutor {
         };
         let mut mcp_env = vec![];
         if let Some(f) = &secrets_file {
-            mcp_env.push(("HAFA_SECRETS_FILE".to_string(), f.to_string_lossy().into_owned()));
+            mcp_env.push((agent::codex_exec::command::SECRETS_ENV.to_string(), f.to_string_lossy().into_owned()));
         }
         let mcp = DeviceMcp {
             command: c.mcp_bin.clone(),
@@ -254,8 +254,15 @@ impl RealExecutor {
         if sum.quota_exhausted {
             return rep.quota_exhausted(ModelSource::CodexExec);
         }
+        // 规则 7：命令失败要把原始错误给用户看。Summary 里已经记着 CLI 的错误输出尾部和退出码，不能丢；
+        // 没有错误输出就如实说没有，不编造原因。
+        let code = sum.exit_code.map_or_else(|| "未知".to_string(), |c| c.to_string());
+        let detail = match &sum.error {
+            Some(error) => format!("原始错误（退出码 {code}）：{error}"),
+            None => format!("没有错误输出，退出码 {code}"),
+        };
         let Some(trace) = trace else {
-            return rep.blocked(BlockedReason::Other, "执行员没有留下轨迹".into());
+            return rep.blocked(BlockedReason::Other, format!("执行员没有留下轨迹。（{detail}）"));
         };
         let result = trace.result.as_deref().unwrap_or_default();
         let reason = trace.reason.unwrap_or_default();
@@ -267,7 +274,12 @@ impl RealExecutor {
             // 这不是链路 / 环境故障，应交给独立 Judge 看原图判定；只有没留下任何步骤、或被看门狗判卡住 / 超时才算受阻
             "blocked" if !trace.steps.is_empty() && !sum.stalled && !sum.timed_out => Verdict::Uncertain,
             "blocked" => return rep.blocked(BlockedReason::Stuck, format!("执行员判定受阻：{reason}")),
-            _ => return rep.blocked(if sum.stalled { BlockedReason::Stuck } else { BlockedReason::Other }, format!("执行员没有给出结论。{reason}")),
+            _ => {
+                return rep.blocked(
+                    if sum.stalled { BlockedReason::Stuck } else { BlockedReason::Other },
+                    format!("执行员没有给出结论。{reason}（{detail}）"),
+                );
+            }
         };
         rep.executor_done(verdict, reason.clone(), cost);
 

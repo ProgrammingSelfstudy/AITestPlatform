@@ -103,6 +103,20 @@ pub fn settings(s: &Spec) -> Vec<(String, Value)> {
     v.into_iter().filter(|(_, val)| !val.is_null()).collect()
 }
 
+/// 脱敏清单文件路径的环境变量名。设备服务读完立即删除文件，所以这个文件只够一次启动用。
+pub const SECRETS_ENV: &str = "HAFA_SECRETS_FILE";
+
+/// 审计用的参数：和真实运行完全一致，**只是不给设备服务脱敏清单**。
+///
+/// 审计要启动一次设备服务来读工具清单，真实会话还要再启动一次。脱敏清单读完即删，
+/// 审计在前就会把它消耗掉，真实会话的设备服务读不到清单，握手前就退出。
+/// 审计只列工具、不执行任何动作，不需要脱敏清单；真实会话仍然完整带上，不放宽「读完即删」。
+pub fn build_audit_args(s: &Spec) -> Vec<String> {
+    let mcp = DeviceMcp { command: s.mcp.command.clone(), env: s.mcp.env.iter().filter(|(k, _)| k != SECRETS_ENV).cloned().collect() };
+    let spec = Spec { model: s.model, work: s.work, catalog: s.catalog, instructions: s.instructions, effort: s.effort, mcp: &mcp, allowed: s.allowed, path_env: s.path_env };
+    build_args(&spec, None)
+}
+
 /// 组装参数。首次运行用 `codex exec`；卡住后用 `codex exec resume <id>` 接着做
 /// （需要会话落盘，所以不能带 `--ephemeral`；resume 子命令不接受 `-s` / `-C`，沙箱用 `-c`，工作目录靠进程 cwd）。
 pub fn build_args(s: &Spec, resume_id: Option<&str>) -> Vec<String> {
@@ -367,5 +381,47 @@ mod tests {
         // 空串会匹配所有文件名；带路径符号的 id 也不是合法会话 id
         cleanup_sessions(&home, &[String::new(), "..".into(), "../x".into(), "short".into(), "gggggggg".into()]);
         assert!(d.join("keep.jsonl").exists(), "id 不像会话 id 时一个文件都不能删");
+    }
+}
+
+#[cfg(test)]
+mod audit_args_tests {
+    use super::*;
+
+    fn spec<'a>(mcp: &'a DeviceMcp, allowed: &'a [String], work: &'a Path) -> Spec<'a> {
+        Spec { model: "gpt-x", work, catalog: Path::new("/w/catalog.json"), instructions: Path::new("/w/i.txt"), effort: Some("low"), mcp, allowed, path_env: "/usr/bin" }
+    }
+
+    fn has_key(args: &[String], key: &str) -> bool {
+        args.iter().any(|a| a.starts_with(&format!("mcp_servers.device.env.{key}=")))
+    }
+
+    #[test]
+    fn 审计启动设备服务时不带一次性的脱敏清单_真实会话照常带上() {
+        // 回归：审计和真实会话各启动一次设备服务，而脱敏清单读完即删，只够第一次用。
+        // 审计在前，把文件消耗掉，真实会话的设备服务就读不到清单、握手前退出，
+        // Codex 只报「握手时连接被关闭」。真机验证时每次带账号租约的执行都这样失败。
+        let mcp = DeviceMcp {
+            command: "/bin/mcp-device".into(),
+            env: vec![("HAFA_SERIAL".into(), "S1".into()), ("HAFA_RUN_DIR".into(), "/runs/x".into()), (SECRETS_ENV.into(), "/runs/.secrets/x.json".into())],
+        };
+        let allowed = vec!["observe".to_string()];
+        let s = spec(&mcp, &allowed, Path::new("/w"));
+
+        let real = build_args(&s, None);
+        assert!(has_key(&real, SECRETS_ENV), "真实会话必须带脱敏清单，否则没有脱敏就在执行");
+
+        let audit = build_audit_args(&s);
+        assert!(!has_key(&audit, SECRETS_ENV), "审计不能带脱敏清单，否则会把一次性文件消耗掉：{audit:?}");
+        assert!(!audit.iter().any(|a| a.contains("/runs/.secrets/")), "清单路径不能出现在审计参数里");
+        assert!(has_key(&audit, "HAFA_SERIAL") && has_key(&audit, "HAFA_RUN_DIR"), "其余环境变量保持一致，审计看到的工具清单才和真实会话相同");
+    }
+
+    #[test]
+    fn 没有脱敏清单时审计参数和真实参数完全一致() {
+        let mcp = DeviceMcp { command: "/bin/mcp-device".into(), env: vec![("HAFA_SERIAL".into(), "S1".into())] };
+        let allowed = vec!["observe".to_string()];
+        let s = spec(&mcp, &allowed, Path::new("/w"));
+        assert_eq!(build_audit_args(&s), build_args(&s, None), "没有清单时不应有任何差别");
     }
 }

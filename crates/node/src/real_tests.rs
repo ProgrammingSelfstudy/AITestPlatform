@@ -15,6 +15,8 @@ use uuid::Uuid;
 struct FinishedExecution {
     real: RealExecutor,
     judge_opts: ClaudeOpts,
+    /// 执行员结束时的概要；默认值表示正常结束，需要模拟异常退出时再指定
+    summary: Summary,
 }
 
 impl RunExecutor for FinishedExecution {
@@ -26,7 +28,7 @@ impl RunExecutor for FinishedExecution {
                 rep,
                 &dir,
                 Execution {
-                    summary: Summary::default(),
+                    summary: self.summary.clone(),
                     trace: read_trace(&dir).await,
                     uploaded: HashSet::from(["01_final.png".into()]),
                 },
@@ -140,11 +142,16 @@ printf '%s\n' "$@" > "$0.args"
     }
 
     async fn messages(&self, script: &str, evidence_bin: PathBuf) -> Vec<NodeMsg> {
+        self.messages_with(Summary::default(), script, evidence_bin).await
+    }
+
+    async fn messages_with(&self, summary: Summary, script: &str, evidence_bin: PathBuf) -> Vec<NodeMsg> {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let runner = Runner::new(
             FinishedExecution {
                 real: RealExecutor(self.config(evidence_bin)),
                 judge_opts: self.judge_opts(script),
+                summary,
             },
             tx,
         );
@@ -952,4 +959,46 @@ async fn 取消run会停止录屏并上传末段而不启动判定() {
     等待末段上传(&uploads).await;
     assert!(adb.active(&fixture.assign.device_serial).is_none());
     assert!(!std::iter::from_fn(|| rx.try_recv().ok()).any(|msg| matches!(msg, NodeMsg::JudgeDone(_))));
+}
+
+fn blocked_reason(msgs: &[NodeMsg]) -> String {
+    msgs.iter().find_map(|m| if let NodeMsg::RunBlocked(b) = m { Some(b.detail.clone()) } else { None }).expect("应该上报受阻")
+}
+
+#[tokio::test]
+async fn 执行员异常退出没有结论时_受阻原因带上原始错误() {
+    // 回归：真机验证时执行员几秒就退出、没有任何事件，页面上只看到「执行员没有给出结论」，
+    // 原始错误其实已经在 Summary 里，却被丢掉了。规则 7：设备或命令失败要把原始错误给用户看。
+    let f = Fixture::new();
+    fs::write(f.run_dir.join("trace.json"), r#"{"steps":[],"result":null,"reason":null}"#).unwrap();
+    let summary = Summary { error: Some("error: unknown field `tools` in `--strict-config`".into()), exit_code: Some(2), ..Summary::default() };
+    let msgs = f.messages_with(summary, JUDGE_PASSES, "mcp-evidence".into()).await;
+    let reason = blocked_reason(&msgs);
+    assert!(reason.contains("执行员没有给出结论"), "{reason}");
+    assert!(reason.contains("unknown field `tools`"), "必须带上原始错误：{reason}");
+    assert!(reason.contains("退出码 2"), "还要带上退出码：{reason}");
+}
+
+#[tokio::test]
+async fn 执行员没有错误输出也没有结论时_如实说没有错误输出() {
+    let f = Fixture::new();
+    fs::write(f.run_dir.join("trace.json"), r#"{"steps":[],"result":null,"reason":null}"#).unwrap();
+    let summary = Summary { exit_code: Some(0), ..Summary::default() };
+    let msgs = f.messages_with(summary, JUDGE_PASSES, "mcp-evidence".into()).await;
+    let reason = blocked_reason(&msgs);
+    assert!(reason.contains("没有错误输出") && reason.contains("退出码 0"), "不能编造原因：{reason}");
+}
+
+#[tokio::test]
+async fn 执行员没有留下轨迹时_受阻原因同样带上原始错误() {
+    // 回归：真机验证第三次，执行员在启动前就失败，没有轨迹文件，页面上只有「没有留下轨迹」，
+    // 看不出为什么。和「没有给出结论」是同一个缺陷，同样要带上原始错误。
+    let f = Fixture::new();
+    fs::remove_file(f.run_dir.join("trace.json")).unwrap(); // 夹具默认会写一份，这里删掉，模拟执行员没留下轨迹
+    let summary = Summary { error: Some("创建审计目录失败：Permission denied".into()), exit_code: None, ..Summary::default() };
+    let msgs = f.messages_with(summary, JUDGE_PASSES, "mcp-evidence".into()).await;
+    let reason = blocked_reason(&msgs);
+    assert!(reason.contains("没有留下轨迹"), "{reason}");
+    assert!(reason.contains("创建审计目录失败：Permission denied"), "必须带上原始错误：{reason}");
+    assert!(reason.contains("退出码 未知"), "拿不到退出码就如实写未知：{reason}");
 }

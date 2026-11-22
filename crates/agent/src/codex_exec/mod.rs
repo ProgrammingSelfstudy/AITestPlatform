@@ -274,7 +274,7 @@ async fn prepare_and_run(o: &CodexOpts, instructions: &str, prompt: &str, run_di
         path_env,
     };
     if o.audit {
-        audit::audit_tools(&o.bin, &command::build_args(&spec, None), &o.allowed, work, path_env).await?;
+        audit::audit_tools(&o.bin, &command::build_audit_args(&spec), &o.allowed, work, path_env).await?;
     }
     let file = std::fs::OpenOptions::new()
         .write(true)
