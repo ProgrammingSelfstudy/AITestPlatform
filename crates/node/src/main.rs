@@ -9,9 +9,14 @@ use tracing_subscriber::EnvFilter;
 /// `node gen-script <run编号> [--app-info <app_info.yaml>]`：为本节点上一次通过的执行生成回归脚本候选并上传归档。
 /// 显式触发而不是每次通过都自动跑：它会花发起人的 Claude 会员额度（规则 9），由人决定哪次值得固化。
 async fn gen_script(args: &[String]) -> anyhow::Result<()> {
-    const USAGE: &str = "用法：node gen-script <run编号> [--app-info <app_info.yaml>]";
-    let (run, rest) = args.split_first().context(USAGE)?;
+    const USAGE: &str = "用法：node gen-script <run编号> [--app-info <app_info.yaml>] [--fix-from <被拒绝的脚本编号>]";
+    let (run, mut rest) = args.split_first().context(USAGE)?;
     let run_id: uuid::Uuid = run.parse().context("run 编号必须是 UUID")?;
+    let mut fix_from = None;
+    if let [head @ .., flag, id] = rest && flag == "--fix-from" {
+        fix_from = Some(id.parse::<uuid::Uuid>().context("--fix-from 的脚本编号必须是 UUID")?);
+        rest = head;
+    }
     let ui_map = match rest {
         [] => serde_json::Value::Null,
         [flag, file] if flag == "--app-info" => {
@@ -36,6 +41,7 @@ async fn gen_script(args: &[String]) -> anyhow::Result<()> {
         runs_dir: std::env::var("HAFA_RUNS_DIR").unwrap_or_else(|_| "data/runs".into()).into(),
         claude: agent::claude_cli::ClaudeOpts::default(),
         ui_map,
+        fix_from,
     };
     match node::scriptgen_run::generate_and_upload(&cfg, run_id).await? {
         node::scriptgen_run::Outcome::Created { id, version } => {

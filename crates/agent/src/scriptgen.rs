@@ -34,6 +34,14 @@ pub struct ScriptgenInput<'a> {
     pub contract: &'a UiContract,
     /// 调用方已知的（敏感值，占位符），用于旧轨迹、Judge 证据等附加来源的补充脱敏。
     pub redactions: &'a [(String, String)],
+    /// 上一版脚本在真机自检中失败时带上：让模型据此修正，而不是重新猜一遍。
+    pub previous_attempt: Option<&'a PreviousAttempt>,
+}
+
+/// 上一版被自检拒绝的脚本和它的原始失败输出。
+pub struct PreviousAttempt {
+    pub files: BTreeMap<String, String>,
+    pub failure: String,
 }
 
 /// 只加载生成用到的轨迹字段，兼容旧轨迹缺少部分证据字段的情况。
@@ -282,6 +290,10 @@ fn prepare(input: &ScriptgenInput<'_>) -> Result<Prepared, ScriptgenError> {
         },
         "required_files": names,
     });
+    if let Some(previous) = input.previous_attempt {
+        // 一并脱敏：失败输出里可能带页面文案
+        prompt["previous_attempt"] = json!({"files": previous.files, "failure": previous.failure});
+    }
     redact_prompt(&mut prompt, &redactions);
     Ok(Prepared {
         prompt: format!("### 生成输入\n{prompt:#}"),

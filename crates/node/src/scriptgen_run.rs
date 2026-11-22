@@ -13,7 +13,7 @@
 use std::path::{Path, PathBuf};
 
 use agent::claude_cli::ClaudeOpts;
-use agent::scriptgen::{ScriptTrace, ScriptgenError, ScriptgenInput, ScriptgenOpts, builtin_contract, generate};
+use agent::scriptgen::{PreviousAttempt, ScriptTrace, ScriptgenError, ScriptgenInput, ScriptgenOpts, builtin_contract, generate};
 use anyhow::{Context, bail};
 use protocol::{CaseSpec, FinalResult, JudgeItem, ModelSource, RoleModel};
 use reqwest::{StatusCode, Url};
@@ -30,6 +30,8 @@ pub struct GenConfig {
     pub claude: ClaudeOpts,
     /// 被测应用的界面元素表，没有就传 `Value::Null`
     pub ui_map: Value,
+    /// 修正模式：基于这条被自检拒绝的脚本和它的失败输出重新生成
+    pub fix_from: Option<Uuid>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -79,6 +81,34 @@ fn explain(error: ScriptgenError) -> anyhow::Error {
     }
 }
 
+#[derive(Deserialize)]
+struct PreviousSource {
+    status: String,
+    status_note: Option<String>,
+    case_code: String,
+    files: std::collections::BTreeMap<String, String>,
+}
+
+/// 取被自检拒绝的上一版：必须是已拒绝、有失败输出、且是同一个用例，否则不带它去花额度。
+async fn fetch_previous(cfg: &GenConfig, client: &reqwest::Client, id: Uuid, case_code: &str) -> anyhow::Result<PreviousAttempt> {
+    let response = authed(cfg, client.get(url(cfg, &format!("api/scripts/{id}/files"))?)).send().await.context("连不上平台服务端")?;
+    match response.status() {
+        StatusCode::OK => {}
+        StatusCode::FORBIDDEN => bail!("要修正的脚本不是本节点生成的"),
+        StatusCode::NOT_FOUND => bail!("平台上没有要修正的脚本"),
+        other => bail!("取要修正的脚本失败：平台返回 {other}"),
+    }
+    let previous: PreviousSource = response.json().await.context("平台返回的脚本格式不对")?;
+    if previous.status != "rejected" {
+        bail!("要修正的脚本状态是 {}，只有被自检拒绝的脚本才需要按失败输出修正", previous.status);
+    }
+    if previous.case_code != case_code {
+        bail!("要修正的脚本属于用例 {}，和这次执行的用例 {case_code} 不是同一个", previous.case_code);
+    }
+    let failure = previous.status_note.filter(|n| !n.trim().is_empty()).context("要修正的脚本没有记录失败输出")?;
+    Ok(PreviousAttempt { files: previous.files, failure })
+}
+
 /// 为 `run_id` 生成回归脚本候选并上传归档。
 pub async fn generate_and_upload(cfg: &GenConfig, run_id: Uuid) -> anyhow::Result<Outcome> {
     let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(30)).build()?;
@@ -106,6 +136,10 @@ pub async fn generate_and_upload(cfg: &GenConfig, run_id: Uuid) -> anyhow::Resul
     if source.judge.source != ModelSource::ClaudeCli {
         bail!("这次任务的 Judge 用的不是 claude_cli，脚本生成只支持 Claude 会员命令行，不会改用其他来源");
     }
+    let previous = match cfg.fix_from {
+        Some(id) => Some(fetch_previous(cfg, &client, id, &source.case_spec.code).await?),
+        None => None,
+    };
     let trace = read_trace(&cfg.runs_dir, run_id)?;
     let contract = builtin_contract();
     let opts = ScriptgenOpts { role: source.judge.clone(), claude: cfg.claude.clone() };
@@ -119,6 +153,7 @@ pub async fn generate_and_upload(cfg: &GenConfig, run_id: Uuid) -> anyhow::Resul
             ui_map: &cfg.ui_map,
             contract: &contract,
             redactions: &[],
+            previous_attempt: previous.as_ref(),
         },
     )
     .await

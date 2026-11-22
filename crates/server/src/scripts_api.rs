@@ -165,7 +165,7 @@ async fn own_script(state: &ApiState, headers: &axum::http::HeaderMap, id: &str)
 /// `GET /api/scripts/{id}/files`：节点取脚本源码和用例编号，用来在本机自检。只能取自己节点来源的脚本。
 pub(crate) async fn files(State(state): State<ApiState>, RoutePath(id): RoutePath<String>, request: Request) -> Result<Json<serde_json::Value>, Failure> {
     let (script_id, _) = own_script(&state, request.headers(), &id).await?;
-    let row = sqlx::query("select s.status, s.version, s.files, c.code from scripts s join test_cases c on c.id = s.case_id where s.id = $1")
+    let row = sqlx::query("select s.status, s.status_note, s.version, s.files, c.code from scripts s join test_cases c on c.id = s.case_id where s.id = $1")
         .bind(script_id)
         .fetch_one(state.app.pool())
         .await
@@ -174,6 +174,7 @@ pub(crate) async fn files(State(state): State<ApiState>, RoutePath(id): RoutePat
         "id": script_id,
         "version": row.try_get::<i32, _>("version").map_err(|e| internal(&e))?,
         "status": row.try_get::<String, _>("status").map_err(|e| internal(&e))?,
+        "status_note": row.try_get::<Option<String>, _>("status_note").map_err(|e| internal(&e))?,
         "case_code": row.try_get::<String, _>("code").map_err(|e| internal(&e))?,
         "files": row.try_get::<serde_json::Value, _>("files").map_err(|e| internal(&e))?,
     })))

@@ -82,6 +82,7 @@ impl Inputs {
             ui_map: &self.map,
             contract: &self.contract,
             redactions: &self.redactions,
+            previous_attempt: None,
         }
     }
 }

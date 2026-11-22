@@ -151,6 +151,7 @@ fn config(w: &World, claude: &FakeClaude) -> GenConfig {
         runs_dir: w.dir.join("runs"),
         claude: claude.opts.clone(),
         ui_map: Value::Null,
+        fix_from: None,
     }
 }
 
@@ -276,4 +277,73 @@ async fn 生成的脚本没过静态校验_不上传() {
     let text = message(generate_and_upload(&config(&w, &claude), run).await.unwrap_err());
     assert!(text.contains("没有通过静态校验") && text.contains("规则"), "要指出违反了哪条规则：{text}");
     assert_eq!(script_count(&w).await, 0, "不合规的脚本不能进库");
+}
+
+// ---------------------------------------------------------------- 按自检失败修正
+
+/// 先归档一条候选，再按需改成指定状态。返回脚本编号。
+async fn archived_as(w: &World, run: Uuid, status: Option<(server::scripts::ScriptStatus, &str)>) -> Uuid {
+    use server::scripts::{create_candidate, file_digests, transition, NewScript};
+    let case_id: Uuid = sqlx::query_scalar("select case_id from runs where id = $1").bind(run).fetch_one(w.st.pool()).await.unwrap();
+    let files = [(TEST_NAME.to_string(), TEST_POC.to_string()), (PAGE_NAME.to_string(), PAGE_POC.to_string())].into();
+    let new = NewScript { case_id, source_run_id: run, file_sha256: file_digests(&files), files, notes: String::new(), gen_source: "claude_cli".into(), gen_model: None, gen_effort: None };
+    let id = create_candidate(w.st.pool(), &new).await.unwrap().id;
+    if let Some((to, note)) = status {
+        transition(w.st.pool(), id, to, Some(note)).await.unwrap();
+    }
+    id
+}
+
+fn prompt_of(claude: &FakeClaude) -> String {
+    fs::read_to_string(format!("{}.prompt", claude.script.display())).unwrap_or_default()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn 修正模式把上一版源码和原始失败输出交给模型() {
+    use server::scripts::ScriptStatus;
+    let w = world().await;
+    let run = passed_run(&w).await;
+    put_trace(&w, run);
+    let old = archived_as(&w, run, Some((ScriptStatus::Rejected, "AssertionError: 目标歌曲没找到-独特标记"))).await;
+    let claude = FakeClaude::new(&w, &[success(json!({ TEST_NAME: format!("{TEST_POC}\n# 已修正\n"), PAGE_NAME: PAGE_POC }))]);
+    let mut cfg = config(&w, &claude);
+    cfg.fix_from = Some(old);
+
+    let Outcome::Created { version, .. } = generate_and_upload(&cfg, run).await.unwrap() else { panic!("应该新建版本") };
+    assert_eq!(version, 2, "修正后是新版本，不覆盖旧版本");
+    let prompt = prompt_of(&claude);
+    assert!(prompt.contains("previous_attempt") && prompt.contains("目标歌曲没找到-独特标记"), "失败输出必须原样交给模型");
+    assert!(prompt.contains("MusicLibraryPage") || prompt.contains("def test_"), "上一版源码也要交给模型");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn 没有修正模式时提示词不带上一版() {
+    let w = world().await;
+    let run = passed_run(&w).await;
+    put_trace(&w, run);
+    let claude = FakeClaude::new(&w, &good_events());
+    generate_and_upload(&config(&w, &claude), run).await.unwrap();
+    assert!(!prompt_of(&claude).contains("previous_attempt"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn 要修正的脚本不是已拒绝_或没有失败输出_不调用模型() {
+    let w = world().await;
+    let run = passed_run(&w).await;
+    put_trace(&w, run);
+    let candidate = archived_as(&w, run, None).await;
+    let claude = FakeClaude::new(&w, &good_events());
+    let mut cfg = config(&w, &claude);
+    cfg.fix_from = Some(candidate);
+    let error = message(generate_and_upload(&cfg, run).await.unwrap_err());
+    assert!(error.contains("candidate") && error.contains("只有被自检拒绝"), "{error}");
+
+    sqlx::query("update scripts set status = 'rejected', status_note = '  ' where id = $1").bind(candidate).execute(w.st.pool()).await.unwrap();
+    let error = message(generate_and_upload(&cfg, run).await.unwrap_err());
+    assert!(error.contains("没有记录失败输出"), "{error}");
+    assert_eq!(claude.calls(), 0, "条件不满足不能花额度");
+
+    cfg.fix_from = Some(Uuid::new_v4());
+    assert!(message(generate_and_upload(&cfg, run).await.unwrap_err()).contains("没有要修正的脚本"));
+    assert_eq!(claude.calls(), 0);
 }

@@ -115,6 +115,7 @@ async fn run(args: &[String]) -> Result<GeneratedScripts, Box<dyn Error>> {
             ui_map: &ui_map,
             contract: &contract,
             redactions: &[],
+            previous_attempt: None,
         },
     )
     .await?)
