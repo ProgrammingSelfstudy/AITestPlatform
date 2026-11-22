@@ -7,6 +7,7 @@ pub mod real;
 mod recorder;
 pub mod runner;
 pub mod scriptgen_run;
+pub mod selfcheck_run;
 pub mod setup_runner;
 mod uploader;
 

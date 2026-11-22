@@ -78,6 +78,8 @@ pub(crate) fn routes(app: AppState, paths: Paths) -> Router {
         .route("/api/runs/{id}/scripts", put(crate::scripts_api::put))
         .route("/api/runs/{id}/script-source", get(crate::scripts_api::source))
         .route("/api/cases/{id}/scripts", get(crate::scripts_api::list))
+        .route("/api/scripts/{id}/files", get(crate::scripts_api::files))
+        .route("/api/scripts/{id}/self-check", put(crate::scripts_api::self_check))
         .with_state(ApiState {
             app,
             paths,

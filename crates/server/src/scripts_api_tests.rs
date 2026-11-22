@@ -217,3 +217,72 @@ async fn 取脚本来源只能取自己节点的执行_未认证拒绝() {
     assert_eq!(send(&world.app, Method::GET, &source_route(Uuid::new_v4()), &node_headers(world.node), "").await.0, StatusCode::NOT_FOUND);
     assert_eq!(send(&world.app, Method::GET, "/api/runs/not-a-uuid/script-source", &node_headers(world.node), "").await.0, StatusCode::NOT_FOUND);
 }
+
+/// 上传一条候选，返回脚本编号。
+async fn archived(world: &World, run: Uuid) -> Uuid {
+    make_passed(world, run).await;
+    let body = upload_body(&files("def test_a():\n    assert 1\n"));
+    let (status, bytes) = send(&world.app, Method::PUT, &script_route(run), &node_headers(world.node), body.to_string()).await;
+    assert_eq!(status, StatusCode::CREATED, "{}", text(&bytes));
+    json_body(&bytes)["id"].as_str().unwrap().parse().unwrap()
+}
+
+#[tokio::test]
+async fn 节点取自己的脚本源码_带用例编号和文件() {
+    let world = World::new().await;
+    let run = world.run().await;
+    let script = archived(&world, run).await;
+    let (status, body) = send(&world.app, Method::GET, &format!("/api/scripts/{script}/files"), &node_headers(world.node), "").await;
+    assert_eq!(status, StatusCode::OK, "{}", text(&body));
+    let got = json_body(&body);
+    assert_eq!(got["status"], "candidate");
+    assert_eq!(got["files"]["test_tc04.py"], "def test_a():\n    assert 1\n");
+    assert!(got["case_code"].as_str().is_some_and(|c| !c.is_empty()));
+}
+
+#[tokio::test]
+async fn 自检结果只能由来源节点回报_未认证拒绝() {
+    let world = World::new().await;
+    let run = world.run().await;
+    let script = archived(&world, run).await;
+    let other = Uuid::new_v4();
+    sqlx::query("insert into nodes (id, caps, online) values ($1, '{\"model_sources\":[]}'::jsonb, true)").bind(other).execute(world.state.pool()).await.unwrap();
+    let report = json!({"passed": true, "detail": "x"}).to_string();
+    for path in [format!("/api/scripts/{script}/files"), format!("/api/scripts/{script}/self-check")] {
+        let method = if path.ends_with("files") { Method::GET } else { Method::PUT };
+        let (status, _) = send(&world.app, method.clone(), &path, &node_headers(other), report.clone()).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "别的节点不能碰：{path}");
+        let no_auth = vec![("x-node-id", world.node.to_string())];
+        assert_eq!(send(&world.app, method, &path, &no_auth, report.clone()).await.0, StatusCode::UNAUTHORIZED);
+    }
+    let status: String = sqlx::query_scalar("select status from scripts where id = $1").bind(script).fetch_one(world.state.pool()).await.unwrap();
+    assert_eq!(status, "candidate", "被拒绝的回报不能改状态");
+    let (status, _) = send(&world.app, Method::PUT, &format!("/api/scripts/{}/self-check", Uuid::new_v4()), &node_headers(world.node), report).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn 自检通过变自检通过_失败变已拒绝并记下原始输出_不能重复回报() {
+    let world = World::new().await;
+    let run = world.run().await;
+    let script = archived(&world, run).await;
+    let route = format!("/api/scripts/{script}/self-check");
+    let headers = node_headers(world.node);
+
+    let (status, body) = send(&world.app, Method::PUT, &route, &headers, json!({"passed": false, "detail": "AssertionError: 目标歌曲没找到"}).to_string()).await;
+    assert_eq!(status, StatusCode::OK, "{}", text(&body));
+    let got = json_body(&body);
+    assert_eq!((got["status"].as_str(), got["status_note"].as_str()), (Some("rejected"), Some("AssertionError: 目标歌曲没找到")));
+
+    let (status, _) = send(&world.app, Method::PUT, &route, &headers, json!({"passed": true, "detail": "ok"}).to_string()).await;
+    assert_eq!(status, StatusCode::CONFLICT, "已拒绝的脚本不能再回报通过");
+
+    // 通过的路径：再来一个版本。
+    let second = upload_body(&files("def test_a():\n    assert 2\n"));
+    let (_, bytes) = send(&world.app, Method::PUT, &script_route(run), &headers, second.to_string()).await;
+    let next: Uuid = json_body(&bytes)["id"].as_str().unwrap().parse().unwrap();
+    let (status, body) = send(&world.app, Method::PUT, &format!("/api/scripts/{next}/self-check"), &headers, json!({"passed": true, "detail": "1 passed"}).to_string()).await;
+    assert_eq!((status, json_body(&body)["status"].as_str()), (StatusCode::OK, Some("self_check_passed")));
+    let (status, _) = send(&world.app, Method::PUT, &format!("/api/scripts/{next}/self-check"), &headers, "not json").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}

@@ -48,6 +48,53 @@ async fn gen_script(args: &[String]) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `node self-check <脚本编号> [--serial <设备序列号>]`：在本节点的真机上自检一条候选脚本。
+/// 不花模型额度，但会占用这台手机：先确认节点没有正在这台手机上跑任务。
+/// 序列号默认取 `HAFA_DEVICE_ALLOW`（只有一台时）。没有账号租约，手机上要已经登录好目标账号。
+async fn self_check(args: &[String]) -> anyhow::Result<()> {
+    const USAGE: &str = "用法：node self-check <脚本编号> [--serial <设备序列号>]";
+    let (script, rest) = args.split_first().context(USAGE)?;
+    let script_id: uuid::Uuid = script.parse().context("脚本编号必须是 UUID")?;
+    let allow: Vec<String> = std::env::var("HAFA_DEVICE_ALLOW").unwrap_or_default().split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+    let serial = match rest {
+        [flag, serial] if flag == "--serial" => serial.clone(),
+        [] if allow.len() == 1 => allow[0].clone(),
+        [] => bail!("没有指定设备：加 --serial，或让 HAFA_DEVICE_ALLOW 只含一台设备"),
+        _ => bail!("{USAGE}"),
+    };
+    let token = std::env::var("NODE_TOKEN").unwrap_or_default();
+    if token.is_empty() {
+        bail!("请先设置环境变量 NODE_TOKEN（和服务端一致的节点接入令牌）");
+    }
+    let ws = std::env::var("PLATFORM_WS").unwrap_or_else(|_| "ws://127.0.0.1:8080/ws/node".into());
+    let state_dir = PathBuf::from(std::env::var("NODE_STATE_DIR").unwrap_or_else(|_| "data/node".into()));
+    let node_id = node::load_node_id(&state_dir).context("没有找到本节点的 node_id：节点还没有连过服务端，或 NODE_STATE_DIR 不对")?;
+    node::load_node_secret(&state_dir);
+    let real = real_config(&NodeConfig::new(ws, token, state_dir))?.context("自检需要 HAFA_PYTHON 等真实执行配置")?;
+    let cfg = node::selfcheck_run::CheckConfig {
+        platform_http: real.platform_http.clone(),
+        node_token: real.node_token.clone(),
+        node_id,
+        python: real.python.clone(),
+        automation_dir: real.automation_dir.clone(),
+        audio_dir: real.audio_dir.clone(),
+        state_dir: real.state_dir.clone(),
+        package: real.package.clone(),
+        activity: real.activity.clone(),
+        bottom_shift: real.bottom_shift.get(&serial).copied().unwrap_or(0),
+        serial,
+        timeout: std::time::Duration::from_secs(15 * 60),
+        work_dir: std::env::temp_dir().join("hafa_selfcheck"),
+    };
+    println!("开始在设备 {} 上自检，会占用这台手机，请确认节点没有在它上面跑任务", cfg.serial);
+    let (outcome, detail) = node::selfcheck_run::self_check(&cfg, script_id).await?;
+    match outcome {
+        node::selfcheck_run::Outcome::Passed => println!("自检通过：{detail}\n脚本状态已改为「自检通过」，获准要由人来决定"),
+        node::selfcheck_run::Outcome::Rejected => println!("自检失败，脚本已标记为「已拒绝」。原始输出：\n{detail}"),
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -57,6 +104,9 @@ async fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.first().map(String::as_str) == Some("gen-script") {
         return gen_script(&args[1..]).await;
+    }
+    if args.first().map(String::as_str) == Some("self-check") {
+        return self_check(&args[1..]).await;
     }
 
     // 令牌必须显式给出；不写日志

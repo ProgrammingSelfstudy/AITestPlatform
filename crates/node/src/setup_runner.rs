@@ -102,7 +102,7 @@ impl SetupSpec {
         a
     }
 
-    fn env(&self) -> Vec<(String, String)> {
+    pub(crate) fn env(&self) -> Vec<(String, String)> {
         let mut e = self.base_env.clone();
         e.extend([
             ("HAFA_SERIAL".into(), self.serial.clone()),
@@ -172,7 +172,7 @@ fn parse_event(line: &str, acc: Option<&AccountArg>) -> Option<Event> {
 }
 
 /// 杀掉整个进程组。
-fn kill_group(child: &tokio::process::Child) {
+pub(crate) fn kill_group(child: &tokio::process::Child) {
     if let Some(pid) = child.id() {
         // SAFETY: 只发信号；pid 是自己启动、自己进程组的组长
         unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };

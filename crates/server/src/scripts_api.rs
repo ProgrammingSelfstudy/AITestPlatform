@@ -146,6 +146,73 @@ pub(crate) async fn source(State(state): State<ApiState>, RoutePath(id): RoutePa
     })))
 }
 
+/// 认证节点并确认这条脚本来自本节点的执行：自检要占用本节点的手机，只能在脚本来源的节点上跑。
+async fn own_script(state: &ApiState, headers: &axum::http::HeaderMap, id: &str) -> Result<(Uuid, Uuid), Failure> {
+    let node_id = crate::node_identity(&state.app, headers).await.map_err(|status| (status, String::new()))?;
+    let script_id: Uuid = id.parse().map_err(|_| fail(StatusCode::NOT_FOUND, "没有这个脚本"))?;
+    let owner: Option<Uuid> = sqlx::query_scalar("select r.node_id from scripts s join runs r on r.id = s.source_run_id where s.id = $1")
+        .bind(script_id)
+        .fetch_optional(state.app.pool())
+        .await
+        .map_err(|e| internal(&e))?;
+    match owner {
+        None => Err(fail(StatusCode::NOT_FOUND, "没有这个脚本")),
+        Some(owner) if owner != node_id => Err(fail(StatusCode::FORBIDDEN, "只能操作来源于自己节点的脚本")),
+        Some(_) => Ok((script_id, node_id)),
+    }
+}
+
+/// `GET /api/scripts/{id}/files`：节点取脚本源码和用例编号，用来在本机自检。只能取自己节点来源的脚本。
+pub(crate) async fn files(State(state): State<ApiState>, RoutePath(id): RoutePath<String>, request: Request) -> Result<Json<serde_json::Value>, Failure> {
+    let (script_id, _) = own_script(&state, request.headers(), &id).await?;
+    let row = sqlx::query("select s.status, s.version, s.files, c.code from scripts s join test_cases c on c.id = s.case_id where s.id = $1")
+        .bind(script_id)
+        .fetch_one(state.app.pool())
+        .await
+        .map_err(|e| internal(&e))?;
+    Ok(Json(serde_json::json!({
+        "id": script_id,
+        "version": row.try_get::<i32, _>("version").map_err(|e| internal(&e))?,
+        "status": row.try_get::<String, _>("status").map_err(|e| internal(&e))?,
+        "case_code": row.try_get::<String, _>("code").map_err(|e| internal(&e))?,
+        "files": row.try_get::<serde_json::Value, _>("files").map_err(|e| internal(&e))?,
+    })))
+}
+
+const MAX_DETAIL_CHARS: usize = 4000;
+
+/// 节点回报的自检结果。
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SelfCheck {
+    passed: bool,
+    /// 通过时是简要说明，失败时是原始失败输出的摘要（规则 7：原样给人看）
+    detail: String,
+}
+
+/// `PUT /api/scripts/{id}/self-check`：节点认证的写接口统一用 PUT（浏览器写保护会拦掉非浏览器的 POST）。
+///节点回报自检结果。候选通过变为「自检通过」，失败变为「已拒绝」，
+/// 都记下原因。只有候选能自检，其他状态返回 409。「获准」不在这里：那是人的决定。
+pub(crate) async fn self_check(State(state): State<ApiState>, RoutePath(id): RoutePath<String>, request: Request) -> Result<Json<ScriptRecord>, Failure> {
+    let (script_id, _) = own_script(&state, request.headers(), &id).await?;
+    let bytes = to_bytes(request.into_body(), 64 * 1024).await.map_err(|_| fail(StatusCode::PAYLOAD_TOO_LARGE, "请求体太大"))?;
+    let report: SelfCheck = serde_json::from_slice(&bytes).map_err(|_| fail(StatusCode::BAD_REQUEST, "请求格式不对"))?;
+    if report.detail.chars().count() > MAX_DETAIL_CHARS {
+        return Err(fail(StatusCode::UNPROCESSABLE_ENTITY, "说明太长"));
+    }
+    let to = if report.passed { scripts::ScriptStatus::SelfCheckPassed } else { scripts::ScriptStatus::Rejected };
+    match scripts::transition(state.app.pool(), script_id, to, Some(&report.detail)).await {
+        Ok(record) => Ok(Json(record)),
+        Err(e @ ScriptError::BadTransition { .. }) => Err((StatusCode::CONFLICT, e.to_string())),
+        Err(ScriptError::NotFound) => Err(fail(StatusCode::NOT_FOUND, "没有这个脚本")),
+        Err(ScriptError::Db(e)) => Err(internal(&e)),
+        Err(e) => {
+            tracing::error!("回报自检时出现不该出现的错误：{e}");
+            Err(fail(StatusCode::INTERNAL_SERVER_ERROR, "回报失败"))
+        }
+    }
+}
+
 /// `GET /api/cases/{id}/scripts`：一个用例的全部脚本版本，新的在前。只有元数据，不含源码。
 pub(crate) async fn list(State(state): State<ApiState>, RoutePath(id): RoutePath<String>) -> Result<Json<Vec<ScriptRecord>>, Failure> {
     let case_id: Uuid = id.parse().map_err(|_| fail(StatusCode::NOT_FOUND, "没有这个用例"))?;
