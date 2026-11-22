@@ -1,0 +1,165 @@
+import { Alert, Form, Input, Modal, Select, Skeleton } from "antd";
+import { useEffect, useRef, useState } from "react";
+import { createTask, fetchCases, fetchModels, fetchNodes } from "./api";
+import { readReviewToken, rememberReviewToken, writeTokenAction } from "./reviewLogic";
+import ReviewTokenDialog from "./ReviewTokenDialog";
+import { LoadError } from "./runUi";
+import { REFRESH_MS, usePolling } from "./usePolling";
+
+const project = "hafa";
+const onceLoaded = () => false;
+
+async function loadChoices(signal: AbortSignal) {
+  const [cases, models] = await Promise.all([fetchCases(project, signal), fetchModels(signal)]);
+  return { cases, models };
+}
+
+interface Fields {
+  node: string;
+  cases: string[];
+  executor: string;
+  effort: string;
+  judge: string;
+  userToken: string;
+}
+
+export default function NewTaskDialog({ onClose }: { onClose: () => void }) {
+  const [form] = Form.useForm<Fields>();
+  const { data, error } = usePolling(loadChoices, REFRESH_MS, onceLoaded);
+  const { data: nodes, error: nodeError } = usePolling(fetchNodes);
+  const submitLock = useRef(false);
+  const [submitting, setSubmitting] = useState(false);
+  const [submitError, setSubmitError] = useState<string | null>(null);
+  const [pendingFields, setPendingFields] = useState<Fields | null>(null);
+  const busy = submitting || pendingFields !== null;
+  const model = Form.useWatch("executor", form);
+  const node = Form.useWatch("node", form);
+  const hasOnlineNodes = nodes?.some((candidate) => candidate.online);
+  const nodeUnavailable = Boolean(node && nodes && !nodes.some((candidate) => candidate.node_id === node && candidate.online));
+  const efforts = data?.models.executor.models.find((m) => m.model === model)?.efforts ?? [];
+
+  useEffect(() => {
+    if (!data) return;
+    const { executor, judge } = data.models;
+    form.setFieldsValue({
+      executor: executor.default.model,
+      effort: executor.default.effort ?? undefined,
+      judge: judge.default.model,
+    });
+  }, [data, form]);
+
+  function changeModel(model: string) {
+    const executor = data?.models.executor;
+    const available = executor?.models.find((m) => m.model === model)?.efforts ?? [];
+    const preferred = executor?.default.effort;
+    form.setFieldValue("effort", preferred && available.includes(preferred) ? preferred : available[0]);
+  }
+
+  async function submit(fields: Fields, enteredToken?: string) {
+    if (submitLock.current || (pendingFields && enteredToken === undefined)) return;
+    const token = enteredToken ?? readReviewToken();
+    const ready = Boolean(nodes?.some((candidate) => candidate.node_id === fields.node && candidate.online));
+    const action = writeTokenAction(ready, token);
+    if (action === "blocked") {
+      setPendingFields(null);
+      return;
+    }
+    setSubmitError(null);
+    if (action === "prompt") {
+      setPendingFields(fields);
+      return;
+    }
+    if (enteredToken !== undefined) rememberReviewToken(enteredToken);
+    submitLock.current = true;
+    setPendingFields(null);
+    setSubmitting(true);
+    try {
+      const task = await createTask({
+        project,
+        node_id: fields.node,
+        case_codes: fields.cases,
+        executor: { model: fields.executor, effort: fields.effort },
+        judge: { model: fields.judge },
+      }, token, fields.userToken.trim());
+      window.location.hash = `/tasks/${task.task_id}`;
+      onClose();
+    } catch (err) {
+      setSubmitError(err instanceof Error ? err.message : String(err));
+    } finally {
+      submitLock.current = false;
+      setSubmitting(false);
+    }
+  }
+
+  return (
+    <Modal
+      open title="发起任务" okText={submitting ? "正在发起…" : "发起任务"} cancelText="返回"
+      mask={{ closable: !busy }} keyboard={!busy} closable={!busy}
+      onCancel={onClose} onOk={() => form.submit()} confirmLoading={submitting}
+      cancelButtonProps={{ disabled: busy }}
+      okButtonProps={{ disabled: busy || !data || !hasOnlineNodes || nodeUnavailable }}
+    >
+      <Form form={form} layout="vertical" disabled={busy} onFinish={(fields) => submit(fields)} className="new-task-form">
+        <Alert
+          type="info" title="执行规则" showIcon
+          description="任务只能在发起人自己的节点上、用自己的模型来源执行；额度用完会暂停并通知，不会自动换计费方式。"
+        />
+        {error && <LoadError title="无法加载用例和模型" error={error} />}
+        {nodeError && <LoadError title="无法加载节点" error={nodeError} />}
+        {submitError && <Alert type="error" title="发起任务失败" description={<div className="wrap-text">{submitError}</div>} showIcon />}
+        {!data && !error && <Skeleton active paragraph={{ rows: 5 }} />}
+        {data && (
+          <>
+            <Form.Item
+              name="node" label="执行节点"
+              rules={[{ required: true, message: "请选择在线节点" }]}
+              validateStatus={nodeUnavailable ? "warning" : undefined}
+              help={nodeUnavailable ? "所选节点已离线或不可用，请选择在线节点。" : nodes && !hasOnlineNodes ? "当前没有在线节点，请先启动自己的执行节点。" : undefined}
+            >
+              <Select
+                placeholder="选择在线节点" disabled={!nodes || busy}
+                options={nodes?.map((candidate) => ({
+                  value: candidate.node_id,
+                  label: `${candidate.node_id.slice(0, 8)} · ${candidate.online ? `在线，${candidate.devices.length} 台设备` : "离线，无法接收任务"}`,
+                  disabled: !candidate.online,
+                })) ?? []}
+              />
+            </Form.Item>
+            <Form.Item name="cases" label="用例" rules={[{ type: "array", required: true, min: 1, message: "请至少选择一个用例" }]}>
+              <Select
+                mode="multiple" placeholder="按编号或标题搜索用例" showSearch={{ optionFilterProp: "label" }}
+                virtual={false} maxTagCount="responsive"
+                optionRender={(option) => <span className="case-choice">{option.label}</span>}
+                options={data.cases.map((c) => ({
+                  value: c.code,
+                  label: `${c.code} · ${c.title}${c.should_fail ? "（故意失败）" : ""}${c.status !== "active" ? `（受阻 · ${c.blocked_reason || "原因未填写"}）` : ""}`,
+                  disabled: c.status !== "active",
+                }))}
+              />
+            </Form.Item>
+            <div className="model-fields">
+              <Form.Item name="executor" label="执行员模型" rules={[{ required: true, message: "请选择执行员模型" }]}>
+                <Select onChange={changeModel} options={data.models.executor.models.map((m) => ({ value: m.model, label: m.model }))} />
+              </Form.Item>
+              <Form.Item name="effort" label="推理强度" rules={[{ required: true, message: "请选择推理强度" }]}>
+                <Select options={efforts.map((effort) => ({ value: effort, label: effort }))} />
+              </Form.Item>
+            </div>
+            <Form.Item name="judge" label="判定员模型" rules={[{ required: true, message: "请选择判定员模型" }]}>
+              <Select options={data.models.judge.models.map((m) => ({ value: m.model, label: m.model }))} />
+            </Form.Item>
+            <Form.Item
+              name="userToken" label="个人令牌" extra="用来确认所选节点属于你。只在本次请求中使用，不会保存。"
+              rules={[{ required: true, whitespace: true, message: "请输入个人令牌" }]}
+            >
+              <Input.Password autoComplete="off" />
+            </Form.Item>
+          </>
+        )}
+      </Form>
+      {pendingFields && (
+        <ReviewTokenDialog onConfirm={(token) => submit(pendingFields, token)} onCancel={() => setPendingFields(null)} />
+      )}
+    </Modal>
+  );
+}

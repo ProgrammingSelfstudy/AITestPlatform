@@ -1,0 +1,22 @@
+{
+  "说明": "任务页面里模型下拉框的选项。模型名属于配置，不写在代码里；改这个文件即可，不用重新编译（服务端每次请求都重新读取）。",
+  "executor": {
+    "source": "codex_exec",
+    "default": { "model": "gpt-6.2-astra", "effort": "max" },
+    "models": [
+      { "model": "gpt-6.2-astra", "efforts": ["low", "medium", "high", "xhigh", "max"] },
+      { "model": "gpt-6.2-sol", "efforts": ["low", "medium", "high", "xhigh", "max"] },
+      { "model": "gpt-6.1-terra", "efforts": ["low", "medium", "high", "xhigh", "max"] },
+      { "model": "gpt-6-sol", "efforts": ["low", "medium", "high", "xhigh", "max"] },
+      { "model": "gpt-6-astra", "efforts": ["low", "medium", "high", "xhigh", "max"] },
+      { "model": "gpt-6-luna", "efforts": ["low", "medium", "high", "xhigh", "max"] }
+    ]
+  },
+  "judge": {
+    "source": "claude_cli",
+    "default": { "model": "claude-opus-5-5", "effort": null },
+    "models": [
+      { "model": "claude-opus-5-5", "efforts": [] }
+    ]
+  }
+}

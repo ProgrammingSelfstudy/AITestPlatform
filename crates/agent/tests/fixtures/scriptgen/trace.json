@@ -1,0 +1,18 @@
+{
+  "case": "TC-04",
+  "serial": "13579024",
+  "unrelated": "不应送入模型的字段",
+  "steps": [
+    {
+      "idx": 1,
+      "action": "tap",
+      "target": "More",
+      "point": [295, 1527],
+      "new_labels": ["Music", "用户 fixture_login_name"],
+      "after_labels": ["Interaction Tools", "fixture_login_name", "demoPass\"with\\Slash99"],
+      "prev_label": "邮箱 old-trace@example.test",
+      "value": "demoPass\"with\\Slash99",
+      "shot": "/Users/fixture/private/shots/01_after.png"
+    }
+  ]
+}

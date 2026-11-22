@@ -1,0 +1,15 @@
+/target
+/web/node_modules
+/web/dist
+.env
+*.log
+/data
+__pycache__/
+*.pyc
+/automation/.venv
+.pytest_cache/
+
+# 服务端落盘的证据文件（截图等），不入库
+/data/
+
+.DS_Store

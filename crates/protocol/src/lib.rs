@@ -1,0 +1,591 @@
+//! 节点 ↔ 服务端通信协议（v1）。这里的类型是协议的唯一来源，说明见 `docs/节点协议.md`。
+//!
+//! 约定：
+//! - 信封固定为 `{v, id, ts, type, payload}`；
+//! - 收到未知 `type` 不报错：用 [`parse`] 解析，得到 `Parsed::UnknownType`，调用方记日志后忽略，保证向前兼容；
+//!   已知 `type` 但内容格式不对仍然报错；
+//! - 未知字段一律容忍（不使用 `deny_unknown_fields`）；
+//! - 账号密码**不出现在任何协议类型里**：`RunAssign` 只带 `lease_id`，凭证走单独的 HTTPS 接口。
+
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+pub mod recording;
+
+/// 当前协议版本。改字段含义或删字段才升版本，只加可选字段不升。
+pub const PROTOCOL_VERSION: u32 = 1;
+
+/// 默认心跳间隔（秒）。服务端在 `Welcome` 里下发，节点以下发值为准。
+pub const DEFAULT_HEARTBEAT_S: u32 = 10;
+
+/// 消息信封。`B` 是 `NodeMsg` 或 `ServerMsg`。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Envelope<B> {
+    pub v: u32,
+    pub id: Uuid,
+    pub ts: DateTime<Utc>,
+    #[serde(flatten)]
+    pub body: B,
+}
+
+impl<B> Envelope<B> {
+    pub fn new(body: B) -> Self {
+        Self { v: PROTOCOL_VERSION, id: Uuid::new_v4(), ts: Utc::now(), body }
+    }
+}
+
+/// [`parse`] 的结果。
+#[derive(Debug, Clone, PartialEq)]
+pub enum Parsed<B> {
+    Known(Envelope<B>),
+    /// 版本更新的对端发来了我们不认识的消息类型：记日志后忽略，不断开连接
+    UnknownType { v: u32, id: Uuid, type_name: String },
+}
+
+/// 解析一条消息。未知 `type` 返回 `UnknownType`，其他格式错误照常返回 `Err`。
+pub fn parse<B: serde::de::DeserializeOwned>(text: &str) -> Result<Parsed<B>, serde_json::Error> {
+    let value: serde_json::Value = serde_json::from_str(text)?;
+    match serde_json::from_value::<Envelope<B>>(value.clone()) {
+        Ok(env) => Ok(Parsed::Known(env)),
+        Err(e) if e.to_string().starts_with("unknown variant") => {
+            let get = |k: &str| value.get(k).cloned().unwrap_or(serde_json::Value::Null);
+            Ok(Parsed::UnknownType {
+                v: get("v").as_u64().unwrap_or(0) as u32,
+                id: get("id").as_str().and_then(|s| s.parse().ok()).unwrap_or_default(),
+                type_name: get("type").as_str().unwrap_or("").to_string(),
+            })
+        }
+        Err(e) => Err(e),
+    }
+}
+
+// ---------------------------------------------------------------- 公共类型
+
+/// 模型来源。只有本机会员两种，**没有 API Key 来源**。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelSource {
+    /// `claude` 命令行（本机 Claude 会员登录）
+    ClaudeCli,
+    /// `codex exec`（本机 ChatGPT 登录）
+    CodexExec,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Caps {
+    pub node_version: String,
+    pub os: String,
+    pub model_sources: Vec<ModelSourceCap>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ModelSourceCap {
+    pub source: ModelSource,
+    /// 该来源是否支持看图（执行岗位必须支持）
+    pub vision: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DeviceStatus {
+    Idle,
+    Busy,
+    Offline,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DeviceInfo {
+    pub serial: String,
+    pub platform: String,
+    pub model: Option<String>,
+    pub os_version: Option<String>,
+    pub screen_w: Option<u32>,
+    pub screen_h: Option<u32>,
+    pub status: DeviceStatus,
+}
+
+/// 判定结果。证据不足用 `Uncertain`，**不能强行通过**。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Verdict {
+    Passed,
+    Failed,
+    Uncertain,
+}
+
+/// run 的最终结果。`Blocked` 表示没跑完（链路、环境、卡住等），不是用例失败。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FinalResult {
+    Passed,
+    Failed,
+    Uncertain,
+    Blocked,
+}
+
+/// 受阻原因，统计完成率时要区分链路/环境故障。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BlockedReason {
+    Setup,
+    Link,
+    NodeLost,
+    Stuck,
+    Quota,
+    Other,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum JudgeStatus {
+    Completed,
+    Failed,
+    NotRun,
+}
+
+/// 需要人介入的类型。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HumanKind {
+    /// 支付、删除账号、注销等高危页面，工具层直接拒绝
+    Danger,
+    Stuck,
+    ManualStep,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HumanAction {
+    Continue,
+    Abort,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CaseExpected {
+    pub idx: u32,
+    pub text: String,
+}
+
+/// 下发给节点的用例。`data` 里的账号是占位符 `{{account.xxx}}`，不含明文。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CaseSpec {
+    pub code: String,
+    pub title: String,
+    pub preconditions: Vec<String>,
+    pub steps: Vec<String>,
+    pub expected: Vec<CaseExpected>,
+    pub data: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RoleModel {
+    pub source: ModelSource,
+    /// 模型名来自角色配置，代码里不写死
+    pub model: Option<String>,
+    /// 推理强度（如 low / medium / high / xhigh / max）。**不指定时 Codex 会落到模型目录里的默认值，通常是 low**，
+    /// 而且平台为了锁死工具会忽略用户自己的 Codex 配置，所以执行员的推理强度必须在这里显式给出。
+    #[serde(default)]
+    pub effort: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Limits {
+    pub max_steps: u32,
+    pub timeout_s: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct JudgeItem {
+    pub idx: u32,
+    pub verdict: Verdict,
+    pub evidence: String,
+    pub file_refs: Vec<String>,
+}
+
+// ---------------------------------------------------------------- 节点 → 服务端
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Hello {
+    /// 注册时拿到的节点令牌
+    pub token: String,
+    /// 节点第一次连接后服务端在 `Welcome` 里下发的 id；重连时带上，服务端据此认出是同一个节点。首次连接为空
+    #[serde(default)]
+    pub node_id: Option<Uuid>,
+    /// 节点身份密钥：首次连接时服务端在 `Welcome` 里下发，节点本地保存，之后每次重连都要带上。
+    /// 服务端已给该节点发过密钥时，缺失或不符一律按 `unauthorized` 拒绝，共享令牌不能冒领别的节点。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_secret: Option<String>,
+    /// 节点主人的个人令牌。节点还没有属主时，服务端据此绑定；已有属主时必须与属主一致（缺省视为不变）。
+    /// 「谁发起谁付额度」靠它判断任务发起人是不是节点属主。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_token: Option<String>,
+    pub caps: Caps,
+    pub devices: Vec<DeviceInfo>,
+    /// 重连时本地仍在跑的 run
+    #[serde(default)]
+    pub running_runs: Vec<Uuid>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Heartbeat {
+    pub devices: Vec<DeviceInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Step {
+    pub run_id: Uuid,
+    /// `(run_id, idx)` 幂等，重传安全
+    pub idx: u32,
+    /// 步骤开始的节点时间（epoch 毫秒）；旧节点不发送时为 0。
+    #[serde(default)]
+    pub at_ms: i64,
+    pub tool: String,
+    /// 已脱敏的参数
+    pub args: serde_json::Value,
+    /// 结果摘要
+    pub result: serde_json::Value,
+    pub file_ref: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ExecutorDone {
+    pub run_id: Uuid,
+    pub result: Verdict,
+    pub reason: String,
+    pub cost: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct JudgeDone {
+    pub run_id: Uuid,
+    pub judge_status: JudgeStatus,
+    /// Judge 没跑成时必须是 `Uncertain`，不得用执行员自评顶替
+    pub final_result: FinalResult,
+    pub items: Vec<JudgeItem>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct NeedHuman {
+    pub run_id: Uuid,
+    pub kind: HumanKind,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RunBlocked {
+    pub run_id: Uuid,
+    pub reason: BlockedReason,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct QuotaExhausted {
+    pub source: ModelSource,
+    pub run_id: Option<Uuid>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Frame {
+    pub run_id: Uuid,
+    /// JPEG 的 base64
+    pub jpeg_b64: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LogLine {
+    pub level: String,
+    /// 已脱敏
+    pub msg: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type", content = "payload", rename_all = "snake_case")]
+pub enum NodeMsg {
+    Hello(Hello),
+    Heartbeat(Heartbeat),
+    DeviceUpdate(Heartbeat),
+    RunStarted { run_id: Uuid },
+    Step(Step),
+    ExecutorDone(ExecutorDone),
+    JudgeDone(JudgeDone),
+    NeedHuman(NeedHuman),
+    RunBlocked(RunBlocked),
+    QuotaExhausted(QuotaExhausted),
+    Frame(Frame),
+    Log(LogLine),
+    /// 对服务端需要确认的消息（如 `run_assign`）的确认，`ack_id` 是被确认消息的 id
+    Ack { ack_id: Uuid },
+}
+
+impl NodeMsg {
+    pub fn tracked_run(&self) -> Option<Uuid> {
+        match self {
+            Self::RunStarted { run_id } => Some(*run_id),
+            Self::Step(step) => Some(step.run_id),
+            Self::ExecutorDone(done) => Some(done.run_id),
+            Self::JudgeDone(done) => Some(done.run_id),
+            Self::RunBlocked(blocked) => Some(blocked.run_id),
+            Self::QuotaExhausted(exhausted) => exhausted.run_id,
+            _ => None,
+        }
+    }
+}
+
+// ---------------------------------------------------------------- 服务端 → 节点
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ResumeDecision {
+    Continue,
+    Abort,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ResumeItem {
+    pub run_id: Uuid,
+    pub decision: ResumeDecision,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Welcome {
+    pub node_id: Uuid,
+    /// 只在服务端新发（或首次补发）密钥时出现；节点必须保存。`Debug` 会打印它，不要把 `Welcome` 写进日志。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_secret: Option<String>,
+    pub heartbeat_s: u32,
+    #[serde(default)]
+    pub resume: Vec<ResumeItem>,
+    #[serde(default)]
+    pub ack_run_updates: bool,
+}
+
+/// 下发任务。**不含账号密码**：节点拿 `lease_id` 用节点令牌调本机 HTTP 接口取一次性凭证。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RunAssign {
+    pub run_id: Uuid,
+    pub case: CaseSpec,
+    pub device_serial: String,
+    pub executor: RoleModel,
+    pub judge: RoleModel,
+    /// 账号租约。`None` 表示这次执行不需要账号（手机上已经是目标账号）；有账号时节点凭它取一次性凭证。
+    /// 不用全零 id 占位：那会让「有租约」和「没租约」无法区分。
+    #[serde(default)]
+    pub lease_id: Option<Uuid>,
+    /// 上一轮使用后环境未恢复，节点需要先执行收尾。
+    #[serde(default)]
+    pub needs_cleanup: bool,
+    pub limits: Limits,
+}
+
+/// 仅用于节点的一次性取凭证接口。账号 ID 是登录态缓存的稳定标识。
+#[derive(Serialize, Deserialize)]
+pub struct LeaseCredentials {
+    pub account_id: Uuid,
+    pub username: String,
+    pub password: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HumanResolved {
+    pub run_id: Uuid,
+    pub action: HumanAction,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ProtoError {
+    /// 如 `unauthorized`、`version_too_old`
+    pub code: String,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ack_id: Option<Uuid>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type", content = "payload", rename_all = "snake_case")]
+pub enum ServerMsg {
+    Welcome(Welcome),
+    RunAssign(RunAssign),
+    RunCancel { run_id: Uuid },
+    HumanResolved(HumanResolved),
+    SubscribeFrames { run_id: Uuid },
+    UnsubscribeFrames { run_id: Uuid },
+    Ping,
+    Error(ProtoError),
+    Ack { ack_id: Uuid },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn caps() -> Caps {
+        Caps {
+            node_version: "0.1.0".into(),
+            os: "macos".into(),
+            model_sources: vec![ModelSourceCap { source: ModelSource::ClaudeCli, vision: true }],
+        }
+    }
+
+    fn device() -> DeviceInfo {
+        DeviceInfo {
+            serial: "1263040493010797".into(),
+            platform: "android".into(),
+            model: Some("X6531".into()),
+            os_version: None,
+            screen_w: Some(720),
+            screen_h: Some(1600),
+            status: DeviceStatus::Idle,
+        }
+    }
+
+    fn roundtrip<B>(body: B)
+    where
+        B: Serialize + for<'de> Deserialize<'de> + PartialEq + std::fmt::Debug + Clone,
+    {
+        let env = Envelope::new(body);
+        let text = serde_json::to_string(&env).unwrap();
+        let back: Envelope<B> = serde_json::from_str(&text).unwrap();
+        assert_eq!(env, back);
+    }
+
+    #[test]
+    fn 信封字段齐全() {
+        let env = Envelope::new(NodeMsg::RunStarted { run_id: Uuid::nil() });
+        let v: serde_json::Value = serde_json::to_value(&env).unwrap();
+        assert_eq!(v["v"], 1);
+        assert_eq!(v["type"], "run_started");
+        assert!(v["id"].is_string() && v["ts"].is_string() && v["payload"].is_object());
+    }
+
+    #[test]
+    fn 节点消息往返() {
+        let run_id = Uuid::new_v4();
+        roundtrip(NodeMsg::Hello(Hello { token: "t".into(), node_id: Some(Uuid::new_v4()), node_secret: Some("s".into()), user_token: Some("u".into()), caps: caps(), devices: vec![device()], running_runs: vec![run_id] }));
+        roundtrip(NodeMsg::Heartbeat(Heartbeat { devices: vec![device()] }));
+        roundtrip(NodeMsg::RunStarted { run_id });
+        roundtrip(NodeMsg::Step(Step {
+            run_id, idx: 3, at_ms: 1_700_000_000_000, tool: "tap_element".into(),
+            args: json!({"desc": "Add Music"}), result: json!({"ok": true}), file_ref: Some("shots/03.png".into()),
+        }));
+        roundtrip(NodeMsg::ExecutorDone(ExecutorDone { run_id, result: Verdict::Uncertain, reason: "r".into(), cost: None }));
+        roundtrip(NodeMsg::JudgeDone(JudgeDone {
+            run_id, judge_status: JudgeStatus::Failed, final_result: FinalResult::Uncertain, items: vec![],
+        }));
+        roundtrip(NodeMsg::NeedHuman(NeedHuman { run_id, kind: HumanKind::Danger, reason: "支付页".into() }));
+        roundtrip(NodeMsg::RunBlocked(RunBlocked { run_id, reason: BlockedReason::Link, detail: "reconnect_loop".into() }));
+        roundtrip(NodeMsg::QuotaExhausted(QuotaExhausted { source: ModelSource::CodexExec, run_id: Some(run_id) }));
+        roundtrip(NodeMsg::Ack { ack_id: Uuid::new_v4() });
+    }
+
+    #[test]
+    fn 旧节点的步骤消息没有开始时间仍可解析() {
+        let step: Step = serde_json::from_value(json!({
+            "run_id": Uuid::nil(), "idx": 1, "tool": "tap", "args": {}, "result": {}
+        })).unwrap();
+        assert_eq!(step.at_ms, 0);
+    }
+
+    #[test]
+    fn 服务端消息往返() {
+        let run_id = Uuid::new_v4();
+        roundtrip(ServerMsg::Welcome(Welcome {
+            node_id: Uuid::new_v4(), node_secret: Some("s".into()), heartbeat_s: DEFAULT_HEARTBEAT_S,
+            resume: vec![ResumeItem { run_id, decision: ResumeDecision::Continue }],
+            ack_run_updates: true,
+        }));
+        roundtrip(ServerMsg::RunAssign(RunAssign {
+            run_id,
+            case: CaseSpec {
+                code: "TC-04".into(), title: "t".into(), preconditions: vec![], steps: vec!["s".into()],
+                expected: vec![CaseExpected { idx: 1, text: "e".into() }], data: json!({"user": "{{account.username}}"}),
+            },
+            device_serial: "1263040493010797".into(),
+            executor: RoleModel { source: ModelSource::CodexExec, model: None, effort: None },
+            judge: RoleModel { source: ModelSource::ClaudeCli, model: None, effort: None },
+            lease_id: Some(Uuid::new_v4()),
+            needs_cleanup: true,
+            limits: Limits { max_steps: 60, timeout_s: 900 },
+        }));
+        roundtrip(ServerMsg::RunCancel { run_id });
+        roundtrip(ServerMsg::HumanResolved(HumanResolved { run_id, action: HumanAction::Abort }));
+        roundtrip(ServerMsg::Ack { ack_id: run_id });
+        roundtrip(ServerMsg::Error(ProtoError { code: "run_rejected".into(), message: "m".into(), ack_id: Some(run_id) }));
+        roundtrip(ServerMsg::Ping);
+    }
+
+    #[test]
+    fn 未知类型不报错() {
+        let text = r#"{"v":1,"id":"00000000-0000-0000-0000-000000000000","ts":"2026-11-20T10:00:00Z","type":"from_the_future","payload":{"x":1}}"#;
+        match parse::<ServerMsg>(text).unwrap() {
+            Parsed::UnknownType { type_name, v, .. } => {
+                assert_eq!(type_name, "from_the_future");
+                assert_eq!(v, 1);
+            }
+            other => panic!("应当识别为未知类型，实际：{other:?}"),
+        }
+    }
+
+    #[test]
+    fn 已知类型但格式错仍然报错() {
+        // run_cancel 缺 run_id：不能被当成「未知类型」悄悄忽略，否则会吞掉真正的协议错误
+        let text = r#"{"v":1,"id":"00000000-0000-0000-0000-000000000000","ts":"2026-11-20T10:00:00Z","type":"run_cancel","payload":{}}"#;
+        assert!(parse::<ServerMsg>(text).is_err());
+    }
+
+    #[test]
+    fn parse解析已知类型() {
+        let env = Envelope::new(NodeMsg::RunStarted { run_id: Uuid::nil() });
+        let text = serde_json::to_string(&env).unwrap();
+        assert_eq!(parse::<NodeMsg>(&text).unwrap(), Parsed::Known(env));
+    }
+
+    #[test]
+    fn 未知字段容忍() {
+        let text = r#"{"v":1,"id":"00000000-0000-0000-0000-000000000000","ts":"2026-11-20T10:00:00Z","type":"run_cancel","payload":{"run_id":"00000000-0000-0000-0000-000000000000","extra":"新增字段"}}"#;
+        let env: Envelope<ServerMsg> = serde_json::from_str(text).unwrap();
+        assert_eq!(env.body, ServerMsg::RunCancel { run_id: Uuid::nil() });
+    }
+
+    #[test]
+    fn 下发任务里没有密码字段() {
+        let assign = RunAssign {
+            run_id: Uuid::nil(),
+            case: CaseSpec {
+                code: "TC-01".into(), title: "t".into(), preconditions: vec![], steps: vec![], expected: vec![],
+                data: json!({"account": "{{account.username}}"}),
+            },
+            device_serial: "x".into(),
+            executor: RoleModel { source: ModelSource::ClaudeCli, model: None, effort: None },
+            judge: RoleModel { source: ModelSource::ClaudeCli, model: None, effort: None },
+            lease_id: None,
+            needs_cleanup: false,
+            limits: Limits { max_steps: 1, timeout_s: 1 },
+        };
+        let text = serde_json::to_string(&assign).unwrap().to_lowercase();
+        assert!(!text.contains("password") && !text.contains("passwd"), "协议里不能出现密码字段：{text}");
+        assert!(!text.contains("\"lease_id\":\"0000"), "没有租约时不能用全零 id 占位");
+    }
+
+    #[test]
+    fn 旧派发消息默认不要求清理() {
+        let assign: RunAssign = serde_json::from_value(json!({
+            "run_id": Uuid::nil(),
+            "case": {"code": "TC-01", "title": "标题", "preconditions": [], "steps": [], "expected": [], "data": {}},
+            "device_serial": "测试设备",
+            "executor": {"source": "codex_exec"},
+            "judge": {"source": "claude_cli"},
+            "limits": {"max_steps": 1, "timeout_s": 2}
+        })).unwrap();
+        assert!(assign.lease_id.is_none());
+        assert!(!assign.needs_cleanup);
+    }
+
+    #[test]
+    fn judge没跑成时最终结果是待确认() {
+        // 固定这个语义：Judge 失败时 final_result 只能是 Uncertain，不能由调用方改成 Passed。
+        let done = JudgeDone { run_id: Uuid::nil(), judge_status: JudgeStatus::Failed, final_result: FinalResult::Uncertain, items: vec![] };
+        assert_eq!(done.final_result, FinalResult::Uncertain);
+    }
+}

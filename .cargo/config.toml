@@ -1,0 +1,14 @@
+# 项目级镜像配置：本机直连 static.crates.io 经常断流（transfer too slow）。
+# 只作用于本仓库，不影响全局 cargo；想撤回，删掉本文件即可。
+# Cargo.lock 里每个包都有校验和，镜像换不掉已锁定的版本内容。
+[source.crates-io]
+replace-with = "rsproxy-sparse"
+
+[source.rsproxy-sparse]
+registry = "sparse+https://rsproxy.cn/index/"
+
+[net]
+retry = 10
+
+[http]
+multiplexing = false

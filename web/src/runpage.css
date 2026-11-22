@@ -1,0 +1,143 @@
+.run-detail .run-grid {
+  grid-template-columns: minmax(0, 1.08fr) minmax(0, 1fr);
+  gap: 20px;
+}
+
+.run-detail-heading {
+  padding-block-end: 12px;
+  border-block-end: 1px solid var(--border);
+}
+
+.run-timeline {
+  display: grid;
+  gap: 4px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.run-timeline-step {
+  position: relative;
+  padding: 10px 10px 12px 42px;
+  border-radius: 8px;
+  scroll-margin-block: 12px;
+}
+
+.run-timeline-step:not(:last-child)::before {
+  position: absolute;
+  inset-block: 38px -14px;
+  inset-inline-start: 18px;
+  width: 1px;
+  background: var(--border);
+  content: "";
+}
+
+.run-step-marker {
+  position: absolute;
+  inset-block-start: 10px;
+  inset-inline-start: 4px;
+  display: grid;
+  place-items: center;
+  box-sizing: border-box;
+  width: 29px;
+  height: 29px;
+  background: var(--soft);
+  border: 1px solid var(--border);
+  border-radius: 50%;
+  color: var(--text-2);
+  font: 600 11px/1 var(--mono);
+}
+
+.run-timeline-step[aria-current="step"] {
+  background: var(--accent-bg);
+}
+
+.run-timeline-step[aria-current="step"] .run-step-marker {
+  background: var(--surface);
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.run-timeline-step:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+.run-step-heading,
+.run-step-action-line {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 8px;
+}
+
+.run-step-heading {
+  justify-content: space-between;
+  min-height: 29px;
+}
+
+.run-step-action-line {
+  flex: 1 1 160px;
+  min-width: 0;
+}
+
+.run-step-action.ant-tag {
+  max-width: 100%;
+  margin-inline-end: 0;
+  overflow-wrap: anywhere;
+  white-space: normal;
+  font-weight: 600;
+}
+
+.run-detail .judge-item {
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-inline-start: 3px solid var(--run-verdict-color, var(--border));
+  border-radius: 8px;
+}
+
+.run-detail .judge-item[data-verdict="passed"] { --run-verdict-color: var(--pass); }
+.run-detail .judge-item[data-verdict="failed"] { --run-verdict-color: var(--fail); }
+.run-detail .judge-item[data-verdict="uncertain"] { --run-verdict-color: var(--unc); }
+
+.run-evidence {
+  color: var(--text-2);
+  line-height: 1.75;
+}
+
+.run-step-ref {
+  align-self: flex-start;
+  max-width: 100%;
+  padding: 1px 6px;
+  background: var(--accent-bg);
+  border: 1px solid transparent;
+  border-radius: 5px;
+  color: var(--accent);
+  font: 600 12px/1.5 var(--mono);
+  overflow-wrap: anywhere;
+  white-space: normal;
+  vertical-align: baseline;
+  cursor: pointer;
+}
+
+.run-step-ref:hover:not(:disabled) {
+  border-color: currentColor;
+}
+
+.run-step-ref:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.run-step-ref:disabled {
+  background: var(--soft);
+  color: var(--text-2);
+  cursor: not-allowed;
+}
+
+@media (max-width: 1020px) {
+  .run-detail .run-grid {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 16px;
+  }
+}

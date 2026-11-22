@@ -1,0 +1,16 @@
+[package]
+name = "device"
+edition.workspace = true
+version.workspace = true
+publish.workspace = true
+
+[dependencies]
+async-trait = "0.1.92"
+roxmltree = "0.21.2"
+serde = { version = "1.0.229", features = ["derive"] }
+thiserror = "2.0.21"
+tokio = { version = "1.54.1", features = ["process", "io-util", "time", "rt", "macros"] }
+tracing = "0.1.44"
+
+[dev-dependencies]
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "test-util"] }

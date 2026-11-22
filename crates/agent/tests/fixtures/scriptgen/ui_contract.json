@@ -1,0 +1,115 @@
+{
+  "allowed_imports": [
+    "pytest", "re", "time", "hafa_automation", "hafa_automation.*",
+    "generated", "generated.pages", "generated.pages.{case}_pages"
+  ],
+  "methods": {
+    "elements": {
+      "parameters": [{"name": "retry", "kind": "positional_or_keyword", "required": false}],
+      "doc": "读取当前页面的元素快照。"
+    },
+    "labels": {"parameters": [], "doc": "读取当前页面所有可见的 content-desc 文案。"},
+    "find": {
+      "parameters": [
+        {"name": "text", "kind": "positional_or_keyword", "required": true},
+        {"name": "exact", "kind": "keyword_only", "required": false},
+        {"name": "clickable", "kind": "keyword_only", "required": false}
+      ],
+      "doc": "按 content-desc 找元素，返回带 bounds、center 的元素或 None。"
+    },
+    "has": {
+      "parameters": [
+        {"name": "text", "kind": "positional_or_keyword", "required": true},
+        {"name": "exact", "kind": "keyword_only", "required": false}
+      ],
+      "doc": "立即检查可见文案，默认包含匹配。"
+    },
+    "read": {
+      "parameters": [{"name": "pattern", "kind": "positional_or_keyword", "required": true}],
+      "doc": "读取匹配正则的第一条页面文案或 None。"
+    },
+    "wait_text": {
+      "parameters": [
+        {"name": "text", "kind": "positional_or_keyword", "required": true},
+        {"name": "timeout", "kind": "positional_or_keyword", "required": false},
+        {"name": "exact", "kind": "keyword_only", "required": false}
+      ],
+      "doc": "等待页面出现目标文案，默认包含匹配，超时会断言失败。"
+    },
+    "wait_gone": {
+      "parameters": [
+        {"name": "text", "kind": "positional_or_keyword", "required": true},
+        {"name": "timeout", "kind": "positional_or_keyword", "required": false}
+      ],
+      "doc": "等待目标文案消失。"
+    },
+    "wait_any": {
+      "parameters": [
+        {"name": "texts", "kind": "positional_or_keyword", "required": true},
+        {"name": "timeout", "kind": "positional_or_keyword", "required": false}
+      ],
+      "doc": "等待任一目标文案出现并返回它。"
+    },
+    "tap_xy": {
+      "parameters": [
+        {"name": "x", "kind": "positional_or_keyword", "required": true},
+        {"name": "y", "kind": "positional_or_keyword", "required": true},
+        {"name": "wait", "kind": "positional_or_keyword", "required": false}
+      ],
+      "doc": "点击没有稳定文案的固定坐标。"
+    },
+    "tap": {
+      "parameters": [
+        {"name": "text", "kind": "positional_or_keyword", "required": true},
+        {"name": "xy", "kind": "keyword_only", "required": false},
+        {"name": "exact", "kind": "keyword_only", "required": false},
+        {"name": "scroll", "kind": "keyword_only", "required": false},
+        {"name": "wait", "kind": "keyword_only", "required": false}
+      ],
+      "doc": "优先按 content-desc 找元素并点击。scroll 可带上滑查找，xy 可作坐标兜底。"
+    },
+    "scroll_to": {
+      "parameters": [
+        {"name": "text", "kind": "positional_or_keyword", "required": true},
+        {"name": "exact", "kind": "keyword_only", "required": false},
+        {"name": "max_swipes", "kind": "keyword_only", "required": false}
+      ],
+      "doc": "在有限次数内上滑查找元素，找不到返回 None。"
+    },
+    "type_after": {
+      "parameters": [
+        {"name": "prev_label", "kind": "positional_or_keyword", "required": true},
+        {"name": "text", "kind": "positional_or_keyword", "required": true},
+        {"name": "xy", "kind": "keyword_only", "required": false}
+      ],
+      "doc": "用输入框前一个稳定文案定位，在其后的输入框输入普通测试文本。"
+    },
+    "drag": {
+      "parameters": [
+        {"name": "x1", "kind": "positional_or_keyword", "required": true},
+        {"name": "y1", "kind": "positional_or_keyword", "required": true},
+        {"name": "x2", "kind": "positional_or_keyword", "required": true},
+        {"name": "y2", "kind": "positional_or_keyword", "required": true},
+        {"name": "duration", "kind": "positional_or_keyword", "required": false},
+        {"name": "wait", "kind": "positional_or_keyword", "required": false}
+      ],
+      "doc": "按住从起点拖到终点，适合滑块。"
+    },
+    "swipe": {
+      "parameters": [
+        {"name": "direction", "kind": "positional_or_keyword", "required": false},
+        {"name": "wait", "kind": "positional_or_keyword", "required": false}
+      ],
+      "doc": "滑动页面，方向支持 up、down、left、right。"
+    },
+    "back": {"parameters": [{"name": "wait", "kind": "positional_or_keyword", "required": false}]},
+    "restart_app": {"parameters": [{"name": "wait", "kind": "positional_or_keyword", "required": false}]},
+    "wait": {
+      "parameters": [{"name": "seconds", "kind": "positional_or_keyword", "required": true}],
+      "doc": "固定等待。生成脚本只可用不超过 3 秒的常量。"
+    },
+    "debug_overlay_up": {"parameters": [], "doc": "判断语音调试面板是否可见。"},
+    "dismiss_debug_overlay": {"parameters": [], "doc": "关闭语音调试面板。"},
+    "close_popups": {"parameters": [], "doc": "关闭首页可选的弹窗和语音调试面板。"}
+  }
+}
