@@ -75,6 +75,9 @@ pub(crate) fn routes(app: AppState, paths: Paths) -> Router {
             get(files::get).put(files::put),
         )
         .route("/api/runs/{id}/recording-index", put(files::put_recording_index))
+        .route("/api/runs/{id}/scripts", put(crate::scripts_api::put))
+        .route("/api/runs/{id}/script-source", get(crate::scripts_api::source))
+        .route("/api/cases/{id}/scripts", get(crate::scripts_api::list))
         .with_state(ApiState {
             app,
             paths,

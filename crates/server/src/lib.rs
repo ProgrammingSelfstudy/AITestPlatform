@@ -11,6 +11,8 @@ pub mod recording_retention;
 mod reviews;
 pub mod users;
 pub mod runs;
+pub mod scripts;
+mod scripts_api;
 #[cfg(feature = "test-support")]
 pub mod test_support;
 

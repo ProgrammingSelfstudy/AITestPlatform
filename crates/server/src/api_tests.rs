@@ -510,6 +510,9 @@ impl World {
 #[path = "reviews_api_tests.rs"]
 mod reviews_api_tests;
 
+#[path = "scripts_api_tests.rs"]
+mod scripts_api_tests;
+
 #[tokio::test]
 async fn 创建任务业务校验失败返回400及原因() {
     let world = World::new().await;
