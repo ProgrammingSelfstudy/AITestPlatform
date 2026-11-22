@@ -411,6 +411,14 @@ fn model_failure(failure: Failure) -> ScriptgenError {
     }
 }
 
+/// 内置的 Ui 契约（PoC 签名夹具），与开发入口 `scriptgen_dev` 的默认契约相同。
+/// 它不是从当前自动化运行时读出来的，运行时新增或改名的方法这里不会知道；
+/// 要和运行时对齐，需要调用方用 [`UiContract::from_runtime_json`] 自己构造。
+pub fn builtin_contract() -> UiContract {
+    UiContract::from_json(include_str!("../tests/fixtures/scriptgen/ui_contract.json").as_bytes())
+        .expect("内置的 Ui 契约夹具必须是有效 JSON")
+}
+
 /// 首次生成与最多一轮修正。只有通过文件形态和源码校验的结果才会返回。
 pub async fn generate(
     opts: &ScriptgenOpts,

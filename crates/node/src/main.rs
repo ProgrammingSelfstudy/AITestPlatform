@@ -6,11 +6,58 @@ use node::{run, AdbDevices, NoExecutor, NodeConfig, Only};
 use reqwest::Url;
 use tracing_subscriber::EnvFilter;
 
+/// `node gen-script <run编号> [--app-info <app_info.yaml>]`：为本节点上一次通过的执行生成回归脚本候选并上传归档。
+/// 显式触发而不是每次通过都自动跑：它会花发起人的 Claude 会员额度（规则 9），由人决定哪次值得固化。
+async fn gen_script(args: &[String]) -> anyhow::Result<()> {
+    const USAGE: &str = "用法：node gen-script <run编号> [--app-info <app_info.yaml>]";
+    let (run, rest) = args.split_first().context(USAGE)?;
+    let run_id: uuid::Uuid = run.parse().context("run 编号必须是 UUID")?;
+    let ui_map = match rest {
+        [] => serde_json::Value::Null,
+        [flag, file] if flag == "--app-info" => {
+            let text = std::fs::read_to_string(file).with_context(|| format!("无法读取应用知识 {file}"))?;
+            let yaml: serde_json::Value = serde_yaml_ng::from_str(&text).context("应用知识不是有效的 YAML")?;
+            yaml.get("ui_map").cloned().unwrap_or(serde_json::Value::Null)
+        }
+        _ => bail!("{USAGE}"),
+    };
+    let token = std::env::var("NODE_TOKEN").unwrap_or_default();
+    if token.is_empty() {
+        bail!("请先设置环境变量 NODE_TOKEN（和服务端一致的节点接入令牌）");
+    }
+    let ws = std::env::var("PLATFORM_WS").unwrap_or_else(|_| "ws://127.0.0.1:8080/ws/node".into());
+    let state_dir = PathBuf::from(std::env::var("NODE_STATE_DIR").unwrap_or_else(|_| "data/node".into()));
+    let node_id = node::load_node_id(&state_dir).context("没有找到本节点的 node_id：节点还没有连过服务端，或 NODE_STATE_DIR 不对")?;
+    node::load_node_secret(&state_dir);
+    let cfg = node::scriptgen_run::GenConfig {
+        platform_http: platform_http(&ws, std::env::var("NODE_ALLOW_INSECURE").is_ok_and(|v| v == "1"))?,
+        node_token: token,
+        node_id,
+        runs_dir: std::env::var("HAFA_RUNS_DIR").unwrap_or_else(|_| "data/runs".into()).into(),
+        claude: agent::claude_cli::ClaudeOpts::default(),
+        ui_map,
+    };
+    match node::scriptgen_run::generate_and_upload(&cfg, run_id).await? {
+        node::scriptgen_run::Outcome::Created { id, version } => {
+            println!("已归档为版本 {version}（脚本 {id}，状态：候选）。候选还要自检通过才能获准，目前还没有自动自检");
+        }
+        node::scriptgen_run::Outcome::Existing { id, version } => {
+            println!("同样内容之前已经归档为版本 {version}（脚本 {id}），没有新增");
+        }
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
         .init();
+
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("gen-script") {
+        return gen_script(&args[1..]).await;
+    }
 
     // 令牌必须显式给出；不写日志
     let token = std::env::var("NODE_TOKEN").unwrap_or_default();
