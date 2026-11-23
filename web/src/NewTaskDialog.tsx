@@ -194,7 +194,7 @@ export default function NewTaskDialog({ onClose, initialCases }: { onClose: () =
               <Select options={judgeRole?.models.map((m) => ({ value: m.model, label: m.model })) ?? []} />
             </Form.Item>
             <Form.Item
-              name="userName" label="我是谁" extra={<span>填你的名字，用来确认所选节点是你的（只能用自己的节点，花自己的额度）。<IdentityHint expiresAt={userNameExpiry()} onForget={() => { forgetUserName(); form.setFieldValue("userName", ""); }} /></span>}
+              name="userName" label="我是谁" extra={<span>填你的名字，用来确认所选节点是你的（只能用自己的节点，花自己的额度）。<IdentityHint expiresAt={userNameExpiry()} onForget={() => { forgetUserName(); form.setFieldValue("userName", ""); }} onCreated={(n) => form.setFieldValue("userName", n)} /></span>}
               rules={[{ required: true, whitespace: true, message: "请填「我是谁」（你的名字）" }]}
             >
               <Input autoComplete="off" maxLength={40} />

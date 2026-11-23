@@ -993,7 +993,7 @@ export default function RolesPage() {
           <div className="roles-control-field">
             <label className="roles-control-label" htmlFor="roles-user-name">
               <span>我是谁</span>
-              <IdentityHint className="roles-control-hint" expiresAt={nameExpiresAt} onForget={forgetName} />
+              <IdentityHint className="roles-control-hint" expiresAt={nameExpiresAt} onForget={forgetName} onCreated={setUserName} />
             </label>
             <Input
               id="roles-user-name"

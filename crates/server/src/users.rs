@@ -106,6 +106,32 @@ pub async fn ensure_user_for_test(pool: &PgPool, name: &str) -> Result<Uuid, sql
     ensure_user(pool, name).await
 }
 
+/// 创建名字的结果。
+pub enum Register {
+    Created,
+    /// 名字已经有人登记（节点启动登记的或别人创建的）
+    Taken,
+}
+
+pub const MIN_PASSWORD_CHARS: usize = 6;
+pub const MAX_PASSWORD_CHARS: usize = 128;
+
+/// 页面上创建名字：名字合格、密码长度合格，名字没被占才登记，密码只存 argon2 哈希。
+pub async fn register_with_password(pool: &PgPool, name: &str, password: &str) -> anyhow::Result<Register> {
+    use argon2::{password_hash::PasswordHasher, Argon2};
+    let password = password.to_string();
+    // argon2 吃 CPU，放到阻塞线程里算，别卡住异步运行时
+    let hash = tokio::task::spawn_blocking(move || Argon2::default().hash_password(password.as_bytes()).map(|h| h.to_string()))
+        .await?
+        .map_err(|e| anyhow::anyhow!("计算密码哈希失败：{e}"))?;
+    let done = sqlx::query("insert into users (name, password_hash) values ($1, $2) on conflict (name) do nothing")
+        .bind(name)
+        .bind(hash)
+        .execute(pool)
+        .await?;
+    Ok(if done.rows_affected() == 1 { Register::Created } else { Register::Taken })
+}
+
 pub async fn list_names(pool: &PgPool) -> Result<Vec<String>, sqlx::Error> {
     sqlx::query_scalar("select name from users order by name").fetch_all(pool).await
 }

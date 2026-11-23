@@ -66,7 +66,7 @@ pub(crate) fn routes(app: AppState, paths: Paths) -> Router {
         .route("/api/modules/{id}/approve-reviewed", post(crate::modules::api_approve_reviewed).route_layer(authorize_write.clone()))
         .route("/api/casegen-requests/{id}/result", put(crate::modules::api_finish).layer(axum::extract::DefaultBodyLimit::max(2 * 1024 * 1024)))
         .route("/api/nodes/{id}/roles", post(set_node_roles).route_layer(authorize_write.clone()).get(node_roles))
-        .route("/api/users", get(list_users))
+        .route("/api/users", get(list_users).post(create_user))
         .route("/api/admin/chat", get(crate::admin::api_chat))
         .route("/api/admin/messages", post(crate::admin::api_send).route_layer(authorize_write.clone()))
         .route("/api/admin/proposals/{id}/confirm", post(crate::admin::api_confirm).route_layer(authorize_write.clone()))
@@ -387,6 +387,30 @@ async fn check_node_role(State(state): State<ApiState>, Path((id, role)): Path<(
 async fn list_users(State(state): State<ApiState>) -> Result<impl IntoResponse, ApiError> {
     let names = crate::users::list_names(state.app.pool()).await.map_err(|e| internal("查询用户失败", e))?;
     Ok(([(header::CACHE_CONTROL, "no-store")], Json(names)))
+}
+
+#[derive(Deserialize)]
+struct NewUser {
+    name: String,
+    password: String,
+}
+
+/// 页面上创建名字：输入名字和密码，名字没被占就登记成功。密码只存哈希，不回显、不进日志。
+async fn create_user(State(state): State<ApiState>, Json(body): Json<NewUser>) -> Result<impl IntoResponse, ApiError> {
+    let Some(name) = crate::users::clean_name(&body.name) else {
+        return Err((StatusCode::BAD_REQUEST, "名字要 1 到 40 个字，不能有换行等控制字符".to_string()));
+    };
+    let chars = body.password.chars().count();
+    if !(crate::users::MIN_PASSWORD_CHARS..=crate::users::MAX_PASSWORD_CHARS).contains(&chars) {
+        return Err((StatusCode::BAD_REQUEST, format!("密码要 {} 到 {} 个字符", crate::users::MIN_PASSWORD_CHARS, crate::users::MAX_PASSWORD_CHARS)));
+    }
+    match crate::users::register_with_password(state.app.pool(), &name, &body.password).await.map_err(|e| {
+        tracing::error!("创建名字失败：{e}");
+        (StatusCode::INTERNAL_SERVER_ERROR, "创建名字失败".to_string())
+    })? {
+        crate::users::Register::Created => Ok((StatusCode::CREATED, Json(serde_json::json!({ "name": name })))),
+        crate::users::Register::Taken => Err((StatusCode::CONFLICT, format!("「{name}」已经有人用了，换一个名字"))),
+    }
 }
 
 // ---------------------------------------------------------------- 本机应用环境检查（选应用 → 检查本机 → 取模型）

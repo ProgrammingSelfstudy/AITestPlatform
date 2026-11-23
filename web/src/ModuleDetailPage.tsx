@@ -808,7 +808,7 @@ export default function ModuleDetailPage({ id }: { id: string }) {
         />
       </div>
       <div className="mod-token-note">
-        <IdentityHint expiresAt={nameExpiresAt} onForget={forgetName} />{" "}
+        <IdentityHint expiresAt={nameExpiresAt} onForget={forgetName} onCreated={setUserName} />{" "}
         数据大家都能看；批准或拒绝用例只有发起这个模块生成请求的人能做。
       </div>
     </div>

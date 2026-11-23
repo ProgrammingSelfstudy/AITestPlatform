@@ -888,7 +888,7 @@ export default function GenerateDialog({ onClose, initialModule }: { onClose: ()
           <div className="mod-field">
             <div className="mod-field-head">
               <RequiredLabel text="我是谁" />
-              <IdentityHint className="mod-field-meta" expiresAt={nameExpiresAt} onForget={forgetName} />
+              <IdentityHint className="mod-field-meta" expiresAt={nameExpiresAt} onForget={forgetName} onCreated={setUserName} />
             </div>
             <Input
               aria-label="我是谁"

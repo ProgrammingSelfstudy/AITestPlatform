@@ -2193,3 +2193,28 @@ fn 局域网模式下origin同样只认私有网段ip() {
     assert!(!allowed_origin("ftp://192.168.1.5", true));
 }
 
+
+#[tokio::test]
+async fn 页面创建名字_要密码_重名拒绝_库里只存哈希() {
+    let temp = TempPaths::with_config();
+    let state = test_state(config()).await;
+    let app = temp.app(state.clone());
+    let create = |name: &str, password: &str| json!({"name": name, "password": password}).to_string();
+
+    // 创建不需要复核口令
+    let (status, _, _) = request(&app, Method::POST, "/api/users", &WRITE_HEADERS, create("小明", "secret-123")).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let stored: String = sqlx::query_scalar("select password_hash from users where name = '小明'").fetch_one(state.pool()).await.unwrap();
+    assert!(stored.starts_with("$argon2") && !stored.contains("secret-123"));
+
+    // 重名 409；名字或密码不合格 400；GET 能列出名字
+    let (status, _, _) = request(&app, Method::POST, "/api/users", &WRITE_HEADERS, create("小明", "another-123")).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    for (n, p) in [("", "secret-123"), ("带\n换行", "secret-123"), ("小红", "123")] {
+        let (status, _, _) = request(&app, Method::POST, "/api/users", &WRITE_HEADERS, create(n, p)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{n:?}/{p:?}");
+    }
+    let (status, _, body) = request(&app, Method::GET, "/api/users", &[], "").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(String::from_utf8_lossy(&body).contains("小明"));
+}

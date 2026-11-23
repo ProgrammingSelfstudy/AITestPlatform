@@ -11,6 +11,7 @@ test-support = []
 [dependencies]
 aes-gcm = "0.11.1"
 anyhow = "1.0.104"
+argon2 = "0.6.0"
 axum = { version = "0.8.9", features = ["ws"] }
 base64 = "0.22.1"
 chrono = "0.4.45"
