@@ -1,0 +1,1 @@
+{"steps": [{"idx": 1, "action": "tap", "target": "More", "after_labels": ["ZEBRA-4821", "Music"], "new_labels": ["ZEBRA-4821"]}, {"idx": 2, "action": "tap", "target": "Music", "after_labels": ["Add Music"], "new_labels": ["Add Music"]}]}

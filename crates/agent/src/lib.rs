@@ -5,6 +5,7 @@
 //! 共同约束：启动子进程前必须剔除会绕过会员登录的环境变量；额度用完要暂停并如实上报，
 //! 不自动换计费方式；卡住要能被检测并杀掉，不依赖模型自觉。
 
+pub mod agy_cli;
 pub mod claude_cli;
 pub mod codex_exec;
 pub mod judge;
