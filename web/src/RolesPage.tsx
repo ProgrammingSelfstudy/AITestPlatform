@@ -15,6 +15,7 @@ import {
   type RoleView,
 } from "./api";
 import { readReviewToken, rememberReviewToken, writeTokenAction } from "./reviewLogic";
+import AppsPanel from "./AppsPanel";
 import ReviewTokenDialog from "./ReviewTokenDialog";
 import { formatDate, LoadError } from "./runUi";
 import { REFRESH_MS, usePolling } from "./usePolling";
@@ -777,6 +778,15 @@ export default function RolesPage() {
     await executeWrite({ kind: "save", payload, createdId });
   }
 
+  /** 从「选应用」面板创建角色：和节点上现有的角色一起整体提交（走审核口令流程），新角色是第一个选中的 */
+  function handleCreateFromApp(created: RoleInput[]) {
+    if (busy || created.length === 0) return;
+    setActionError(null);
+    setActionNotice(null);
+    const payload: RoleInput[] = [...serverRoles.map(toRoleInput), ...created];
+    void executeWrite({ kind: "save", payload, createdId: created[0].id });
+  }
+
   function handleCheckCurrent() {
     if (!activeServerRole || isEditingNewDraft || isNodeOffline || busy) return;
     setActionError(null);
@@ -1064,6 +1074,16 @@ export default function RolesPage() {
         </section>
       ) : rolesError && !loadedForNode ? null : (
         /* 主体左右两栏：左 28% 角色实体卡 / 右 72% 管线 + 统计 + 编辑 + 检测日志 */
+        <>
+        {/* 选应用 → 检查本机环境 → 选模型创建角色：创建的角色和现有角色一起整体提交 */}
+        <AppsPanel
+          nodeId={selectedNodeId}
+          userToken={trimmedToken}
+          online={!isNodeOffline}
+          existingRoles={serverRoles}
+          busy={busy}
+          onCreateRoles={handleCreateFromApp}
+        />
         <div className="roles-workspace">
           {/* 左栏：角色实体卡列表 */}
           <aside className="roles-sidebar" aria-label="角色列表">
@@ -1684,6 +1704,7 @@ export default function RolesPage() {
             </section>
           </main>
         </div>
+        </>
       )}
 
       {/* 删除角色二次确认弹窗 */}

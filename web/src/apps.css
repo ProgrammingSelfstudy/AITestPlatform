@@ -1,0 +1,424 @@
+/* 「选应用 → 检查本机环境 → 选模型创建角色」面板：复用 theme.css 变量，浅色深色都靠变量切换 */
+
+.apps-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  padding: 20px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-lg);
+  background: var(--bg-surface);
+  box-shadow: var(--shadow-sm);
+}
+
+.apps-head,
+.apps-detail-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+
+.apps-kicker {
+  display: inline-block;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  color: var(--text-muted);
+}
+
+.apps-title,
+.apps-detail-title {
+  margin: 2px 0 0;
+  font-size: 18px;
+  font-weight: 700;
+  color: var(--text-primary);
+}
+
+.apps-detail-title {
+  font-size: 16px;
+}
+
+.apps-sub {
+  margin: 4px 0 0;
+  font-size: 13px;
+  color: var(--text-secondary);
+  line-height: 1.6;
+}
+
+.apps-count {
+  font-size: 13px;
+  color: var(--text-secondary);
+  padding: 4px 10px;
+  border-radius: 999px;
+  background: var(--bg-subtle);
+  border: 1px solid var(--border-hairline);
+}
+
+.apps-banner {
+  padding: 10px 14px;
+  border-radius: var(--radius-sm);
+  font-size: 13px;
+  line-height: 1.6;
+  border: 1px solid var(--border-strong);
+  color: var(--text-primary);
+  background: var(--bg-subtle);
+}
+
+.apps-banner.is-warn {
+  color: var(--st-unc-fg);
+  background: var(--st-unc-bg);
+  border-color: var(--st-unc-fg);
+}
+
+.apps-banner.is-bad {
+  color: var(--st-fail-fg);
+  background: var(--st-fail-bg);
+  border-color: var(--st-fail-fg);
+}
+
+/* 四张应用卡片：贴纸感——错位的硬阴影、轻微倾斜，选中时抬起 */
+.apps-cards {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 18px;
+  padding: 6px 4px 10px;
+}
+
+.apps-card {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  padding: 18px 12px 16px;
+  font: inherit;
+  text-align: center;
+  color: var(--text-primary);
+  background: var(--bg-surface);
+  border: 2px solid var(--border-strong);
+  border-radius: 20px;
+  box-shadow: 5px 5px 0 var(--border-hairline);
+  cursor: pointer;
+  transform: rotate(-0.8deg);
+  transition: transform 0.16s ease, box-shadow 0.16s ease, border-color 0.16s ease;
+}
+
+.apps-card:nth-child(even) {
+  transform: rotate(0.8deg);
+}
+
+.apps-card:hover:not(.is-disabled),
+.apps-card:focus-visible {
+  transform: translateY(-3px) rotate(0deg);
+  box-shadow: 7px 8px 0 var(--border-hairline);
+  outline: none;
+}
+
+.apps-card:focus-visible {
+  border-color: var(--accent);
+}
+
+.apps-card.is-selected {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  transform: translateY(-4px) rotate(0deg);
+  box-shadow: 7px 8px 0 var(--accent-soft), 0 0 0 3px var(--accent-soft);
+}
+
+.apps-card.is-disabled {
+  cursor: not-allowed;
+  opacity: 0.72;
+}
+
+.apps-card-art {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  /* 图标用 currentColor 画描边，墨水色跟随主题文字色 */
+  color: var(--text-primary);
+}
+
+.apps-card-name {
+  font-size: 18px;
+  font-weight: 700;
+}
+
+.apps-card-tag {
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.apps-card-note {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.apps-chip {
+  margin-top: 4px;
+  padding: 2px 10px;
+  font-size: 12px;
+  font-weight: 600;
+  border-radius: 999px;
+  border: 1px solid transparent;
+}
+
+.apps-chip.is-ok {
+  color: var(--st-pass-fg);
+  background: var(--st-pass-bg);
+  border-color: var(--st-pass-fg);
+}
+
+.apps-chip.is-warn {
+  color: var(--st-unc-fg);
+  background: var(--st-unc-bg);
+  border-color: var(--st-unc-fg);
+}
+
+.apps-chip.is-bad {
+  color: var(--st-fail-fg);
+  background: var(--st-fail-bg);
+  border-color: var(--st-fail-fg);
+}
+
+.apps-chip.is-muted {
+  color: var(--text-secondary);
+  background: var(--bg-subtle);
+  border-color: var(--border-strong);
+}
+
+/* 详情区 */
+.apps-detail {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 16px;
+  border: 1px dashed var(--border-strong);
+  border-radius: var(--radius-md);
+  background: var(--bg-canvas);
+}
+
+.apps-scanning {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 13px;
+  color: var(--text-secondary);
+}
+
+.apps-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--accent);
+  animation: apps-pulse 1.2s ease-in-out infinite;
+}
+
+@keyframes apps-pulse {
+  0%, 100% { opacity: 0.35; transform: scale(0.85); }
+  50% { opacity: 1; transform: scale(1.1); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .apps-dot { animation: none; }
+  .apps-card { transition: none; }
+}
+
+.apps-checklist {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.apps-check {
+  display: flex;
+  gap: 10px;
+  padding: 10px 12px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-hairline);
+  background: var(--bg-surface);
+}
+
+.apps-check-mark {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  font-weight: 700;
+  font-size: 13px;
+}
+
+.apps-check.is-pass .apps-check-mark {
+  color: var(--st-pass-fg);
+  background: var(--st-pass-bg);
+}
+
+.apps-check.is-fail .apps-check-mark {
+  color: var(--st-fail-fg);
+  background: var(--st-fail-bg);
+}
+
+.apps-check-body {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  font-size: 13px;
+  color: var(--text-primary);
+}
+
+.apps-check.is-pass .apps-check-verdict { color: var(--st-pass-fg); }
+.apps-check.is-fail .apps-check-verdict { color: var(--st-fail-fg); }
+
+.apps-check-detail {
+  color: var(--text-secondary);
+  line-height: 1.55;
+  overflow-wrap: anywhere;
+}
+
+/* 第 3 步：模型表和创建角色表单 */
+.apps-create {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding-top: 6px;
+}
+
+.apps-bulk {
+  display: flex;
+  gap: 8px;
+}
+
+.apps-models {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  max-height: 320px;
+  overflow: auto;
+  border: 1px solid var(--border-hairline);
+  border-radius: var(--radius-sm);
+  background: var(--bg-surface);
+}
+
+.apps-model {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding: 9px 12px;
+  border-bottom: 1px solid var(--border-hairline);
+}
+
+.apps-model:last-child {
+  border-bottom: none;
+}
+
+.apps-model.is-on {
+  background: var(--accent-soft);
+}
+
+.apps-model-name {
+  margin-right: 8px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.apps-model-id {
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.apps-model-efforts {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.apps-tag {
+  padding: 1px 8px;
+  font-size: 12px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: var(--text-secondary);
+  background: var(--bg-subtle);
+  border: 1px solid var(--border-hairline);
+  border-radius: 6px;
+}
+
+.apps-muted {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.apps-manual {
+  display: flex;
+  gap: 8px;
+}
+
+.apps-form {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+}
+
+.apps-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+
+.apps-field-wide {
+  grid-column: 1 / -1;
+}
+
+.apps-label {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.apps-hint {
+  font-size: 12px;
+  color: var(--text-secondary);
+  line-height: 1.55;
+}
+
+.apps-errors {
+  margin: 0;
+  padding: 10px 14px 10px 28px;
+  font-size: 13px;
+  color: var(--st-fail-fg);
+  background: var(--st-fail-bg);
+  border: 1px solid var(--st-fail-fg);
+  border-radius: var(--radius-sm);
+}
+
+.apps-actions {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  flex-wrap: wrap;
+}
+
+@media (max-width: 1100px) {
+  .apps-cards { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+
+@media (max-width: 900px) {
+  .apps-panel { padding: 14px; }
+  .apps-form { grid-template-columns: 1fr; }
+}
+
+@media (max-width: 560px) {
+  .apps-cards { grid-template-columns: 1fr; }
+}

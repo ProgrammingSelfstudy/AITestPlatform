@@ -487,3 +487,51 @@ export async function approveReviewed(moduleId: string, token: string, userToken
   const response = await post(`/api/modules/${encodeURIComponent(moduleId)}/approve-reviewed`, {}, token, userHeaders(userToken));
   return ((await response.json()) as { approved: number }).approved;
 }
+
+// ---------------------------------------------------------------- 选应用 → 检查本机环境 → 取模型
+
+export type AppLogin = "ok" | "not_logged_in" | "wrong_auth" | "not_applicable";
+
+/** 应用里的一个模型。efforts 为空表示没有单独的推理强度档位（强度已写进模型名，如 agy）。 */
+export interface AppModel {
+  id: string;
+  display: string;
+  efforts: string[];
+  default_effort: string | null;
+}
+
+/** 四个应用各一项。scanned=false 表示还没检查过，其余字段不存在。 */
+export interface AppView {
+  /** claude_cli / codex_exec / agy / deepseek */
+  source: string;
+  scanned: boolean;
+  installed?: boolean;
+  version?: string | null;
+  login?: AppLogin;
+  /** 登录检查的说明（不含账号信息），原样显示 */
+  login_detail?: string;
+  models?: AppModel[];
+  /** 模型列表的来源说明（例如 Claude 命令行不能列模型，这里是别名建议、可手填），原样显示 */
+  models_note?: string;
+  scanned_at?: string;
+}
+
+export interface NodeApps {
+  /** 节点离线时拿不到检查结果 */
+  online: boolean;
+  apps: AppView[];
+}
+
+export async function fetchNodeApps(nodeId: string, userToken: string, signal?: AbortSignal): Promise<NodeApps> {
+  const response = await request(`/api/nodes/${encodeURIComponent(nodeId)}/apps`, { signal, headers: userHeaders(userToken) });
+  try {
+    return (await response.json()) as NodeApps;
+  } catch {
+    throw new Error("服务端返回的数据格式无效");
+  }
+}
+
+/** 让节点检查本机有没有这个应用、怎么登录的、有哪些模型。只跑本地命令，不调模型、不花额度，不需要审核口令。结果靠 fetchNodeApps 轮询得到。 */
+export async function scanNodeApp(nodeId: string, source: string, userToken: string): Promise<void> {
+  await post(`/api/nodes/${encodeURIComponent(nodeId)}/apps/${encodeURIComponent(source)}/scan`, {}, "", userHeaders(userToken));
+}
