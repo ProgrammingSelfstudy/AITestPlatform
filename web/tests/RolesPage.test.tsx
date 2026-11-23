@@ -95,3 +95,25 @@ test("节点还没有角色时可以用模板初始化，请求不带 Key", asyn
   expect(String(init?.body)).not.toContain("api_key");
   expect((init?.headers as Record<string, string>)["x-user-token"]).toBe(USER_TOKEN);
 });
+
+test("个人令牌填完整后记在浏览器里：刷新（重新进入页面）后不用再填，也能忘记", { timeout: 30000 }, async () => {
+  const FULL = `u_${"a1B2".repeat(16)}`;
+  serve([role("a", "executor", "codex_exec", "ok", null)]);
+  const user = userEvent.setup();
+  const first = render(<RolesPage />);
+  await user.type(await screen.findByPlaceholderText(/个人令牌/), FULL);
+  await screen.findAllByText("角色-a");
+  expect(screen.getByText(/已记住，到期/)).toBeInTheDocument();
+  expect(document.body.textContent).not.toContain(FULL);
+  // 重新进入页面：令牌还在，直接读到角色，不用再填
+  first.unmount();
+  fetchMock.mockClear();
+  render(<RolesPage />);
+  expect((await screen.findAllByText("角色-a")).length).toBeGreaterThan(0);
+  expect(fetchMock.mock.calls.some(([input, init]) => String(input).includes("/roles") && (init?.headers as Record<string, string>)["x-user-token"] === FULL)).toBe(true);
+  // 忘记令牌：清空，回到「请输入个人令牌」
+  await user.click(screen.getByRole("button", { name: "忘记令牌" }));
+  expect((await screen.findAllByText(/请输入个人令牌/)).length).toBeGreaterThan(0);
+  expect(screen.queryByText("角色-a")).not.toBeInTheDocument();
+  expect(window.localStorage.getItem("platform.userToken.v1")).toBeNull();
+});

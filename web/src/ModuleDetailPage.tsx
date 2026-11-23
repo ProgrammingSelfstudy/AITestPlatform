@@ -16,6 +16,8 @@ import { readReviewToken, rememberReviewToken, writeTokenAction } from "./review
 import ReviewTokenDialog from "./ReviewTokenDialog";
 import { formatDate, formatTime, LoadError } from "./runUi";
 import { REFRESH_MS, usePolling } from "./usePolling";
+import UserTokenHint from "./UserTokenHint";
+import { useRememberedUserToken } from "./userToken";
 import "./modules.css";
 
 const project = "hafa";
@@ -451,8 +453,8 @@ interface DecisionModalState {
 }
 
 export default function ModuleDetailPage({ id }: { id: string }) {
-  // 个人令牌仅存内存，不回显
-  const [userToken, setUserToken] = useState("");
+  // 个人令牌填完整后在本浏览器记 30 天，不回显
+  const { token: userToken, setToken: setUserToken, expiresAt: tokenExpiresAt, forget: forgetToken } = useRememberedUserToken();
   const trimmedToken = userToken.trim();
 
   // 轮询模块列表（找到当前 id），防闪烁缓存
@@ -806,7 +808,8 @@ export default function ModuleDetailPage({ id }: { id: string }) {
         />
       </div>
       <div className="mod-token-note">
-        仅保存在当前页面内存中，不会写入本地存储、不回显。批准或拒绝用例时提交给服务端校验；只有发起该模块生成请求的人能操作。
+        <UserTokenHint expiresAt={tokenExpiresAt} onForget={forgetToken} onToken={setUserToken} />{" "}
+        批准或拒绝用例时提交给服务端校验；只有发起该模块生成请求的人能操作。
       </div>
     </div>
   );

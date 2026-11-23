@@ -4,6 +4,8 @@ import { createTask, fetchCases, fetchModels, fetchNodes, type ModelRole, type M
 import { readReviewToken, rememberReviewToken, writeTokenAction } from "./reviewLogic";
 import ReviewTokenDialog from "./ReviewTokenDialog";
 import { LoadError } from "./runUi";
+import UserTokenHint from "./UserTokenHint";
+import { forgetUserToken, readUserToken, rememberUserToken, userTokenExpiry } from "./userToken";
 import { REFRESH_MS, usePolling } from "./usePolling";
 
 const project = "hafa";
@@ -114,6 +116,7 @@ export default function NewTaskDialog({ onClose, initialCases }: { onClose: () =
         executor: { role: fields.executorRole, model: fields.executor, ...(fields.effort ? { effort: fields.effort } : {}) },
         judge: { role: fields.judgeRole, model: fields.judge },
       }, token, fields.userToken.trim());
+      rememberUserToken(fields.userToken);
       window.location.hash = `/tasks/${task.task_id}`;
       onClose();
     } catch (err) {
@@ -132,7 +135,7 @@ export default function NewTaskDialog({ onClose, initialCases }: { onClose: () =
       cancelButtonProps={{ disabled: busy }}
       okButtonProps={{ disabled: busy || !data || !hasOnlineNodes || nodeUnavailable }}
     >
-      <Form form={form} layout="vertical" disabled={busy} onFinish={(fields) => submit(fields)} className="new-task-form">
+      <Form form={form} layout="vertical" disabled={busy} onFinish={(fields) => submit(fields)} className="new-task-form" initialValues={{ userToken: readUserToken() }}>
         <Alert
           type="info" title="执行规则" showIcon
           description="任务只能在发起人自己的节点上、用自己的模型来源执行；额度用完会暂停并通知，不会自动换计费方式。"
@@ -191,7 +194,7 @@ export default function NewTaskDialog({ onClose, initialCases }: { onClose: () =
               <Select options={judgeRole?.models.map((m) => ({ value: m.model, label: m.model })) ?? []} />
             </Form.Item>
             <Form.Item
-              name="userToken" label="个人令牌" extra="用来确认所选节点属于你。只在本次请求中使用，不会保存。"
+              name="userToken" label="个人令牌" extra={<span>用来确认所选节点属于你。<UserTokenHint expiresAt={userTokenExpiry()} onForget={() => { forgetUserToken(); form.setFieldValue("userToken", ""); }} onToken={(token) => { rememberUserToken(token); form.setFieldValue("userToken", token); }} /></span>}
               rules={[{ required: true, whitespace: true, message: "请输入个人令牌" }]}
             >
               <Input.Password autoComplete="off" />

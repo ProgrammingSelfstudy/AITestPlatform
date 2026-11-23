@@ -535,3 +535,11 @@ export async function fetchNodeApps(nodeId: string, userToken: string, signal?: 
 export async function scanNodeApp(nodeId: string, source: string, userToken: string): Promise<void> {
   await post(`/api/nodes/${encodeURIComponent(nodeId)}/apps/${encodeURIComponent(source)}/scan`, {}, "", userHeaders(userToken));
 }
+
+// ---------------------------------------------------------------- 创建个人令牌
+
+/** 页面上创建个人令牌。令牌只在这次返回里出现一次，库里只存摘要；要审核口令。名字重复会返回 409。 */
+export async function createUser(name: string, token: string): Promise<{ name: string; token: string }> {
+  const response = await post("/api/users", { name }, token);
+  return response.json();
+}

@@ -16,6 +16,8 @@ import {
 } from "./api";
 import { readReviewToken, rememberReviewToken, writeTokenAction } from "./reviewLogic";
 import AppsPanel from "./AppsPanel";
+import UserTokenHint from "./UserTokenHint";
+import { useRememberedUserToken } from "./userToken";
 import ReviewTokenDialog from "./ReviewTokenDialog";
 import { formatDate, LoadError } from "./runUi";
 import { REFRESH_MS, usePolling } from "./usePolling";
@@ -267,9 +269,9 @@ function pipeAvailClass(status: CheckStatus): string {
 export default function RolesPage() {
   const [form] = Form.useForm<RoleFormValues>();
 
-  // 节点与个人令牌（个人令牌仅存内存，永不写入 localStorage，永不回显）
+  // 节点与个人令牌（令牌填完整后在本浏览器记 30 天，永不回显；API Key 仍不落本地存储）
   const [selectedNodeId, setSelectedNodeId] = useState<string>("");
-  const [userToken, setUserToken] = useState<string>("");
+  const { token: userToken, setToken: setUserToken, expiresAt: tokenExpiresAt, forget: forgetToken } = useRememberedUserToken();
   const trimmedToken = userToken.trim();
 
   // 节点列表轮询：数据未变时复用旧引用，避免无意义重渲染
@@ -900,7 +902,7 @@ export default function RolesPage() {
                 )}
               </div>
               <div className="roles-hero-subnote">
-                仅能读取与修改你自己的在线节点；个人令牌与 API Key 均不回显、不落本地存储。
+                仅能读取与修改你自己的在线节点；个人令牌和 API Key 都不回显，API Key 不落本地存储，个人令牌填一次会在本浏览器记 30 天。
               </div>
             </div>
           </div>
@@ -978,7 +980,7 @@ export default function RolesPage() {
           <div className="roles-control-field">
             <label className="roles-control-label" htmlFor="roles-user-token">
               <span>个人令牌</span>
-              <span className="roles-control-hint">仅存当前内存，刷新页面即清空</span>
+              <UserTokenHint className="roles-control-hint" expiresAt={tokenExpiresAt} onForget={forgetToken} onToken={setUserToken} />
             </label>
             <Input.Password
               id="roles-user-token"
@@ -1073,7 +1075,7 @@ export default function RolesPage() {
         <section className="roles-gate-card" aria-label="等待输入个人令牌">
           <h2 className="roles-gate-title">请输入个人令牌以读取角色配置</h2>
           <p className="roles-gate-desc">
-            个人令牌用来向服务端验证所选节点归属于你；未填令牌前不会发起角色请求，令牌仅保存在组件内存中。
+            个人令牌用来向服务端验证所选节点归属于你；未填令牌前不会发起角色请求。填完整后会在本浏览器记住 30 天，随时可以点「忘记令牌」。
           </p>
         </section>
       ) : isNodeOffline ? (

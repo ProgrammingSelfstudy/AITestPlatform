@@ -18,6 +18,8 @@ import { readReviewToken, rememberReviewToken, writeTokenAction } from "./review
 import ReviewTokenDialog from "./ReviewTokenDialog";
 import { LoadError } from "./runUi";
 import { REFRESH_MS, usePolling } from "./usePolling";
+import UserTokenHint from "./UserTokenHint";
+import { useRememberedUserToken } from "./userToken";
 import "./modules.css";
 
 const project = "hafa";
@@ -174,7 +176,7 @@ export default function GenerateDialog({ onClose }: { onClose: () => void }) {
   const [dragOver, setDragOver] = useState(false);
 
   const [nodeId, setNodeId] = useState("");
-  const [userToken, setUserToken] = useState("");
+  const { token: userToken, setToken: setUserToken, expiresAt: tokenExpiresAt, forget: forgetToken } = useRememberedUserToken();
   const trimmedToken = userToken.trim();
 
   // 节点角色拉取（节点 + 令牌都填完后拉一次，也支持手动刷新）
@@ -885,7 +887,7 @@ export default function GenerateDialog({ onClose }: { onClose: () => void }) {
           <div className="mod-field">
             <div className="mod-field-head">
               <RequiredLabel text="个人令牌" />
-              <span className="mod-field-meta">仅存内存，不落本地存储</span>
+              <UserTokenHint className="mod-field-meta" expiresAt={tokenExpiresAt} onForget={forgetToken} onToken={setUserToken} />
             </div>
             <Input.Password
               aria-label="个人令牌"

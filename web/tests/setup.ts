@@ -3,7 +3,11 @@ import { cleanup } from "@testing-library/react";
 import { afterEach } from "vitest";
 
 // 每个测试后卸载渲染出来的组件，免得上一个测试的页面留在 document 里串到下一个
-afterEach(() => cleanup());
+afterEach(() => {
+  cleanup();
+  // 个人令牌会记在 localStorage 里，不清掉的话上一个测试填的令牌会带进下一个测试
+  window.localStorage.clear();
+});
 
 // antd 用到 matchMedia 和 ResizeObserver，jsdom 没有；给最小的空实现
 if (!window.matchMedia) {

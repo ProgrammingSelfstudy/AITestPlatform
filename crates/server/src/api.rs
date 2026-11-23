@@ -66,6 +66,7 @@ pub(crate) fn routes(app: AppState, paths: Paths) -> Router {
         .route("/api/modules/{id}/approve-reviewed", post(crate::modules::api_approve_reviewed).route_layer(authorize_write.clone()))
         .route("/api/casegen-requests/{id}/result", put(crate::modules::api_finish).layer(axum::extract::DefaultBodyLimit::max(2 * 1024 * 1024)))
         .route("/api/nodes/{id}/roles", post(set_node_roles).route_layer(authorize_write.clone()).get(node_roles))
+        .route("/api/users", post(create_user).route_layer(authorize_write.clone()))
         .route("/api/nodes/{id}/apps", get(node_apps))
         .route("/api/nodes/{id}/apps/{source}/scan", post(scan_node_app))
         .route("/api/nodes/{id}/roles/init-template", post(init_node_roles).route_layer(authorize_write.clone()))
@@ -346,6 +347,33 @@ async fn check_node_role(State(state): State<ApiState>, Path((id, role)): Path<(
         return Err((StatusCode::CONFLICT, "节点离线，无法检测".to_string()));
     }
     Ok(StatusCode::ACCEPTED)
+}
+
+// ---------------------------------------------------------------- 创建个人令牌
+
+#[derive(Deserialize)]
+struct NewUser {
+    name: String,
+}
+
+/// 页面上创建个人令牌：令牌只在这次响应里出现一次，库里只存摘要（和命令行 `server create-user` 同一套）。
+/// 要审核口令：否则局域网里谁都能无限造身份。名字不能重复（它是人看的标识，不是认证）。
+async fn create_user(State(state): State<ApiState>, body: Result<Json<NewUser>, JsonRejection>) -> Result<impl IntoResponse, ApiError> {
+    let Json(body) = body.map_err(|_| bad_request("请求格式无效，请填写名字"))?;
+    let name = body.name.trim();
+    let count = name.chars().count();
+    if count == 0 || count > 40 || name.chars().any(char::is_control) {
+        return Err(bad_request("名字不能为空、不超过 40 个字，也不能有控制字符"));
+    }
+    match crate::users::create_user(state.app.pool(), name).await {
+        Ok(token) => Ok((
+            StatusCode::CREATED,
+            [(header::CACHE_CONTROL, "no-store")],
+            Json(serde_json::json!({ "name": name, "token": token })),
+        )),
+        Err(sqlx::Error::Database(e)) if e.is_unique_violation() => Err((StatusCode::CONFLICT, "这个名字已经有人用了，换一个".to_string())),
+        Err(e) => Err(internal("创建个人令牌失败", e)),
+    }
 }
 
 // ---------------------------------------------------------------- 本机应用环境检查（选应用 → 检查本机 → 取模型）

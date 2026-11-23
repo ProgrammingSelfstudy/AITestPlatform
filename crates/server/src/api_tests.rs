@@ -929,6 +929,40 @@ async fn 应用环境检查接口_需要令牌_只能查自己的节点_离线�
     assert_eq!(scan("agy", "u_apps-other").await, StatusCode::FORBIDDEN);
 }
 
+#[tokio::test]
+async fn 页面创建个人令牌_要审核口令_令牌只显示一次_库里只存摘要() {
+    let world = World::new().await;
+    let create = |name: &str, with_review: bool| {
+        let mut h = if with_review { review_headers(REVIEW_TOKEN) } else { WRITE_HEADERS.to_vec() };
+        h.push(("x-user-token", USER_TOKEN));
+        let (app, body) = (world.app.clone(), json!({"name": name}).to_string());
+        async move { request(&app, Method::POST, "/api/users", &h, body).await }
+    };
+    // 没审核口令：不能造身份
+    assert_eq!(create("小明", false).await.0, StatusCode::FORBIDDEN);
+    // 名字不合法：400
+    for bad in ["", "   ", &"长".repeat(41), "带\n换行"] {
+        assert_eq!(create(bad, true).await.0, StatusCode::BAD_REQUEST, "{bad:?}");
+    }
+    // 成功：201，令牌只在这次响应里；不缓存
+    let (status, headers, bytes) = create("小明", true).await;
+    assert_eq!(status, StatusCode::CREATED, "{}", text(&bytes));
+    assert_eq!(headers[header::CACHE_CONTROL], "no-store");
+    let created = json_body(&bytes);
+    let token = created["token"].as_str().unwrap().to_string();
+    assert!(token.starts_with("u_") && token.len() > 40, "令牌长度要够：{}", token.len());
+    assert_eq!(created["name"], "小明");
+    // 令牌有效（能找到用户），库里没有明文
+    assert!(crate::users::user_by_token(world.state.pool(), &token).await.unwrap().is_some());
+    let plain: i64 = sqlx::query_scalar("select count(*) from users where token_hash = $1 or name = $1").bind(&token).fetch_one(world.state.pool()).await.unwrap();
+    assert_eq!(plain, 0, "库里只能有摘要，不能有明文令牌");
+    // 同名：409，不会覆盖已有令牌
+    let (status, _, bytes) = create("小明", true).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(text(&bytes).contains("已经有人用了"));
+    assert!(crate::users::user_by_token(world.state.pool(), &token).await.unwrap().is_some(), "同名创建失败不能让原来的令牌失效");
+}
+
 struct World {
     temp: TempPaths,
     app: Router,
