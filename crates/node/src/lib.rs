@@ -4,6 +4,7 @@
 //! 节点令牌从环境变量读取。测试账号凭证只走单独的本机 HTTP 接口，不经过 WebSocket。
 
 pub mod real;
+pub mod roles;
 mod recorder;
 pub mod runner;
 pub mod scriptgen_run;
@@ -17,7 +18,7 @@ mod uploader;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use device::{Android, Info};
@@ -174,6 +175,9 @@ pub fn detect_caps(node_version: &str) -> Caps {
     if on_path("codex") {
         model_sources.push(ModelSourceCap { source: ModelSource::CodexExec, vision: true });
     }
+    if on_path("agy") {
+        model_sources.push(ModelSourceCap { source: ModelSource::Agy, vision: true });
+    }
     Caps { node_version: node_version.into(), os: std::env::consts::OS.into(), model_sources }
 }
 
@@ -287,7 +291,7 @@ impl Outbox {
     }
 }
 
-async fn session<D: Devices, E: RunExecutor>(cfg: &NodeConfig, devices: &D, runner: &Runner<E>, outbox: &mut Outbox, node_id: &mut Option<Uuid>) -> SessionEnd {
+async fn session<D: Devices, E: RunExecutor>(cfg: &NodeConfig, devices: &D, runner: &Runner<E>, outbox: &mut Outbox, node_id: &mut Option<Uuid>, roles: &Arc<roles::RoleStore>, role_tx: &mpsc::UnboundedSender<NodeMsg>) -> SessionEnd {
     let lost = |connected: bool, reason: String| SessionEnd::Lost { connected, reason };
 
     let mut ws = match connect_async(cfg.url.as_str()).await {
@@ -373,6 +377,11 @@ async fn session<D: Devices, E: RunExecutor>(cfg: &NodeConfig, devices: &D, runn
         }
     }
 
+    // 连上后先报一次角色摘要（只有摘要，没有 Key）；节点本机还没有角色时上报空列表，服务端据此下发初始模板
+    if let Err(e) = ws.send(envelope_text(&Envelope::new(NodeMsg::RolesReport(roles.report())))).await {
+        return lost(true, format!("上报角色摘要失败：{e}"));
+    }
+
     let period = Duration::from_secs(u64::from(heartbeat_s));
     let mut last_receipt = tokio::time::Instant::now();
     let mut tick = tokio::time::interval_at(last_receipt + period, period);
@@ -454,6 +463,30 @@ async fn session<D: Devices, E: RunExecutor>(cfg: &NodeConfig, devices: &D, runn
                             }
                             tracing::warn!(code = e.code, "服务端报错：{}", e.message);
                         }
+                        ServerMsg::SetRoles(set) => {
+                            // 日志只记个数；RoleSet 的 Debug 已隐藏 Key
+                            match roles.set(set.roles) {
+                                Ok(()) => tracing::info!("已更新本机角色配置"),
+                                Err(e) => tracing::warn!("保存角色配置失败：{e}"),
+                            }
+                            if let Err(e) = ws.send(envelope_text(&Envelope::new(NodeMsg::RolesReport(roles.report())))).await {
+                                return lost(true, format!("上报角色摘要失败：{e}"));
+                            }
+                        }
+                        ServerMsg::CheckRole { role_id } => {
+                            if let Some((source, model)) = roles.begin_check(&role_id) {
+                                if let Err(e) = ws.send(envelope_text(&Envelope::new(NodeMsg::RolesReport(roles.report())))).await {
+                                    return lost(true, format!("上报角色摘要失败：{e}"));
+                                }
+                                let (roles, tx) = (roles.clone(), role_tx.clone());
+                                tokio::spawn(async move {
+                                    let result = roles.run_probe(source, model.clone()).await;
+                                    roles.finish_check(&role_id, source, &model, result);
+                                    // 连接若已断开，发不出去也没关系：重连后会重新上报
+                                    let _ = tx.send(NodeMsg::RolesReport(roles.report()));
+                                });
+                            }
+                        }
                         ServerMsg::Ping | ServerMsg::Welcome(_) => {}
                         // 人工处理结果、画面订阅还没接入：明确记一笔，不能假装收到了
                         other => tracing::warn!("这类消息还不处理，已忽略：{other:?}"),
@@ -472,11 +505,13 @@ async fn session<D: Devices, E: RunExecutor>(cfg: &NodeConfig, devices: &D, runn
 pub async fn run<D: Devices, E: RunExecutor>(cfg: NodeConfig, devices: D, executor: E) -> Result<(), NodeError> {
     let mut node_id = load_node_id(&cfg.state_dir);
     let (tx, rx) = mpsc::unbounded_channel();
+    let role_tx = tx.clone();
     let runner = Runner::new(executor, tx);
+    let roles = Arc::new(roles::RoleStore::open(&cfg.state_dir, roles::real_probe()));
     let mut outbox = Outbox { rx, pending: VecDeque::new() };
     let mut attempt: u32 = 0;
     loop {
-        match session(&cfg, &devices, &runner, &mut outbox, &mut node_id).await {
+        match session(&cfg, &devices, &runner, &mut outbox, &mut node_id, &roles, &role_tx).await {
             SessionEnd::Rejected(e) => return Err(e),
             SessionEnd::Lost { connected, reason } => {
                 if connected {

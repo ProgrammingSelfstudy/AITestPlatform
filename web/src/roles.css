@@ -1,0 +1,1373 @@
+/* 角色与模型配置页（指挥台布局）：复用 theme.css 变量，提供浅色与深色双主题支持 */
+
+:root {
+  /* 指挥带与三层表面补充变量（浅色） */
+  --roles-hero-bg: linear-gradient(135deg, rgba(5, 150, 105, 0.05) 0%, var(--bg-surface) 46%, rgba(37, 99, 235, 0.045) 100%);
+  --roles-hero-border: rgba(5, 150, 105, 0.24);
+  --roles-hero-border-warn: rgba(217, 119, 6, 0.34);
+  --roles-hero-border-idle: var(--border-strong);
+  --roles-hero-glow: 0 8px 26px -12px rgba(15, 23, 42, 0.09);
+
+  --roles-emblem-bg: rgba(5, 150, 105, 0.08);
+  --roles-emblem-border: rgba(5, 150, 105, 0.34);
+  --roles-emblem-fg: #047857;
+
+  /* 选中 / 活跃角色卡亮色描边与微弱发光 */
+  --roles-active-border: rgba(37, 99, 235, 0.68);
+  --roles-active-glow: 0 0 0 1px rgba(37, 99, 235, 0.20), 0 8px 22px -6px rgba(37, 99, 235, 0.16);
+  --roles-active-bg: linear-gradient(135deg, rgba(37, 99, 235, 0.055) 0%, var(--bg-surface) 64%);
+
+  /* 岗位语义色（执行员：冷青蓝；判定员：靛紫；不与通过绿/失败红冲突） */
+  --roles-exec-fg: #0369a1;
+  --roles-exec-bg: rgba(2, 132, 199, 0.10);
+  --roles-exec-border: rgba(2, 132, 199, 0.24);
+
+  --roles-judge-fg: #6d28d9;
+  --roles-judge-bg: rgba(124, 58, 237, 0.10);
+  --roles-judge-border: rgba(124, 58, 237, 0.24);
+
+  /* 类终端检测日志面板（浅色模式采用高对比度冷灰凹陷终端表面） */
+  --roles-term-bg: #f1f5f9;
+  --roles-term-header: rgba(15, 23, 42, 0.04);
+  --roles-term-border: rgba(15, 23, 42, 0.12);
+  --roles-term-fg: #0f172a;
+  --roles-term-muted: #475569;
+  --roles-term-detail-bg: rgba(15, 23, 42, 0.045);
+
+  /* 管线连接线 */
+  --roles-pipe-line: rgba(15, 23, 42, 0.18);
+  --roles-pipe-line-ok: rgba(5, 150, 105, 0.45);
+
+  /* 卡片底部的状态指示条轨道 */
+  --roles-meter-track: rgba(15, 23, 42, 0.08);
+}
+
+:root[data-theme="dark"] {
+  /* 指挥带与三层表面补充变量（深色，贴合深色指挥台层次） */
+  --roles-hero-bg: linear-gradient(135deg, rgba(16, 185, 129, 0.08) 0%, var(--bg-surface) 44%, rgba(59, 130, 246, 0.06) 100%);
+  --roles-hero-border: rgba(52, 211, 153, 0.28);
+  --roles-hero-border-warn: rgba(251, 191, 36, 0.36);
+  --roles-hero-border-idle: rgba(255, 255, 255, 0.14);
+  --roles-hero-glow: 0 0 36px -14px rgba(16, 185, 129, 0.24), var(--shadow-sm);
+
+  --roles-emblem-bg: rgba(16, 185, 129, 0.10);
+  --roles-emblem-border: rgba(52, 211, 153, 0.42);
+  --roles-emblem-fg: #34d399;
+
+  --roles-active-border: rgba(96, 165, 250, 0.78);
+  --roles-active-glow: 0 0 0 1px rgba(96, 165, 250, 0.26), 0 0 24px -4px rgba(59, 130, 246, 0.28);
+  --roles-active-bg: linear-gradient(135deg, rgba(59, 130, 246, 0.12) 0%, var(--bg-surface) 64%);
+
+  --roles-exec-fg: #38bdf8;
+  --roles-exec-bg: rgba(56, 189, 248, 0.14);
+  --roles-exec-border: rgba(56, 189, 248, 0.32);
+
+  --roles-judge-fg: #c084fc;
+  --roles-judge-bg: rgba(192, 132, 252, 0.14);
+  --roles-judge-border: rgba(192, 132, 252, 0.32);
+
+  --roles-term-bg: #070a0f;
+  --roles-term-header: rgba(255, 255, 255, 0.03);
+  --roles-term-border: rgba(255, 255, 255, 0.10);
+  --roles-term-fg: #e4e4e7;
+  --roles-term-muted: #94a3b8;
+  --roles-term-detail-bg: rgba(255, 255, 255, 0.04);
+
+  --roles-pipe-line: rgba(255, 255, 255, 0.16);
+  --roles-pipe-line-ok: rgba(52, 211, 153, 0.48);
+
+  --roles-meter-track: rgba(255, 255, 255, 0.08);
+}
+
+/* ---------------------------------------------------------------- 页面骨架 */
+
+.roles-page {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  color: var(--text-primary);
+  font-family: var(--font-sans);
+}
+
+.roles-mono {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+/* ---------------------------------------------------------------- 顶部通栏指挥带 */
+
+.roles-hero {
+  background: var(--roles-hero-bg);
+  border: 1px solid var(--roles-hero-border);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--roles-hero-glow);
+  padding: var(--space-5) var(--space-5) var(--space-4);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+
+.roles-hero.roles-hero-offline {
+  border-color: var(--roles-hero-border-warn);
+}
+
+.roles-hero.roles-hero-idle {
+  border-color: var(--roles-hero-border-idle);
+}
+
+.roles-hero-top {
+  display: grid;
+  grid-template-columns: minmax(0, 1.35fr) minmax(200px, 0.9fr) minmax(190px, 0.75fr);
+  gap: var(--space-5);
+  align-items: center;
+}
+
+.roles-hero-brand {
+  display: flex;
+  align-items: center;
+  gap: var(--space-4);
+  min-width: 0;
+}
+
+.roles-emblem {
+  width: 56px;
+  height: 56px;
+  flex: 0 0 56px;
+  border-radius: var(--radius-md);
+  background: var(--roles-emblem-bg);
+  border: 1px solid var(--roles-emblem-border);
+  color: var(--roles-emblem-fg);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-family: var(--font-mono);
+  font-size: 20px;
+  font-weight: 700;
+  letter-spacing: -0.04em;
+}
+
+.roles-hero-titles {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.roles-hero-heading-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+}
+
+.roles-hero-title {
+  margin: 0;
+  font-size: 22px;
+  font-weight: 700;
+  line-height: 1.25;
+  letter-spacing: -0.02em;
+  color: var(--text-primary);
+}
+
+.roles-hero-scope-tag {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--border-strong);
+  background: var(--bg-subtle);
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 1.4;
+}
+
+.roles-hero-runtime {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+  font-size: 13px;
+  color: var(--text-secondary);
+}
+
+.roles-hero-sep {
+  color: var(--text-muted);
+}
+
+.roles-hero-subnote {
+  font-size: 12px;
+  color: var(--text-muted);
+  line-height: 1.45;
+}
+
+/* 中央超大 KPI */
+
+.roles-hero-kpi {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  padding: 0 var(--space-3);
+  border-left: 1px solid var(--border-hairline);
+  border-right: 1px solid var(--border-hairline);
+}
+
+.roles-kpi-main-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: center;
+  gap: 6px;
+  line-height: 1;
+}
+
+.roles-kpi-prefix {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-muted);
+  letter-spacing: 0.04em;
+}
+
+.roles-kpi-big {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  font-size: 40px;
+  font-weight: 800;
+  letter-spacing: -0.03em;
+  color: var(--text-primary);
+}
+
+.roles-kpi-denom {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  font-size: 20px;
+  font-weight: 600;
+  color: var(--text-muted);
+}
+
+.roles-kpi-caption {
+  margin-top: 6px;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+/* 右侧副 KPI 纵向三行 */
+
+.roles-hero-side-kpis {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.roles-side-kpi-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--space-3);
+}
+
+.roles-side-kpi-label {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.roles-side-kpi-val {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  font-size: 20px;
+  font-weight: 700;
+  line-height: 1.15;
+  color: var(--text-primary);
+}
+
+.roles-side-kpi-val.is-pass {
+  color: var(--st-pass-fg);
+}
+
+.roles-side-kpi-val.is-fail {
+  color: var(--st-fail-fg);
+}
+
+.roles-side-kpi-val.is-muted {
+  color: var(--text-muted);
+}
+
+/* 顶部节点与个人令牌控制带 */
+
+.roles-hero-controls {
+  display: grid;
+  grid-template-columns: minmax(220px, 1fr) minmax(240px, 1.15fr) auto;
+  gap: var(--space-3);
+  align-items: end;
+  padding-top: var(--space-3);
+  border-top: 1px solid var(--border-hairline);
+}
+
+.roles-control-field {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  min-width: 0;
+}
+
+.roles-control-label {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text-secondary);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+}
+
+.roles-control-hint {
+  font-weight: 400;
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.roles-control-meta {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding-bottom: 4px;
+  font-size: 12px;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+/* ---------------------------------------------------------------- 状态徽章与岗位胶囊 */
+
+.roles-status-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 9px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.45;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.roles-status-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: currentColor;
+  flex-shrink: 0;
+}
+
+.roles-tone-pass {
+  color: var(--st-pass-fg);
+  background: var(--st-pass-bg);
+}
+
+.roles-tone-run {
+  color: var(--st-run-fg);
+  background: var(--st-run-bg);
+}
+
+.roles-tone-que {
+  color: var(--st-que-fg);
+  background: var(--st-que-bg);
+}
+
+.roles-tone-unc {
+  color: var(--st-unc-fg);
+  background: var(--st-unc-bg);
+}
+
+.roles-tone-lost {
+  color: var(--st-lost-fg);
+  background: var(--st-lost-bg);
+}
+
+.roles-tone-fail {
+  color: var(--st-fail-fg);
+  background: var(--st-fail-bg);
+}
+
+@keyframes roles-checking-pulse {
+  0%, 100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.35;
+  }
+}
+
+.roles-checking-dot {
+  animation: roles-checking-pulse 1.8s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .roles-checking-dot {
+    animation: none;
+  }
+}
+
+.roles-slot-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 1px 8px;
+  border-radius: 6px;
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1.5;
+  border: 1px solid transparent;
+  white-space: nowrap;
+}
+
+.roles-slot-executor {
+  color: var(--roles-exec-fg);
+  background: var(--roles-exec-bg);
+  border-color: var(--roles-exec-border);
+}
+
+.roles-slot-judge {
+  color: var(--roles-judge-fg);
+  background: var(--roles-judge-bg);
+  border-color: var(--roles-judge-border);
+}
+
+.roles-key-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 1px 7px;
+  border-radius: 6px;
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--text-secondary);
+  background: var(--bg-subtle);
+  border: 1px solid var(--border-strong);
+  white-space: nowrap;
+}
+
+.roles-dirty-pill {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 7px;
+  border-radius: 6px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--st-unc-fg);
+  background: var(--st-unc-bg);
+  white-space: nowrap;
+}
+
+/* ---------------------------------------------------------------- 状态提示横幅与空态卡片 */
+
+.roles-alerts-stack {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.roles-gate-card {
+  background: var(--bg-surface);
+  border: 1px solid var(--border-hairline);
+  border-radius: var(--radius-lg);
+  padding: var(--space-8) var(--space-6);
+  text-align: center;
+  box-shadow: var(--shadow-xs);
+}
+
+.roles-gate-title {
+  margin: 0 0 6px;
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.roles-gate-desc {
+  margin: 0;
+  font-size: 13px;
+  color: var(--text-secondary);
+}
+
+/* ---------------------------------------------------------------- 主体两栏（左 28% / 右 72%） */
+
+.roles-workspace {
+  display: grid;
+  grid-template-columns: minmax(268px, 28%) minmax(0, 1fr);
+  gap: var(--space-4);
+  align-items: start;
+}
+
+/* 左栏：角色实体卡列 */
+
+.roles-sidebar {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  min-width: 0;
+}
+
+.roles-sidebar-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 2px;
+}
+
+.roles-section-kicker {
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  color: var(--text-muted);
+  text-transform: uppercase;
+}
+
+.roles-sidebar-count {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.roles-card-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+.roles-entity-card {
+  width: 100%;
+  text-align: left;
+  cursor: pointer;
+  background: var(--bg-surface);
+  border: 1px solid var(--border-hairline);
+  border-radius: var(--radius-md);
+  padding: 14px 14px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  color: inherit;
+  font: inherit;
+  box-shadow: var(--shadow-xs);
+  transition: border-color 140ms ease, box-shadow 140ms ease, background-color 140ms ease;
+}
+
+.roles-entity-card:hover {
+  border-color: var(--border-strong);
+  background: var(--bg-hover);
+}
+
+.roles-entity-card:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.roles-entity-card.is-selected {
+  background: var(--roles-active-bg);
+  border-color: var(--roles-active-border);
+  box-shadow: var(--roles-active-glow);
+}
+
+.roles-card-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-2);
+}
+
+.roles-card-identity {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.roles-card-icon {
+  width: 32px;
+  height: 32px;
+  flex: 0 0 32px;
+  border-radius: var(--radius-sm);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--border-hairline);
+  background: var(--bg-subtle);
+}
+
+.roles-card-icon.is-executor {
+  color: var(--roles-exec-fg);
+  border-color: var(--roles-exec-border);
+  background: var(--roles-exec-bg);
+}
+
+.roles-card-icon.is-judge {
+  color: var(--roles-judge-fg);
+  border-color: var(--roles-judge-border);
+  background: var(--roles-judge-bg);
+}
+
+.roles-card-name-wrap {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.roles-card-name {
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--text-primary);
+  line-height: 1.3;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.roles-card-tags {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.roles-card-source {
+  font-size: 12px;
+  color: var(--text-secondary);
+  line-height: 1.4;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.roles-card-model-box {
+  background: var(--bg-subtle);
+  border: 1px solid var(--border-hairline);
+  border-radius: var(--radius-sm);
+  padding: 7px 10px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+  min-width: 0;
+}
+
+.roles-card-model-name {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.roles-card-effort {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-secondary);
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: var(--bg-surface);
+  border: 1px solid var(--border-hairline);
+  flex-shrink: 0;
+}
+
+.roles-card-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.roles-card-meter {
+  height: 3px;
+  width: 100%;
+  border-radius: 999px;
+  background: var(--roles-meter-track);
+  overflow: hidden;
+}
+
+.roles-card-meter-fill {
+  height: 100%;
+  border-radius: 999px;
+  width: 100%;
+}
+
+.roles-meter-pass {
+  background: var(--st-pass-fg);
+}
+
+.roles-meter-run {
+  width: 65%;
+  background: var(--st-run-fg);
+}
+
+.roles-meter-que {
+  width: 30%;
+  background: var(--st-que-fg);
+}
+
+.roles-meter-unc {
+  width: 55%;
+  background: var(--st-unc-fg);
+}
+
+.roles-meter-lost {
+  width: 55%;
+  background: var(--st-lost-fg);
+}
+
+.roles-meter-fail {
+  width: 100%;
+  background: var(--st-fail-fg);
+}
+
+.roles-add-btn {
+  width: 100%;
+  height: 44px;
+  border-radius: var(--radius-md);
+  border: 1px dashed var(--border-strong);
+  background: var(--bg-surface);
+  color: var(--text-primary);
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  transition: border-color 140ms ease, background-color 140ms ease, color 140ms ease;
+}
+
+.roles-add-btn:hover:not(:disabled) {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.roles-add-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.roles-add-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.roles-empty-sidebar {
+  background: var(--bg-surface);
+  border: 1px solid var(--border-hairline);
+  border-radius: var(--radius-md);
+  padding: var(--space-5) var(--space-4);
+  text-align: center;
+  font-size: 13px;
+  color: var(--text-muted);
+}
+
+/* ---------------------------------------------------------------- 右栏主区（72%） */
+
+.roles-main {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  min-width: 0;
+}
+
+.roles-panel {
+  background: var(--bg-surface);
+  border: 1px solid var(--border-hairline);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-xs);
+  overflow: hidden;
+}
+
+.roles-panel-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  padding: 14px var(--space-5);
+  border-bottom: 1px solid var(--border-hairline);
+  flex-wrap: wrap;
+}
+
+.roles-panel-title-wrap {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
+  flex-wrap: wrap;
+}
+
+.roles-panel-title {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--text-primary);
+  line-height: 1.3;
+}
+
+.roles-panel-sub {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.roles-panel-body {
+  padding: var(--space-5);
+}
+
+/* ---------------------------------------------------------------- 流程管线 + 4 统计块 */
+
+.roles-flow-body {
+  padding: var(--space-4) var(--space-5) var(--space-5);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+
+.roles-pipeline {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 72px minmax(0, 1fr);
+  gap: var(--space-3);
+  align-items: stretch;
+}
+
+.roles-pipe-stage {
+  background: var(--bg-subtle);
+  border: 1px solid var(--border-hairline);
+  border-radius: var(--radius-md);
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0;
+}
+
+.roles-pipe-stage-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+}
+
+.roles-pipe-stage-count {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.roles-pipe-nodes {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.roles-pipe-node {
+  flex: 1 1 150px;
+  min-width: 0;
+  text-align: left;
+  cursor: pointer;
+  background: var(--bg-surface);
+  border: 1px solid var(--border-hairline);
+  border-radius: var(--radius-sm);
+  padding: 9px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  color: inherit;
+  font: inherit;
+  transition: border-color 140ms ease, box-shadow 140ms ease;
+}
+
+.roles-pipe-node:hover {
+  border-color: var(--border-strong);
+}
+
+.roles-pipe-node:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.roles-pipe-node.is-selected {
+  border-color: var(--roles-active-border);
+  box-shadow: var(--roles-active-glow);
+}
+
+.roles-pipe-node-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+}
+
+.roles-pipe-node-name {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.roles-pipe-node-avail {
+  font-size: 11px;
+  font-weight: 600;
+  padding: 1px 7px;
+  border-radius: 999px;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.roles-pipe-node-avail.is-ok {
+  color: var(--st-pass-fg);
+  background: var(--st-pass-bg);
+}
+
+.roles-pipe-node-avail.is-bad {
+  color: var(--st-fail-fg);
+  background: var(--st-fail-bg);
+}
+
+.roles-pipe-node-avail.is-pending {
+  color: var(--st-que-fg);
+  background: var(--st-que-bg);
+}
+
+.roles-pipe-node-avail.is-warn {
+  color: var(--st-unc-fg);
+  background: var(--st-unc-bg);
+}
+
+.roles-pipe-node-avail.is-lost {
+  color: var(--st-lost-fg);
+  background: var(--st-lost-bg);
+}
+
+.roles-pipe-node-avail.is-run {
+  color: var(--st-run-fg);
+  background: var(--st-run-bg);
+}
+
+.roles-pipe-node-meta {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.roles-pipe-empty {
+  padding: 12px 10px;
+  border-radius: var(--radius-sm);
+  border: 1px dashed var(--border-strong);
+  font-size: 12px;
+  color: var(--text-muted);
+  text-align: center;
+}
+
+.roles-pipe-bridge {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  color: var(--text-muted);
+}
+
+.roles-pipe-bridge-line {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+  color: var(--roles-pipe-line);
+}
+
+.roles-pipe-bridge-line.is-ready {
+  color: var(--roles-pipe-line-ok);
+}
+
+.roles-pipe-bridge-label {
+  font-size: 11px;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+/* 4 个统计块 */
+
+.roles-stats-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: var(--space-3);
+}
+
+.roles-stat-tile {
+  background: var(--bg-subtle);
+  border: 1px solid var(--border-hairline);
+  border-radius: var(--radius-md);
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.roles-stat-tile.is-alert {
+  border-color: var(--st-fail-fg);
+  background: var(--st-fail-bg);
+}
+
+.roles-stat-label {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text-secondary);
+}
+
+.roles-stat-num {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  font-size: 28px;
+  font-weight: 800;
+  line-height: 1.15;
+  letter-spacing: -0.02em;
+  color: var(--text-primary);
+}
+
+.roles-stat-num.is-pass {
+  color: var(--st-pass-fg);
+}
+
+.roles-stat-num.is-fail {
+  color: var(--st-fail-fg);
+}
+
+.roles-stat-num.is-que {
+  color: var(--text-secondary);
+}
+
+.roles-stat-note {
+  font-size: 11px;
+  color: var(--text-muted);
+  line-height: 1.4;
+}
+
+/* ---------------------------------------------------------------- 右栏中部：角色编辑表单 */
+
+.roles-editor-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+}
+
+.roles-form-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0 var(--space-4);
+}
+
+.roles-form-span-2 {
+  grid-column: 1 / -1;
+}
+
+.roles-source-option {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 2px 0;
+}
+
+.roles-source-option-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.roles-source-option-hint {
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.roles-models-box {
+  background: var(--bg-subtle);
+  border: 1px solid var(--border-hairline);
+  border-radius: var(--radius-md);
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.roles-models-header {
+  display: grid;
+  grid-template-columns: minmax(0, 1.1fr) minmax(0, 1.3fr) 56px;
+  gap: var(--space-2);
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-muted);
+  padding: 0 2px;
+}
+
+.roles-model-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1.1fr) minmax(0, 1.3fr) 56px;
+  gap: var(--space-2);
+  align-items: start;
+}
+
+.roles-model-row .ant-form-item {
+  margin-bottom: 0;
+}
+
+.roles-model-remove {
+  display: flex;
+  justify-content: flex-end;
+}
+
+.roles-models-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+  padding-top: 4px;
+  flex-wrap: wrap;
+}
+
+.roles-models-tip {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.roles-key-section {
+  background: var(--bg-subtle);
+  border: 1px solid var(--border-hairline);
+  border-radius: var(--radius-md);
+  padding: 12px 14px 4px;
+  margin-bottom: var(--space-4);
+}
+
+.roles-editor-meta-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  padding: 10px 14px;
+  margin-bottom: var(--space-4);
+  border-radius: var(--radius-sm);
+  background: var(--bg-subtle);
+  border: 1px solid var(--border-hairline);
+  font-size: 12px;
+  color: var(--text-secondary);
+  flex-wrap: wrap;
+}
+
+.roles-editor-meta-items {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  flex-wrap: wrap;
+}
+
+/* ---------------------------------------------------------------- 右栏下方：类终端检测日志面板 */
+
+.roles-terminal {
+  background: var(--roles-term-bg);
+  border: 1px solid var(--roles-term-border);
+  border-radius: var(--radius-lg);
+  overflow: hidden;
+  color: var(--roles-term-fg);
+}
+
+.roles-terminal-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  padding: 10px var(--space-4);
+  background: var(--roles-term-header);
+  border-bottom: 1px solid var(--roles-term-border);
+  flex-wrap: wrap;
+}
+
+.roles-terminal-cmd {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--roles-emblem-fg);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.roles-terminal-title {
+  color: var(--roles-term-fg);
+  font-family: var(--font-sans);
+  font-weight: 600;
+  font-size: 13px;
+}
+
+.roles-terminal-count {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  font-size: 12px;
+  color: var(--roles-term-muted);
+}
+
+.roles-terminal-body {
+  padding: var(--space-3) var(--space-4);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  max-height: 360px;
+  overflow-y: auto;
+}
+
+.roles-terminal-empty {
+  padding: var(--space-5) var(--space-3);
+  text-align: center;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--roles-term-muted);
+}
+
+.roles-log-entry {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding-bottom: 10px;
+  border-bottom: 1px solid var(--roles-term-border);
+}
+
+.roles-log-entry:last-child {
+  padding-bottom: 0;
+  border-bottom: none;
+}
+
+.roles-log-line {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  font-size: 12px;
+}
+
+.roles-log-time {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  color: var(--roles-term-muted);
+  font-size: 12px;
+}
+
+.roles-log-role {
+  font-weight: 600;
+  color: var(--roles-term-fg);
+}
+
+.roles-log-detail {
+  margin: 0;
+  padding: 8px 10px;
+  border-radius: 6px;
+  background: var(--roles-term-detail-bg);
+  border: 1px solid var(--roles-term-border);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.55;
+  color: var(--roles-term-fg);
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow-wrap: anywhere;
+}
+
+/* ---------------------------------------------------------------- 响应式适配（<900px 上下排列） */
+
+@media (max-width: 1080px) {
+  .roles-hero-top {
+    grid-template-columns: minmax(0, 1fr) minmax(180px, auto);
+  }
+
+  .roles-hero-side-kpis {
+    grid-column: 1 / -1;
+    flex-direction: row;
+    justify-content: space-between;
+    padding-top: var(--space-3);
+    border-top: 1px solid var(--border-hairline);
+  }
+
+  .roles-hero-kpi {
+    border-right: none;
+    padding-right: 0;
+  }
+
+  .roles-hero-controls {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .roles-control-meta {
+    grid-column: 1 / -1;
+    padding-bottom: 0;
+  }
+}
+
+@media (max-width: 899px) {
+  .roles-workspace {
+    grid-template-columns: 1fr;
+  }
+
+  .roles-hero-top {
+    grid-template-columns: 1fr;
+    gap: var(--space-4);
+  }
+
+  .roles-hero-kpi {
+    border-left: none;
+    border-right: none;
+    border-top: 1px solid var(--border-hairline);
+    padding: var(--space-3) 0 0;
+    align-items: flex-start;
+    text-align: left;
+  }
+
+  .roles-hero-controls {
+    grid-template-columns: 1fr;
+  }
+
+  .roles-pipeline {
+    grid-template-columns: 1fr;
+  }
+
+  .roles-pipe-bridge {
+    flex-direction: row;
+    padding: 2px 0;
+  }
+
+  .roles-stats-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .roles-form-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .roles-models-header {
+    display: none;
+  }
+
+  .roles-model-row {
+    grid-template-columns: 1fr;
+    padding-bottom: 10px;
+    border-bottom: 1px solid var(--border-hairline);
+  }
+
+  .roles-model-row:last-child {
+    padding-bottom: 0;
+    border-bottom: none;
+  }
+}

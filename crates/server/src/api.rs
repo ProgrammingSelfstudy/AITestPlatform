@@ -11,7 +11,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
-use protocol::{CaseExpected, ModelSource, RoleModel};
+use protocol::{CaseExpected, ModelSource, RoleConfig, RoleModel, RoleSlot};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::Row;
@@ -50,6 +50,9 @@ pub(crate) fn routes(app: AppState, paths: Paths) -> Router {
     let authorize_write = axum::middleware::from_fn_with_state(app.clone(), reviews::authorize);
     Router::new()
         .route("/api/models", get(models))
+        .route("/api/nodes/{id}/roles", post(set_node_roles).route_layer(authorize_write.clone()).get(node_roles))
+        .route("/api/nodes/{id}/roles/init-template", post(init_node_roles).route_layer(authorize_write.clone()))
+        .route("/api/nodes/{id}/roles/{role}/check", post(check_node_role).route_layer(authorize_write.clone()))
         .route(
             "/api/tasks",
             post(create_task)
@@ -166,78 +169,50 @@ pub(crate) async fn browser_write_guard(request: Request, next: Next, lan: bool)
 }
 
 /// 模型配置：`roles` 列表，每项是「某个岗位（执行员 / 判定员）可选的一个来源和它的模型」。
-/// 新增角色或模型只改配置文件，不改代码。
+/// 新增角色或模型只改配置文件，不改代码。文件里的格式和节点上报的角色配置是同一个类型。
 #[derive(Deserialize)]
 struct Models {
-    roles: Vec<Role>,
+    roles: Vec<RoleConfig>,
 }
 
-#[derive(Deserialize, PartialEq, Eq, Clone, Copy, Debug)]
-#[serde(rename_all = "snake_case")]
-enum Slot {
-    Executor,
-    Judge,
+fn find_model<'a>(role: &'a RoleConfig, name: &str) -> Option<&'a protocol::RoleModelOption> {
+    role.models.iter().find(|m| m.model == name)
 }
 
-#[derive(Deserialize)]
-struct Role {
-    id: String,
-    slot: Slot,
-    #[allow(dead_code)]
-    name: String,
-    source: ModelSource,
-    default: ModelDefault,
-    models: Vec<ModelOption>,
-}
-
-#[derive(Deserialize)]
-struct ModelDefault {
-    model: String,
-    effort: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct ModelOption {
-    model: String,
-    efforts: Vec<String>,
-}
-
-impl Role {
-    fn find(&self, name: &str) -> Option<&ModelOption> {
-        self.models.iter().find(|m| m.model == name)
+/// 目前节点真正能跑的来源组合；还没有运行器的来源不让进配置，免得页面上能选、实际跑不了。
+fn source_supported(role: &RoleConfig) -> bool {
+    match role.slot {
+        RoleSlot::Executor => role.source == ModelSource::CodexExec,
+        RoleSlot::Judge => matches!(role.source, ModelSource::ClaudeCli | ModelSource::Agy),
     }
+}
 
-    /// 目前节点真正能跑的来源组合；还没有运行器的来源不让进配置，免得页面上能选、实际跑不了。
-    fn source_supported(&self) -> bool {
-        match self.slot {
-            Slot::Executor => self.source == ModelSource::CodexExec,
-            Slot::Judge => matches!(self.source, ModelSource::ClaudeCli | ModelSource::Agy),
-        }
-    }
+fn role_valid(role: &RoleConfig) -> bool {
+    !role.id.trim().is_empty()
+        && !role.name.trim().is_empty()
+        && source_supported(role)
+        && !role.models.is_empty()
+        && role.models.iter().all(|m| !m.model.trim().is_empty() && m.efforts.iter().all(|e| !e.trim().is_empty()))
+        && find_model(role, &role.default.model).is_some_and(|m| match &role.default.effort {
+            Some(e) => m.efforts.contains(e),
+            None => m.efforts.is_empty(),
+        })
+}
 
-    fn valid(&self) -> bool {
-        !self.id.trim().is_empty()
-            && self.source_supported()
-            && !self.models.is_empty()
-            && self.models.iter().all(|m| !m.model.trim().is_empty() && m.efforts.iter().all(|e| !e.trim().is_empty()))
-            && self.find(&self.default.model).is_some_and(|m| match &self.default.effort {
-                Some(e) => m.efforts.contains(e),
-                None => m.efforts.is_empty(),
-            })
-    }
+/// 一组角色是否合法：id 不重复、每个角色合法、两个岗位都至少一个。
+fn roles_valid(roles: &[RoleConfig]) -> bool {
+    let unique = roles.iter().enumerate().all(|(i, r)| roles[..i].iter().all(|o| o.id != r.id));
+    unique && roles.iter().all(role_valid) && [RoleSlot::Executor, RoleSlot::Judge].iter().all(|slot| roles.iter().any(|r| r.slot == *slot))
+}
+
+/// 请求没写角色时用该岗位的第一个角色。
+fn pick<'a>(roles: &'a [RoleConfig], slot: RoleSlot, role: Option<&str>) -> Option<&'a RoleConfig> {
+    roles.iter().find(|r| r.slot == slot && role.is_none_or(|id| r.id == id))
 }
 
 impl Models {
     fn valid(&self) -> bool {
-        let unique = self.roles.iter().enumerate().all(|(i, r)| self.roles[..i].iter().all(|o| o.id != r.id));
-        unique
-            && self.roles.iter().all(Role::valid)
-            && [Slot::Executor, Slot::Judge].iter().all(|slot| self.roles.iter().any(|r| r.slot == *slot))
-    }
-
-    /// 请求没写角色时用该岗位的第一个角色。
-    fn pick(&self, slot: Slot, role: Option<&str>) -> Option<&Role> {
-        self.roles.iter().find(|r| r.slot == slot && role.is_none_or(|id| r.id == id))
+        roles_valid(&self.roles)
     }
 }
 
@@ -267,6 +242,91 @@ async fn models(State(state): State<ApiState>) -> Result<impl IntoResponse, ApiE
         ],
         bytes,
     ))
+}
+
+// ---------------------------------------------------------------- 节点的角色与模型配置（每个节点各自一份）
+
+/// 校验个人令牌，并且节点属于该用户。别人的节点、没有属主的节点一律 403，不存在 404。
+async fn require_owned(state: &ApiState, headers: &axum::http::HeaderMap, id: &str) -> Result<Uuid, ApiError> {
+    let node: Uuid = id.parse().map_err(|_| (StatusCode::NOT_FOUND, "没有这个节点".to_string()))?;
+    let token = headers.get("x-user-token").and_then(|h| h.to_str().ok()).unwrap_or_default();
+    if token.is_empty() {
+        return Err((StatusCode::UNAUTHORIZED, "需要有效的个人令牌才能查看或修改角色配置".to_string()));
+    }
+    let user = crate::users::user_by_token(state.app.pool(), token)
+        .await
+        .map_err(|e| internal("校验用户失败", e))?
+        .ok_or((StatusCode::UNAUTHORIZED, "需要有效的个人令牌才能查看或修改角色配置".to_string()))?;
+    match crate::users::check_node_owner(state.app.pool(), node, user).await.map_err(|e| internal("校验节点属主失败", e))? {
+        crate::users::NodeOwner::Owned => Ok(node),
+        crate::users::NodeOwner::Missing => Err((StatusCode::NOT_FOUND, "没有这个节点".to_string())),
+        crate::users::NodeOwner::NotYours => Err((StatusCode::FORBIDDEN, "只能查看和修改自己的节点".to_string())),
+    }
+}
+
+#[derive(Serialize)]
+struct NodeRolesView {
+    online: bool,
+    roles: Vec<protocol::RoleReport>,
+}
+
+/// 节点当前的角色摘要。节点离线时 `online=false` 且不返回角色（上一次的报告可能已过期）。Key 永远不在里面。
+async fn node_roles(State(state): State<ApiState>, Path(id): Path<String>, headers: axum::http::HeaderMap) -> Result<impl IntoResponse, ApiError> {
+    let node = require_owned(&state, &headers, &id).await?;
+    let online = state.app.node_connected(node).await;
+    let roles = if online { state.app.roles_report(node).map(|r| r.roles).unwrap_or_default() } else { vec![] };
+    Ok(([(header::CACHE_CONTROL, "no-store")], Json(NodeRolesView { online, roles })))
+}
+
+#[derive(Deserialize)]
+struct SetRolesRequest {
+    roles: Vec<protocol::RoleSet>,
+}
+
+/// 整体替换节点的角色配置：服务端校验后转给节点写入本机。**Key 只在这里经手一次**：不写库、不写日志，
+/// `RoleSet` 的 Debug 也隐藏了它。
+async fn set_node_roles(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    headers: axum::http::HeaderMap,
+    body: Result<Json<SetRolesRequest>, JsonRejection>,
+) -> Result<StatusCode, ApiError> {
+    let node = require_owned(&state, &headers, &id).await?;
+    let Json(request) = body.map_err(|_| bad_request("角色配置格式无效"))?;
+    let configs: Vec<RoleConfig> = request.roles.iter().map(|r| r.config.clone()).collect();
+    if !roles_valid(&configs) {
+        return Err(bad_request("角色配置无效：id 不能重复，执行员和判定员各至少一个，来源要和岗位匹配且已有运行器，默认模型要在模型列表里"));
+    }
+    push_roles(&state, node, request.roles).await
+}
+
+async fn push_roles(state: &ApiState, node: Uuid, roles: Vec<protocol::RoleSet>) -> Result<StatusCode, ApiError> {
+    if !state.app.send_to(node, protocol::ServerMsg::SetRoles(protocol::SetRoles { roles })).await {
+        return Err((StatusCode::CONFLICT, "节点离线，无法保存角色配置".to_string()));
+    }
+    Ok(StatusCode::ACCEPTED)
+}
+
+/// 用服务端 `models.json` 里的角色给节点做初始配置（不带 Key）。只在节点还没有任何角色时允许，不覆盖已有配置。
+async fn init_node_roles(State(state): State<ApiState>, Path(id): Path<String>, headers: axum::http::HeaderMap) -> Result<StatusCode, ApiError> {
+    let node = require_owned(&state, &headers, &id).await?;
+    if state.app.roles_report(node).is_some_and(|r| !r.roles.is_empty()) {
+        return Err((StatusCode::CONFLICT, "节点已经有角色配置，不能用模板覆盖".to_string()));
+    }
+    let (_, models) = read_models(&state.paths.models).await?;
+    let roles = models.roles.into_iter().map(|config| protocol::RoleSet { config, api_key: None }).collect();
+    push_roles(&state, node, roles).await
+}
+
+async fn check_node_role(State(state): State<ApiState>, Path((id, role)): Path<(String, String)>, headers: axum::http::HeaderMap) -> Result<StatusCode, ApiError> {
+    let node = require_owned(&state, &headers, &id).await?;
+    if !state.app.roles_report(node).is_some_and(|r| r.roles.iter().any(|x| x.config.id == role)) {
+        return Err((StatusCode::NOT_FOUND, "节点上没有这个角色".to_string()));
+    }
+    if !state.app.send_to(node, protocol::ServerMsg::CheckRole { role_id: role }).await {
+        return Err((StatusCode::CONFLICT, "节点离线，无法检测".to_string()));
+    }
+    Ok(StatusCode::ACCEPTED)
 }
 
 #[derive(Deserialize)]
@@ -305,6 +365,18 @@ fn run_error(error: RunError, action: &str) -> ApiError {
     (status, error.to_string())
 }
 
+/// 校验个人令牌有效、所选节点属于该用户（规则 9：只能用自己的节点）。节点不存在放行，交给后面的校验。
+async fn owner_check(state: &ApiState, token: &str, node: Uuid) -> Result<Uuid, ApiError> {
+    let user = crate::users::user_by_token(state.app.pool(), token)
+        .await
+        .map_err(|e| internal("校验发起人失败", e))?
+        .ok_or((StatusCode::UNAUTHORIZED, "需要有效的个人令牌才能发起任务".to_string()))?;
+    match crate::users::check_node_owner(state.app.pool(), node, user).await.map_err(|e| internal("校验节点属主失败", e))? {
+        crate::users::NodeOwner::NotYours => Err((StatusCode::FORBIDDEN, "只能使用自己的节点发起任务".to_string())),
+        crate::users::NodeOwner::Owned | crate::users::NodeOwner::Missing => Ok(user),
+    }
+}
+
 async fn create_task(
     State(state): State<ApiState>,
     headers: axum::http::HeaderMap,
@@ -317,12 +389,31 @@ async fn create_task(
     if token.is_empty() {
         return Err((StatusCode::UNAUTHORIZED, "需要有效的个人令牌才能发起任务".to_string()));
     }
-    let (_, models) = read_models(&state.paths.models).await?;
-    let executor_role = models
-        .pick(Slot::Executor, request.executor.role.as_deref())
-        .ok_or_else(|| bad_request("执行员角色不在配置列表中"))?;
-    let executor = executor_role
-        .find(&request.executor.model)
+    // 节点上报过角色（新版节点）：只能用该节点自己上报、检测通过的角色，所以要先确认节点是发起人的，
+    // 否则别人能借错误提示探测别人节点的配置。没上报过（旧版节点）：沿用服务端的 models.json
+    let report = state.app.roles_report(request.node_id);
+    let mut owner_checked = false;
+    let candidates: Vec<RoleConfig> = match report {
+        Some(report) => {
+            owner_check(&state, token, request.node_id).await?;
+            owner_checked = true;
+            if report.roles.is_empty() {
+                return Err(bad_request("该节点还没有配置角色，请先在「角色与模型」页配置，或用模板初始化"));
+            }
+            for wanted in [request.executor.role.as_deref(), request.judge.role.as_deref()].into_iter().flatten() {
+                if let Some(r) = report.roles.iter().find(|r| r.config.id == wanted) {
+                    if r.check.status != protocol::CheckStatus::Ok {
+                        return Err(bad_request(format!("角色「{}」还没有检测通过（当前：{:?}），请先在「角色与模型」页检测", r.config.name, r.check.status)));
+                    }
+                }
+            }
+            report.roles.into_iter().filter(|r| r.check.status == protocol::CheckStatus::Ok && source_supported(&r.config)).map(|r| r.config).collect()
+        }
+        None => read_models(&state.paths.models).await?.1.roles,
+    };
+    let executor_role = pick(&candidates, RoleSlot::Executor, request.executor.role.as_deref())
+        .ok_or_else(|| bad_request("执行员角色不在可用列表中（没有配置，或还没有检测通过）"))?;
+    let executor = find_model(executor_role, &request.executor.model)
         .ok_or_else(|| bad_request("执行员模型不在配置列表中"))?;
     // 有强度档位的模型必须选其中之一；没有档位的（强度已写进模型名）不能带强度。
     let effort_ok = match &request.executor.effort {
@@ -332,19 +423,13 @@ async fn create_task(
     if !effort_ok {
         return Err(bad_request("该执行员模型不支持所选推理强度"));
     }
-    let judge_role = models
-        .pick(Slot::Judge, request.judge.role.as_deref())
-        .ok_or_else(|| bad_request("判定员角色不在配置列表中"))?;
-    if judge_role.find(&request.judge.model).is_none() {
+    let judge_role = pick(&candidates, RoleSlot::Judge, request.judge.role.as_deref())
+        .ok_or_else(|| bad_request("判定员角色不在可用列表中（没有配置，或还没有检测通过）"))?;
+    if find_model(judge_role, &request.judge.model).is_none() {
         return Err(bad_request("判定员模型不在配置列表中"));
     }
-    let user = crate::users::user_by_token(state.app.pool(), token)
-        .await
-        .map_err(|e| internal("校验发起人失败", e))?
-        .ok_or((StatusCode::UNAUTHORIZED, "需要有效的个人令牌才能发起任务".to_string()))?;
-    match crate::users::check_node_owner(state.app.pool(), request.node_id, user).await.map_err(|e| internal("校验节点属主失败", e))? {
-        crate::users::NodeOwner::NotYours => return Err((StatusCode::FORBIDDEN, "只能使用自己的节点发起任务".to_string())),
-        crate::users::NodeOwner::Owned | crate::users::NodeOwner::Missing => {}
+    if !owner_checked {
+        owner_check(&state, token, request.node_id).await?;
     }
     let task = NewTask {
         project: request.project,
@@ -822,6 +907,7 @@ mod evidence_tests {
                 accounts: None,
                 review_auth: reviews::ReviewAuth::new(None),
                 conns: Default::default(),
+                roles: Default::default(),
             })),
             Paths {
                 models: PathBuf::new(),

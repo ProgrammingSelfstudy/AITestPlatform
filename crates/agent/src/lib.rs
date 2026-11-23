@@ -9,6 +9,7 @@ pub mod agy_cli;
 pub mod claude_cli;
 pub mod codex_exec;
 pub mod judge;
+pub mod probe;
 pub mod prompts;
 pub mod scriptcheck;
 pub mod scriptgen;

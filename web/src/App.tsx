@@ -3,18 +3,20 @@ import zhCN from "antd/locale/zh_CN";
 import { useEffect, useState } from "react";
 import NodesPage from "./NodesPage";
 import ScriptsPage from "./ScriptsPage";
+import RolesPage from "./RolesPage";
 import RunPage from "./RunPage";
 import { TaskPage, TasksPage } from "./TasksPage";
 import "./styles.css";
 
 type Mode = "light" | "dark";
-type Route = { page: "nodes" | "tasks" | "scripts" | "missing" } | { page: "task" | "run"; id: string };
+type Route = { page: "nodes" | "tasks" | "scripts" | "roles" | "missing" } | { page: "task" | "run"; id: string };
 
 function readRoute(): Route {
   const hash = window.location.hash;
   if (!hash || hash === "#/nodes") return { page: "nodes" };
   if (hash === "#/tasks") return { page: "tasks" };
   if (hash === "#/scripts") return { page: "scripts" };
+  if (hash === "#/roles") return { page: "roles" };
   const match = /^#\/(tasks|runs)\/([a-z0-9-]+)$/i.exec(hash);
   if (match) return { page: match[1] === "tasks" ? "task" : "run", id: match[2] };
   return { page: "missing" };
@@ -35,6 +37,7 @@ const BREADCRUMB: Record<Route["page"], string> = {
   nodes: "节点与设备",
   tasks: "测试任务",
   scripts: "回归脚本",
+  roles: "角色与模型",
   task: "任务详情",
   run: "运行详情",
   missing: "找不到这个页面",
@@ -113,7 +116,8 @@ function Shell({ mode, onToggle }: { mode: Mode; onToggle: () => void }) {
   }, []);
   const nodes = route.page === "nodes";
   const scripts = route.page === "scripts";
-  const tasks = !nodes && !scripts && route.page !== "missing";
+  const roles = route.page === "roles";
+  const tasks = !nodes && !scripts && !roles && route.page !== "missing";
 
   return (
     <div className="app-shell">
@@ -147,6 +151,13 @@ function Shell({ mode, onToggle }: { mode: Mode; onToggle: () => void }) {
                 <polyline points="8 6 2 12 8 18" />
               </svg>
               <span>回归脚本</span>
+            </a>
+            <a href="#/roles" aria-current={roles ? "page" : undefined}>
+              <svg className="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
+                <circle cx="12" cy="8" r="4" />
+                <path d="M4 21v-1a6 6 0 0 1 6-6h4a6 6 0 0 1 6 6v1" />
+              </svg>
+              <span>角色与模型</span>
             </a>
           </nav>
         </div>
@@ -195,6 +206,7 @@ function Shell({ mode, onToggle }: { mode: Mode; onToggle: () => void }) {
           {route.page === "nodes" && <NodesPage />}
           {route.page === "tasks" && <TasksPage />}
           {route.page === "scripts" && <ScriptsPage />}
+          {route.page === "roles" && <RolesPage />}
           {route.page === "task" && <TaskPage key={route.id} id={route.id} />}
           {route.page === "run" && <RunPage key={route.id} id={route.id} />}
           {route.page === "missing" && (

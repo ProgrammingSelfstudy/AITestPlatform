@@ -104,6 +104,96 @@ pub enum ModelSource {
     DeepSeek,
 }
 
+/// 角色所属岗位。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RoleSlot {
+    Executor,
+    Judge,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RoleDefault {
+    pub model: String,
+    pub effort: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RoleModelOption {
+    pub model: String,
+    /// 空表示没有单独的推理强度档位（强度已写进模型名）
+    pub efforts: Vec<String>,
+}
+
+/// 一个角色 = 某个岗位可选的一个来源和它的模型。配置里**不含 Key**。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RoleConfig {
+    pub id: String,
+    pub slot: RoleSlot,
+    pub name: String,
+    pub source: ModelSource,
+    pub default: RoleDefault,
+    pub models: Vec<RoleModelOption>,
+}
+
+/// 检测结果。失败时 `detail` 是已脱敏的原始错误（不含 Key），要原样给用户看。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckStatus {
+    Unchecked,
+    Checking,
+    Ok,
+    NotLoggedIn,
+    QuotaExhausted,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RoleCheck {
+    pub status: CheckStatus,
+    pub detail: Option<String>,
+    /// RFC3339 时间
+    pub checked_at: Option<String>,
+}
+
+/// 节点上报给服务端的角色摘要。`key_configured` 只有布尔，Key 永远不上报。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RoleReport {
+    #[serde(flatten)]
+    pub config: RoleConfig,
+    pub key_configured: bool,
+    pub check: RoleCheck,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RolesReport {
+    pub roles: Vec<RoleReport>,
+}
+
+/// 服务端下发的整体角色配置。`api_key` 只在新设或更换 Key 时带；`None` 表示保持节点本机原来的。
+/// 自定义 `Debug`：永远不把 Key 打进日志。
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
+pub struct RoleSet {
+    #[serde(flatten)]
+    pub config: RoleConfig,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
+}
+
+impl std::fmt::Debug for RoleSet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RoleSet")
+            .field("config", &self.config)
+            .field("api_key", &self.api_key.as_ref().map(|_| "<已隐藏>"))
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SetRoles {
+    pub roles: Vec<RoleSet>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Caps {
     pub node_version: String,
@@ -348,6 +438,8 @@ pub enum NodeMsg {
     Log(LogLine),
     /// 对服务端需要确认的消息（如 `run_assign`）的确认，`ack_id` 是被确认消息的 id
     Ack { ack_id: Uuid },
+    /// 角色摘要：连上后、配置变更后、检测完成后上报。服务端只在内存里缓存，不落库
+    RolesReport(RolesReport),
 }
 
 impl NodeMsg {
@@ -445,6 +537,10 @@ pub enum ServerMsg {
     Ping,
     Error(ProtoError),
     Ack { ack_id: Uuid },
+    /// 整体替换节点本机的角色配置
+    SetRoles(SetRoles),
+    /// 让节点真调一次模型，检测这个角色能不能用
+    CheckRole { role_id: String },
 }
 
 #[cfg(test)]
@@ -652,5 +748,38 @@ mod tests {
         // 固定这个语义：Judge 失败时 final_result 只能是 Uncertain，不能由调用方改成 Passed。
         let done = JudgeDone { run_id: Uuid::nil(), judge_status: JudgeStatus::Failed, final_result: FinalResult::Uncertain, items: vec![] };
         assert_eq!(done.final_result, FinalResult::Uncertain);
+    }
+
+    fn role(id: &str) -> RoleConfig {
+        RoleConfig {
+            id: id.into(),
+            slot: RoleSlot::Judge,
+            name: "判定员 · 测试".into(),
+            source: ModelSource::Agy,
+            default: RoleDefault { model: "m".into(), effort: None },
+            models: vec![RoleModelOption { model: "m".into(), efforts: vec![] }],
+        }
+    }
+
+    #[test]
+    fn 角色消息往返并且摘要里没有key字段() {
+        roundtrip(ServerMsg::SetRoles(SetRoles { roles: vec![RoleSet { config: role("a"), api_key: Some("sk-密钥".into()) }] }));
+        roundtrip(ServerMsg::CheckRole { role_id: "a".into() });
+        let report = RolesReport {
+            roles: vec![RoleReport { config: role("a"), key_configured: true, check: RoleCheck { status: CheckStatus::NotLoggedIn, detail: Some("未登录".into()), checked_at: None } }],
+        };
+        roundtrip(NodeMsg::RolesReport(report.clone()));
+        let text = serde_json::to_string(&report).unwrap().to_lowercase();
+        assert!(!text.contains("api_key") && !text.contains("sk-"), "上报的角色摘要里不能有 Key：{text}");
+        assert!(text.contains("\"key_configured\":true"));
+    }
+
+    #[test]
+    fn 角色的调试输出不泄露key() {
+        let set = RoleSet { config: role("a"), api_key: Some("sk-绝不能出现".into()) };
+        let shown = format!("{set:?}");
+        assert!(!shown.contains("sk-绝不能出现"), "Debug 输出泄露了 Key：{shown}");
+        let all = format!("{:?}", ServerMsg::SetRoles(SetRoles { roles: vec![set] }));
+        assert!(!all.contains("sk-绝不能出现"), "消息的 Debug 输出泄露了 Key：{all}");
     }
 }

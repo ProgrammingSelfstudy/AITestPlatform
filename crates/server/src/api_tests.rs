@@ -64,6 +64,7 @@ fn lazy_state() -> AppState {
         accounts: None,
         review_auth: reviews::ReviewAuth::new(None),
         conns: tokio::sync::Mutex::new(HashMap::new()),
+        roles: Default::default(),
     }))
 }
 
@@ -438,6 +439,141 @@ async fn 创建任务按角色选来源_不写角色用岗位第一个() {
     body["judge"]["model"] = json!("测试Gemini模型");
     let (status, _, _) = browser_post(&app, "/api/tasks", body).await;
     assert_ne!(status, StatusCode::BAD_REQUEST, "角色和模型匹配时校验应通过（后面的节点属主校验另有结果）");
+}
+
+// ---------------------------------------------------------------- 节点角色配置
+
+fn report_role(id: &str, slot: protocol::RoleSlot, source: ModelSource, model: &str, efforts: &[&str], default_effort: Option<&str>, status: protocol::CheckStatus) -> protocol::RoleReport {
+    protocol::RoleReport {
+        config: RoleConfig {
+            id: id.into(),
+            slot,
+            name: format!("角色-{id}"),
+            source,
+            default: protocol::RoleDefault { model: model.into(), effort: default_effort.map(str::to_owned) },
+            models: vec![protocol::RoleModelOption { model: model.into(), efforts: efforts.iter().map(|e| e.to_string()).collect() }],
+        },
+        key_configured: false,
+        check: protocol::RoleCheck { status, detail: None, checked_at: None },
+    }
+}
+
+fn user_headers(token: &'static str) -> Vec<(&'static str, &'static str)> {
+    vec![("x-user-token", token)]
+}
+
+fn set_roles_body(roles: Value) -> String {
+    json!({ "roles": roles }).to_string()
+}
+
+fn role_json(id: &str, slot: &str, source: &str, model: &str) -> Value {
+    json!({"id": id, "slot": slot, "name": id, "source": source, "default": {"model": model, "effort": null}, "models": [{"model": model, "efforts": []}]})
+}
+
+#[tokio::test]
+async fn 角色接口需要令牌且只能操作自己的节点() {
+    let world = World::new().await;
+    let path = format!("/api/nodes/{}/roles", world.node);
+    // 没令牌 / 令牌无效：401
+    let (status, _, _) = request(&world.app, Method::GET, &path, &[], "").await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (status, _, _) = request(&world.app, Method::GET, &path, &user_headers("u_不存在的令牌"), "").await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    // 节点不属于该用户：403；没有属主的节点：403；不存在：404
+    let other_user: Uuid = sqlx::query_scalar("insert into users (name, token_hash) values ('别人', $1) returning id")
+        .bind(crate::secret_hash("u_other-user-token")).fetch_one(world.state.pool()).await.unwrap();
+    let (status, _, _) = request(&world.app, Method::GET, &path, &user_headers("u_other-user-token"), "").await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let _ = other_user;
+    sqlx::query("update nodes set owner_user_id = null where id = $1").bind(world.node).execute(world.state.pool()).await.unwrap();
+    let (status, _, _) = request(&world.app, Method::GET, &path, &user_headers(USER_TOKEN), "").await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, _, _) = request(&world.app, Method::GET, &format!("/api/nodes/{}/roles", Uuid::new_v4()), &user_headers(USER_TOKEN), "").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn 角色接口_离线不返回角色_保存先校验再转发() {
+    let world = World::new().await;
+    let path = format!("/api/nodes/{}/roles", world.node);
+    world.state.set_roles_report_for_test(world.node, protocol::RolesReport { roles: vec![report_role("a", protocol::RoleSlot::Judge, ModelSource::Agy, "m", &[], None, protocol::CheckStatus::Ok)] });
+    // 测试里节点没有 WebSocket 连接：离线，不返回上一次的（可能过期的）角色
+    let (status, headers, bytes) = request(&world.app, Method::GET, &path, &user_headers(USER_TOKEN), "").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers[header::CACHE_CONTROL], "no-store");
+    assert_eq!(json_body(&bytes), json!({"online": false, "roles": []}));
+    // 保存：无效配置先被拒（400），不会因为节点离线而掩盖
+    let post = |body: String| {
+        let mut headers = review_headers(REVIEW_TOKEN);
+        headers.push(("x-user-token", USER_TOKEN));
+        let (app, path) = (world.app.clone(), path.clone());
+        async move {
+            request(&app, Method::POST, &path, &headers, body).await
+        }
+    };
+    let exec = role_json("e", "executor", "codex_exec", "m");
+    let judge = role_json("j", "judge", "agy", "m");
+    for (roles, why) in [
+        (json!([exec]), "缺判定员"),
+        (json!([exec, role_json("j", "judge", "deepseek", "m")]), "还没有运行器的来源"),
+        (json!([exec, role_json("j", "judge", "codex_exec", "m")]), "来源和岗位不匹配"),
+        (json!([exec, judge, role_json("j", "judge", "agy", "m")]), "id 重复"),
+    ] {
+        let (status, _, bytes) = post(set_roles_body(roles)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{why}：{}", text(&bytes));
+    }
+    // 配置合法但节点离线：409，如实告知
+    let (status, _, bytes) = post(set_roles_body(json!([exec, judge]))).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(text(&bytes).contains("节点离线"));
+    // 检测：节点上没有这个角色 404；有但离线 409
+    let check = |role: &str| {
+        let mut h = review_headers(REVIEW_TOKEN);
+        h.push(("x-user-token", USER_TOKEN));
+        let (app, p) = (world.app.clone(), format!("{path}/{role}/check"));
+        async move { request(&app, Method::POST, &p, &h, "{}").await }
+    };
+    assert_eq!(check("不存在").await.0, StatusCode::NOT_FOUND);
+    assert_eq!(check("a").await.0, StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn 创建任务用节点上报的角色_没检测通过或没配置都拒绝() {
+    let world = World::new().await;
+    let exec = |status| report_role("exec", protocol::RoleSlot::Executor, ModelSource::CodexExec, "测试执行模型", &["high", "max"], Some("max"), status);
+    let judge = |id: &str, source, status| report_role(id, protocol::RoleSlot::Judge, source, "测试判定模型", &[], None, status);
+    let post = |body: Value| browser_post(&world.app, "/api/tasks", body);
+    // 节点上报了空列表：提示去配置
+    world.state.set_roles_report_for_test(world.node, protocol::RolesReport { roles: vec![] });
+    let (status, _, bytes) = post(payload(world.node, &["TC-04"])).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(text(&bytes).contains("还没有配置角色"));
+    // 角色存在但没检测通过：拒绝，并说明是哪个角色
+    world.state.set_roles_report_for_test(world.node, protocol::RolesReport { roles: vec![exec(protocol::CheckStatus::Ok), judge("judge-agy", ModelSource::Agy, protocol::CheckStatus::Failed)] });
+    let mut body = payload(world.node, &["TC-04"]);
+    body["judge"]["role"] = json!("judge-agy");
+    let (status, _, bytes) = post(body).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(text(&bytes).contains("还没有检测通过") && text(&bytes).contains("角色-judge-agy"), "{}", text(&bytes));
+    // 全部通过：用所选角色的来源建任务（来源由服务端按角色定，不信请求里带的）
+    // 节点的命令行能力里要有 agy，否则创建任务本身会拒绝（这是原有的另一道校验）
+    sqlx::query("update nodes set caps = $2 where id = $1").bind(world.node)
+        .bind(json!({"model_sources": [{"source": "claude_cli"}, {"source": "codex_exec"}, {"source": "agy"}]}))
+        .execute(world.state.pool()).await.unwrap();
+    world.state.set_roles_report_for_test(world.node, protocol::RolesReport { roles: vec![exec(protocol::CheckStatus::Ok), judge("judge-agy", ModelSource::Agy, protocol::CheckStatus::Ok)] });
+    let mut body = payload(world.node, &["TC-04"]);
+    body["judge"]["role"] = json!("judge-agy");
+    let (status, _, bytes) = post(body).await;
+    assert_eq!(status, StatusCode::CREATED, "{}", text(&bytes));
+    let task = json_body(&bytes)["task_id"].clone();
+    let (_, _, detail) = request(&world.app, Method::GET, &format!("/api/tasks/{}", task.as_str().unwrap()), &[], "").await;
+    assert_eq!(json_body(&detail)["judge"]["source"], "agy");
+    // 别人拿自己的令牌往这个节点发任务：403，不泄露角色情况
+    sqlx::query("insert into users (name, token_hash) values ('另一个人', $1)").bind(crate::secret_hash("u_another-token")).execute(world.state.pool()).await.unwrap();
+    let mut headers = review_headers(REVIEW_TOKEN);
+    headers.push(("x-user-token", "u_another-token"));
+    let (status, _, _) = request(&world.app, Method::POST, "/api/tasks", &headers, payload(world.node, &["TC-04"]).to_string()).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
 }
 
 struct World {

@@ -167,6 +167,40 @@ export interface Models {
   roles: ModelRole[];
 }
 
+/** 模型来源。除 deepseek 外都是本机会员登录，只有 deepseek 用 API Key（规则 1）。 */
+export const ROLE_SOURCES: { value: string; label: string; needsKey: boolean; available: boolean; hint: string }[] = [
+  { value: "codex_exec", label: "Codex（本机 ChatGPT 登录）", needsKey: false, available: true, hint: "只能当执行员" },
+  { value: "claude_cli", label: "Claude（本机会员登录）", needsKey: false, available: true, hint: "只能当判定员" },
+  { value: "agy", label: "Gemini（agy，个人账号登录）", needsKey: false, available: true, hint: "只能当判定员；模型名已带推理强度" },
+  { value: "deepseek", label: "DeepSeek（API Key）", needsKey: true, available: false, hint: "运行器还在开发中，暂时不能配置" },
+];
+
+export type CheckStatus = "unchecked" | "checking" | "ok" | "not_logged_in" | "quota_exhausted" | "failed";
+
+export interface RoleCheck {
+  status: CheckStatus;
+  /** 失败时的原始错误（已脱敏，不含 Key），要原样给用户看 */
+  detail: string | null;
+  checked_at: string | null;
+}
+
+/** 节点上报的一个角色：配置 + 是否已配 Key（只有布尔，永远不回显 Key）+ 最近一次检测 */
+export interface RoleView extends ModelRole {
+  key_configured: boolean;
+  check: RoleCheck;
+}
+
+export interface NodeRoles {
+  /** 节点离线时拿不到角色，页面要明确提示 */
+  online: boolean;
+  roles: RoleView[];
+}
+
+/** 保存时提交的角色。api_key 只在需要新设或更换 Key 时填；不填表示保持原来的。 */
+export interface RoleInput extends ModelRole {
+  api_key?: string;
+}
+
 export type ScriptStatus = "candidate" | "self_check_passed" | "approved" | "rejected" | "retired";
 
 export interface Regression {
@@ -327,4 +361,33 @@ export async function submitReview(id: string, review: ReviewSubmission, token: 
 
 export function evidenceUrl(run: RunDetail, name: string): string | undefined {
   return run.file_urls[name];
+}
+
+// ---------------------------------------------------------------- 角色与模型配置（每个节点各自一份，只能操作自己的节点）
+
+const rolesPath = (nodeId: string) => `/api/nodes/${encodeURIComponent(nodeId)}/roles`;
+const userHeaders = (userToken: string) => ({ "x-user-token": userToken });
+
+export async function fetchNodeRoles(nodeId: string, userToken: string, signal?: AbortSignal): Promise<NodeRoles> {
+  const response = await request(rolesPath(nodeId), { signal, headers: userHeaders(userToken) });
+  try {
+    return (await response.json()) as NodeRoles;
+  } catch {
+    throw new Error("服务端返回的数据格式无效");
+  }
+}
+
+/** 整体替换该节点的角色配置，服务端转给节点写入本机；Key 只经这一次转手，不落库。 */
+export async function saveNodeRoles(nodeId: string, roles: RoleInput[], token: string, userToken: string): Promise<void> {
+  await post(rolesPath(nodeId), { roles }, token, userHeaders(userToken));
+}
+
+/** 节点还没有任何角色时，用服务端模板（config/models.json）初始化，不带 Key。 */
+export async function initNodeRoles(nodeId: string, token: string, userToken: string): Promise<void> {
+  await post(`${rolesPath(nodeId)}/init-template`, {}, token, userHeaders(userToken));
+}
+
+/** 让节点真调一次模型，检测这个角色能不能用；结果通过 fetchNodeRoles 轮询得到。 */
+export async function checkNodeRole(nodeId: string, roleId: string, token: string, userToken: string): Promise<void> {
+  await post(`${rolesPath(nodeId)}/${encodeURIComponent(roleId)}/check`, {}, token, userHeaders(userToken));
 }

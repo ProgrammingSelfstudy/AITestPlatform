@@ -256,7 +256,7 @@ fn command(opts: &ClaudeOpts) -> Command {
 }
 
 /// 判定前在与模型调用相同的环境下确认本机 Claude 会员登录。
-pub(crate) async fn check_login(opts: &ClaudeOpts) -> Result<(), &'static str> {
+pub async fn check_login(opts: &ClaudeOpts) -> Result<(), &'static str> {
     let out = tokio::time::timeout(
         Duration::from_secs(15),
         command(opts)
@@ -293,7 +293,7 @@ pub async fn run(opts: &ClaudeOpts, prompt: &str) -> Outcome {
 }
 
 /// 纯文本角色隔离外部工具及当前进程的应用凭证，保留本机登录和运行环境。
-pub(crate) async fn run_text_only(opts: &ClaudeOpts, prompt: &str) -> Outcome {
+pub async fn run_text_only(opts: &ClaudeOpts, prompt: &str) -> Outcome {
     run_inner(opts, prompt, true).await
 }
 

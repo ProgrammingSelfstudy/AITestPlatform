@@ -78,6 +78,8 @@ struct Inner {
     /// 每个节点当前有效的连接（连接 id + 发件箱）。同一节点重连时，旧连接的收尾不能把新连接标成离线。
     /// 只在本进程内有效（单实例）；多实例部署时要换成共享的租约。
     conns: Mutex<HashMap<Uuid, Conn>>,
+    /// 各节点最近上报的角色摘要（不含 Key）。只在内存里：节点重连会重新上报，不落库。
+    roles: std::sync::Mutex<HashMap<Uuid, protocol::RolesReport>>,
 }
 
 #[derive(Clone)]
@@ -136,6 +138,7 @@ impl AppState {
             accounts,
             review_auth: reviews::ReviewAuth::from_env(),
             conns: Mutex::new(HashMap::new()),
+            roles: Default::default(),
         })))
     }
 
@@ -267,6 +270,22 @@ impl AppState {
         Ok(())
     }
 
+    /// 节点最近一次上报的角色摘要；从没上报过（旧版节点）返回 `None`。
+    pub fn roles_report(&self, node_id: Uuid) -> Option<protocol::RolesReport> {
+        self.0.roles.lock().unwrap().get(&node_id).cloned()
+    }
+
+    /// 仅测试：直接放一份节点的角色摘要（真实情况由节点经 WebSocket 上报）。
+    #[cfg(test)]
+    pub(crate) fn set_roles_report_for_test(&self, node_id: Uuid, report: protocol::RolesReport) {
+        self.0.roles.lock().unwrap().insert(node_id, report);
+    }
+
+    /// 节点是否有有效连接。
+    pub async fn node_connected(&self, node_id: Uuid) -> bool {
+        self.0.conns.lock().await.contains_key(&node_id)
+    }
+
     /// 给节点发一条消息；节点不在线（没有有效连接）返回 `false`。
     pub async fn send_to(&self, node_id: Uuid, msg: ServerMsg) -> bool {
         match self.0.conns.lock().await.get(&node_id) {
@@ -385,6 +404,10 @@ impl AppState {
             }
             NodeMsg::NeedHuman(n) => {
                 tracing::warn!(%node_id, run_id = %n.run_id, kind = ?n.kind, "run 需要人工：{}", n.reason);
+                Ok(())
+            }
+            NodeMsg::RolesReport(report) => {
+                self.0.roles.lock().unwrap().insert(node_id, report);
                 Ok(())
             }
             NodeMsg::Ack { .. } | NodeMsg::Frame(_) | NodeMsg::Log(_) => Ok(()),
@@ -765,6 +788,7 @@ mod credential_auth_tests {
             accounts: None,
             review_auth: reviews::ReviewAuth::new(None),
             conns: Mutex::new(HashMap::new()),
+            roles: Default::default(),
         }));
         let lease = Uuid::new_v4().to_string();
         for (authorization, status) in [
