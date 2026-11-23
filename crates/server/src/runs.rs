@@ -96,6 +96,8 @@ fn src_str(s: ModelSource) -> &'static str {
     match s {
         ModelSource::ClaudeCli => "claude_cli",
         ModelSource::CodexExec => "codex_exec",
+        ModelSource::Agy => "agy",
+        ModelSource::DeepSeek => "deepseek",
     }
 }
 

@@ -13,7 +13,7 @@ use std::time::Duration;
 use agent::claude_cli::ClaudeOpts;
 use agent::codex_exec::command::DeviceMcp;
 use agent::codex_exec::{run_executor, CodexOpts};
-use agent::judge::run_judge;
+use agent::judge::{run_judge, run_judge_agy};
 use agent::prompts::{build_task_prompt, device_hints, AppKnowledge, DEVICE_TOOLS, SYSTEM_PROMPT};
 use protocol::{BlockedReason, FinalResult, JudgeStatus, LeaseCredentials, ModelSource, RunAssign, Verdict};
 use serde_json::json;
@@ -284,16 +284,26 @@ impl RealExecutor {
         rep.executor_done(verdict, reason.clone(), cost);
 
         // 3. 判定员按角色配置复核本次轨迹。
-        if a.judge.source != ModelSource::ClaudeCli || self.0.evidence_bin.as_os_str().is_empty() {
+        let judge_source = a.judge.source;
+        if !matches!(judge_source, ModelSource::ClaudeCli | ModelSource::Agy) || self.0.evidence_bin.as_os_str().is_empty() {
+            if !matches!(judge_source, ModelSource::ClaudeCli | ModelSource::Agy) {
+                rep.log("warn", format!("判定员来源 {judge_source:?} 还没有实现，本次不判定，转待人工确认"));
+            }
             return rep.judge_done(JudgeStatus::NotRun, FinalResult::Uncertain, vec![]);
         }
-        let opts = ClaudeOpts {
-            model: a.judge.model.clone(),
-            effort: a.judge.effort.clone(),
-            cwd: Some(run_dir.to_path_buf()),
-            ..judge_opts
+        let mut outcome = if judge_source == ModelSource::Agy {
+            // agy 的模型名里已带推理强度，不再单独传 effort
+            let opts = agent::agy_cli::AgyOpts { model: a.judge.model.clone(), ..Default::default() };
+            run_judge_agy(&opts, &a.case, result, &reason, run_dir, &self.0.evidence_bin).await
+        } else {
+            let opts = ClaudeOpts {
+                model: a.judge.model.clone(),
+                effort: a.judge.effort.clone(),
+                cwd: Some(run_dir.to_path_buf()),
+                ..judge_opts
+            };
+            run_judge(&opts, &a.case, result, &reason, run_dir, &self.0.evidence_bin).await
         };
-        let mut outcome = run_judge(&opts, &a.case, result, &reason, run_dir, &self.0.evidence_bin).await;
         for item in &mut outcome.items {
             let cited = item.file_refs.len();
             // Judge 已核验步骤文字的引用，节点通过步骤消息上报这些步骤。
@@ -311,7 +321,7 @@ impl RealExecutor {
         }
         rep.judge_done(outcome.status, outcome.final_result, outcome.items);
         if outcome.quota_exhausted {
-            rep.quota_exhausted(ModelSource::ClaudeCli);
+            rep.quota_exhausted(judge_source);
         }
     }
 }

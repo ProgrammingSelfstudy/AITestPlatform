@@ -89,7 +89,7 @@ pub fn parse<B: DeserializeOwned>(text: &str) -> Result<Parsed<B>, serde_json::E
 
 // ---------------------------------------------------------------- 公共类型
 
-/// 模型来源。只有本机会员两种，**没有 API Key 来源**。
+/// 模型来源。除 `DeepSeek` 外都是本机会员登录，**只有 DeepSeek 允许 API Key**（规则 1）。
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ModelSource {
@@ -97,6 +97,10 @@ pub enum ModelSource {
     ClaudeCli,
     /// `codex exec`（本机 ChatGPT 登录）
     CodexExec,
+    /// `agy` 命令行（本机 Gemini 个人账号登录）
+    Agy,
+    /// DeepSeek API（唯一允许 API Key 的来源，Key 只在发起人自己的节点本机）
+    DeepSeek,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

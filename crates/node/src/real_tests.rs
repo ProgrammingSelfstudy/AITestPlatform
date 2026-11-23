@@ -301,6 +301,17 @@ async fn 未配置证据服务或来源不匹配时节点不运行判定() {
 }
 
 #[tokio::test]
+async fn 判定员来源还没实现时如实记录并转待人工确认() {
+    let mut f = Fixture::new();
+    f.assign.judge.source = ModelSource::DeepSeek;
+    let messages = f.messages("exit 91", "mcp-evidence".into()).await;
+    let j = f.judge_done(&messages);
+    assert_eq!((j.judge_status, j.final_result), (JudgeStatus::NotRun, FinalResult::Uncertain));
+    assert!(messages.iter().any(|m| matches!(m, NodeMsg::Log(l) if l.msg.contains("还没有实现"))));
+    assert!(!f.dir.join("claude.sh.prompt").exists());
+}
+
+#[tokio::test]
 async fn 判定额度耗尽时保留待确认并上报会员额度() {
     let f = Fixture::new();
     let msgs = f
