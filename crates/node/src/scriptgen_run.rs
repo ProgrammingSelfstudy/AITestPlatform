@@ -62,7 +62,7 @@ fn url(cfg: &GenConfig, path: &str) -> anyhow::Result<Url> {
 }
 
 /// 读本节点本地的轨迹。没有就报错：只能在执行这次 run 的节点上生成。
-fn read_trace(runs_dir: &Path, run_id: Uuid) -> anyhow::Result<ScriptTrace> {
+pub(crate) fn read_trace(runs_dir: &Path, run_id: Uuid) -> anyhow::Result<ScriptTrace> {
     let path = runs_dir.join(run_id.to_string()).join("trace.json");
     let bytes = std::fs::read(&path).map_err(|e| anyhow::anyhow!("本节点没有这次执行的轨迹文件（{}）：{e}。脚本只能在执行它的节点上生成", path.display()))?;
     serde_json::from_slice(&bytes).with_context(|| format!("轨迹文件格式不对：{}", path.display()))

@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::claude_cli::{self, ClaudeOpts, Failure};
-use crate::prompts::{SCRIPTGEN_SYSTEM, render};
+use crate::prompts::{SCRIPTGEN_SYSTEM, SCRIPTHEAL_SYSTEM, render};
 use crate::scriptcheck::{self, UiContract, Violation, contains_sensitive, redact_sensitive};
 
 pub const ROLE: &str = "scriptgen";
@@ -338,7 +338,7 @@ fn deserialize_files<'de, D: Deserializer<'de>>(
     decoder.deserialize_map(FileMap)
 }
 
-fn parse(text: &str) -> Option<Payload> {
+fn parse<T: serde::de::DeserializeOwned>(text: &str) -> Option<T> {
     if let Ok(payload) = serde_json::from_str(text) {
         return Some(payload);
     }
@@ -372,7 +372,7 @@ fn validate_payload(
     input: &ScriptgenInput<'_>,
 ) -> Result<(BTreeMap<String, String>, String), Vec<Violation>> {
     let output_error = |message| vec![Violation::new("输出", 1, 0, message)];
-    let payload =
+    let payload: Payload =
         parse(text).ok_or_else(|| output_error("未找到唯一且完整的 files/notes JSON 对象"))?;
     if payload.files.len() > MAX_FILES {
         return Err(output_error("文件数量超过 6 个"));
@@ -490,6 +490,156 @@ pub async fn generate(
                 prompt.push_str("\n\n### 上一轮的静态违规，请修正后重新输出完整 JSON\n");
                 prompt.push_str(&feedback);
                 repair = true;
+            }
+        }
+    }
+}
+
+
+// ───── 自愈 ─────
+
+/// 自愈要用的现场材料：当前脚本、回归失败的原始输出、失败那一刻页面上的控件文字。
+pub struct HealContext<'a> {
+    pub files: &'a BTreeMap<String, String>,
+    pub failure: &'a str,
+    pub elements: &'a str,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HealVerdict {
+    /// 定位失效：产出修复候选
+    LocatorBroken,
+    /// 业务行为错误：脚本是对的，失败是对的
+    BusinessBug,
+    /// 分不清或没能修好：交人工
+    Unsure,
+}
+
+impl HealVerdict {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::LocatorBroken => "locator_broken",
+            Self::BusinessBug => "business_bug",
+            Self::Unsure => "unsure",
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct HealResult {
+    pub verdict: HealVerdict,
+    pub reason: String,
+    /// 只有 `LocatorBroken` 才有，且已通过全部静态校验和「不放宽断言」检查
+    pub fix: Option<GeneratedScripts>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HealPayload {
+    verdict: String,
+    reason: String,
+    #[serde(default, deserialize_with = "deserialize_files")]
+    files: Vec<(String, String)>,
+    #[serde(default)]
+    notes: String,
+}
+
+/// 脚本里语句级 `assert` 的数量（含 `assert x` 和 `assert(x)`）。启发式：不解析 Python，只数行首。
+/// 用来拦「修复时顺手删断言或把断言放宽到不存在」，不是断言语义检查。
+pub fn assert_count(files: &BTreeMap<String, String>) -> usize {
+    files
+        .values()
+        .flat_map(|source| source.lines())
+        .filter(|line| {
+            let line = line.trim_start();
+            line.strip_prefix("assert").is_some_and(|rest| rest.starts_with([' ', '(']))
+        })
+        .count()
+}
+
+/// 自愈只允许改定位：断言不能比原脚本少，内容也不能和原脚本一样（一样就是没修）。
+fn weaker_or_same(original: &BTreeMap<String, String>, healed: &BTreeMap<String, String>) -> Option<Violation> {
+    if healed == original {
+        return Some(Violation::new("输出", 1, 0, "修复后的脚本和原脚本完全相同，没有实际修改"));
+    }
+    let (before, after) = (assert_count(original), assert_count(healed));
+    (after < before).then(|| Violation::new("输出", 1, 0, &format!("修复后的断言（{after} 条）比原脚本（{before} 条）少：自愈只能改定位，不能删或放宽断言")))
+}
+
+/// 分诊并在确定是「定位失效」时给出修复。
+///
+/// 模型的结论不是最终的：「定位失效」必须带通过静态校验、且没有放宽断言的修复文件，
+/// 否则降为「分不清」交人工；其余结论一律不产出文件。额度用完返回 `QuotaExhausted`，不改用其他计费方式。
+/// `input` 沿用生成的输入（原始通过执行的用例、轨迹、Judge 证据），所以同样要求来源执行 Judge 整体通过。
+pub async fn heal(opts: &ScriptgenOpts, input: ScriptgenInput<'_>, heal: &HealContext<'_>) -> Result<HealResult, ScriptgenError> {
+    if opts.role.source != ModelSource::ClaudeCli {
+        return Err(ScriptgenError::Input("自愈角色必须使用 Claude 会员命令行"));
+    }
+    let prepared = prepare(&input)?;
+    let mut material = json!({"heal": {"script_files": heal.files, "failure": heal.failure, "elements": heal.elements}});
+    redact_prompt(&mut material, &prepared.redactions);
+    let claude = ClaudeOpts {
+        model: opts.role.model.clone(),
+        effort: opts.role.effort.clone(),
+        system_prompt: Some(SCRIPTHEAL_SYSTEM.into()),
+        mcp_config: None,
+        tools: vec![],
+        allowed_tools: vec![],
+        ..opts.claude.clone()
+    };
+    let mut prompt = format!("{}\n\n### 自愈输入\n{material:#}", prepared.prompt);
+    let mut repaired = false;
+    loop {
+        let response = claude_cli::run_text_only(&claude, &prompt).await;
+        if response.rate_limit.is_some_and(|limit| !limit.status.starts_with("allowed")) {
+            return Err(ScriptgenError::QuotaExhausted);
+        }
+        if let Some(failure) = response.failure {
+            return Err(model_failure(failure));
+        }
+        let unsure = |reason: String| Ok(HealResult { verdict: HealVerdict::Unsure, reason, fix: None });
+        let Some(payload) = parse::<HealPayload>(&response.text) else {
+            if repaired {
+                return unsure("模型没有给出可解析的分诊结论，交人工判断".into());
+            }
+            prompt.push_str("\n\n### 上一轮输出无法解析，请只输出一个完整的 JSON 对象");
+            repaired = true;
+            continue;
+        };
+        let reason = payload.reason.trim().to_string();
+        if reason.is_empty() || contains_sensitive(&reason, &prepared.redactions) {
+            return unsure("模型给出的分诊原因为空或含敏感值，交人工判断".into());
+        }
+        match payload.verdict.as_str() {
+            "business_bug" => return Ok(HealResult { verdict: HealVerdict::BusinessBug, reason, fix: None }),
+            "unsure" => return unsure(reason),
+            "locator_broken" => {}
+            _ => return unsure("模型给出的结论不在三种之内，交人工判断".into()),
+        }
+        // 定位失效：修复文件必须过全部校验。复用生成的校验：先拼回 files/notes 再验。
+        let text = serde_json::to_string(&json!({"files": payload.files.iter().cloned().collect::<BTreeMap<_, _>>(), "notes": payload.notes})).expect("可序列化");
+        let checked = validate_payload(&text, &prepared, &input).and_then(|(files, notes)| match weaker_or_same(heal.files, &files) {
+            Some(violation) => Err(vec![violation]),
+            None => Ok((files, notes)),
+        });
+        match checked {
+            Ok((files, notes)) => {
+                let sha256 = files
+                    .iter()
+                    .map(|(name, source)| (name.clone(), Sha256::digest(source.as_bytes()).iter().map(|byte| format!("{byte:02x}")).collect()))
+                    .collect();
+                let fix = GeneratedScripts { files, notes, sha256, model: response.model.or_else(|| opts.role.model.clone()), effort: opts.role.effort.clone() };
+                return Ok(HealResult { verdict: HealVerdict::LocatorBroken, reason, fix: Some(fix) });
+            }
+            Err(violations) if repaired => {
+                let shown: Vec<String> = violations.iter().take(5).map(|v| format!("{} 第 {} 行 规则 {}：{}", v.file, v.line, v.rule, v.message)).collect();
+                return unsure(format!("模型认为是定位失效，但给出的修复没有通过校验，没有采用：{}。原判断：{reason}", shown.join("；")));
+            }
+            Err(violations) => {
+                let feedback = serde_json::to_string_pretty(&violations).expect("违规列表可序列化");
+                prompt.push_str("\n\n### 上一轮的修复没有通过校验，请修正后重新输出完整 JSON（仍可改判 unsure）\n");
+                prompt.push_str(&feedback);
+                repaired = true;
             }
         }
     }

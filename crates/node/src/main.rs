@@ -111,6 +111,46 @@ async fn self_check(args: &[String]) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `node heal <脚本编号> [--serial <设备序列号>] [--app-info <app_info.yaml>]`：已获准脚本回归失败后做自愈分诊。
+/// 会花发起人的 Claude 会员额度，也会占用这台手机重跑一遍脚本取新证据，所以显式触发。
+async fn heal(args: &[String]) -> anyhow::Result<()> {
+    const USAGE: &str = "用法：node heal <脚本编号> [--serial <设备序列号>] [--app-info <app_info.yaml>]";
+    let (script, mut rest) = args.split_first().context(USAGE)?;
+    let script_id: uuid::Uuid = script.parse().context("脚本编号必须是 UUID")?;
+    let (mut serial, mut ui_map) = (None, serde_json::Value::Null);
+    while let [flag, value, tail @ ..] = rest {
+        match flag.as_str() {
+            "--serial" => serial = Some(value.clone()),
+            "--app-info" => {
+                let text = std::fs::read_to_string(value).with_context(|| format!("无法读取应用知识 {value}"))?;
+                let yaml: serde_json::Value = serde_yaml_ng::from_str(&text).context("应用知识不是有效的 YAML")?;
+                ui_map = yaml.get("ui_map").cloned().unwrap_or(serde_json::Value::Null);
+            }
+            _ => bail!("{USAGE}"),
+        }
+        rest = tail;
+    }
+    if !rest.is_empty() {
+        bail!("{USAGE}");
+    }
+    let cfg = node::heal_run::HealConfig {
+        check: check_config(serial)?,
+        runs_dir: std::env::var("HAFA_RUNS_DIR").unwrap_or_else(|_| "data/runs".into()).into(),
+        claude: agent::claude_cli::ClaudeOpts::default(),
+        ui_map,
+    };
+    println!("开始自愈分诊脚本 {script_id}：会在设备 {} 上重跑一遍取新证据，并调用 Claude 会员命令行", cfg.check.serial);
+    let report = node::heal_run::heal_script(&cfg, script_id).await?;
+    match (report.verdict, report.healed) {
+        (agent::scriptgen::HealVerdict::LocatorBroken, Some((id, version))) => {
+            println!("定位失效：已归档修复候选版本 {version}（脚本 {id}）。原获准版本没有动；候选要自检通过、再由人获准（先下线旧版本）才会被回归使用。\n依据：{}", report.reason);
+        }
+        (agent::scriptgen::HealVerdict::BusinessBug, _) => println!("业务行为错误：脚本没有改，失败的回归记录保留，请按缺陷处理。\n依据：{}", report.reason),
+        _ => println!("分不清，交人工判断：脚本没有改，失败的回归记录保留。\n原因：{}", report.reason),
+    }
+    Ok(())
+}
+
 /// `node regress <用例编号> [--project <项目>] [--serial <设备序列号>]`：用该用例当前已获准的脚本版本在本节点真机上回归，
 /// 结果记到平台。失败是回归的结论，如实记录，不改脚本状态。会占用这台手机。
 async fn regress(args: &[String]) -> anyhow::Result<()> {
@@ -152,6 +192,9 @@ async fn main() -> anyhow::Result<()> {
     }
     if args.first().map(String::as_str) == Some("self-check") {
         return self_check(&args[1..]).await;
+    }
+    if args.first().map(String::as_str) == Some("heal") {
+        return heal(&args[1..]).await;
     }
     if args.first().map(String::as_str) == Some("regress") {
         return regress(&args[1..]).await;

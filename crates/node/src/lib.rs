@@ -7,6 +7,7 @@ pub mod real;
 mod recorder;
 pub mod runner;
 pub mod scriptgen_run;
+pub mod heal_run;
 pub mod regress_poll;
 pub mod regress_run;
 pub mod selfcheck_run;

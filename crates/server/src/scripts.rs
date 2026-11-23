@@ -124,6 +124,8 @@ pub struct ScriptRecord {
     pub notes: String,
     pub status: ScriptStatus,
     pub status_note: Option<String>,
+    /// 自愈产出的候选：它是从哪个版本修来的；普通生成的版本为空
+    pub healed_from: Option<Uuid>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -133,7 +135,7 @@ macro_rules! columns {
     () => {
         "id, case_id, version, case_version, source_run_id, \
          (select coalesce(array_agg(k order by k), '{}') from jsonb_object_keys(files) k) as file_names, \
-         content_sha256, gen_source, gen_model, gen_effort, notes, status, status_note, created_at, updated_at"
+         content_sha256, gen_source, gen_model, gen_effort, notes, status, status_note, healed_from, created_at, updated_at"
     };
 }
 
@@ -153,6 +155,7 @@ fn record(row: &PgRow) -> Result<ScriptRecord, sqlx::Error> {
         notes: row.try_get("notes")?,
         status: ScriptStatus::parse(&status).ok_or_else(|| sqlx::Error::Decode(format!("未知的脚本状态：{status}").into()))?,
         status_note: row.try_get("status_note")?,
+        healed_from: row.try_get("healed_from")?,
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
     })
@@ -220,8 +223,15 @@ fn check_files(case_code: &str, files: &BTreeMap<String, String>) -> Result<(), 
 /// 归档一个候选脚本。整个过程在一个事务里，先锁住用例行，所以并发归档同一用例时版本号不会重复。
 pub async fn create_candidate(pool: &PgPool, new: &NewScript) -> Result<ScriptRecord, ScriptError> {
     let mut tx = pool.begin().await?;
+    let created = create_in_tx(&mut tx, new, None).await?;
+    tx.commit().await?;
+    Ok(created)
+}
 
-    let case = sqlx::query("select code, version from test_cases where id = $1 for update").bind(new.case_id).fetch_optional(&mut *tx).await?;
+/// 在调用方的事务里归档候选（自愈分诊要把「归档修复候选」和「记分诊结论」放进同一个事务）。`healed_from` 记它是从哪个版本修来的。
+pub(crate) async fn create_in_tx(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>, new: &NewScript, healed_from: Option<Uuid>) -> Result<ScriptRecord, ScriptError> {
+
+    let case = sqlx::query("select code, version from test_cases where id = $1 for update").bind(new.case_id).fetch_optional(&mut **tx).await?;
     let Some(case) = case else { return Err(ScriptError::CaseNotFound) };
     let code: String = case.try_get("code")?;
     let case_version: i32 = case.try_get("version")?;
@@ -236,7 +246,7 @@ pub async fn create_candidate(pool: &PgPool, new: &NewScript) -> Result<ScriptRe
     // 来源执行：同一用例、用例版本没变、Judge 已完成且整体通过、每条预期都有通过项。
     let run = sqlx::query("select case_id, case_version, final_result, judge_status, case_spec -> 'expected' as expected from runs where id = $1")
         .bind(new.source_run_id)
-        .fetch_optional(&mut *tx)
+        .fetch_optional(&mut **tx)
         .await?;
     let Some(run) = run else { return Err(ScriptError::SourceRun("执行记录不存在".into())) };
     if run.try_get::<Uuid, _>("case_id")? != new.case_id {
@@ -257,20 +267,20 @@ pub async fn create_candidate(pool: &PgPool, new: &NewScript) -> Result<ScriptRe
     if expected_idx.is_empty() {
         return Err(ScriptError::SourceRun("这次执行没有预期条目".into()));
     }
-    let passed: Vec<i32> = sqlx::query_scalar("select idx from judge_items where run_id = $1 and verdict = 'passed'").bind(new.source_run_id).fetch_all(&mut *tx).await?;
+    let passed: Vec<i32> = sqlx::query_scalar("select idx from judge_items where run_id = $1 and verdict = 'passed'").bind(new.source_run_id).fetch_all(&mut **tx).await?;
     if let Some(missing) = expected_idx.iter().find(|idx| !passed.iter().any(|p| i64::from(*p) == **idx)) {
         return Err(ScriptError::SourceRun(format!("预期 {missing} 没有通过项，不能据此生成脚本")));
     }
 
     let digest = content_digest(&new.files);
-    if let Some(dup) = sqlx::query("select id, version from scripts where case_id = $1 and content_sha256 = $2").bind(new.case_id).bind(&digest).fetch_optional(&mut *tx).await? {
+    if let Some(dup) = sqlx::query("select id, version from scripts where case_id = $1 and content_sha256 = $2").bind(new.case_id).bind(&digest).fetch_optional(&mut **tx).await? {
         return Err(ScriptError::Duplicate { id: dup.try_get("id")?, version: dup.try_get("version")? });
     }
-    let version: i32 = sqlx::query_scalar("select coalesce(max(version), 0) + 1 from scripts where case_id = $1").bind(new.case_id).fetch_one(&mut *tx).await?;
+    let version: i32 = sqlx::query_scalar("select coalesce(max(version), 0) + 1 from scripts where case_id = $1").bind(new.case_id).fetch_one(&mut **tx).await?;
 
     let row = sqlx::query(concat!(
-        "insert into scripts (case_id, version, case_version, source_run_id, files, content_sha256, gen_source, gen_model, gen_effort, notes) \
-         values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) returning ",
+        "insert into scripts (case_id, version, case_version, source_run_id, files, content_sha256, gen_source, gen_model, gen_effort, notes, healed_from) \
+         values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) returning ",
         columns!()
     ))
         .bind(new.case_id)
@@ -283,10 +293,10 @@ pub async fn create_candidate(pool: &PgPool, new: &NewScript) -> Result<ScriptRe
         .bind(&new.gen_model)
         .bind(&new.gen_effort)
         .bind(&new.notes)
-        .fetch_one(&mut *tx)
+        .bind(healed_from)
+        .fetch_one(&mut **tx)
         .await?;
     let created = record(&row)?;
-    tx.commit().await?;
     Ok(created)
 }
 
@@ -360,6 +370,7 @@ pub async fn list_by_case(pool: &PgPool, case_id: Uuid) -> Result<Vec<ScriptReco
 /// 一次回归的结果。
 #[derive(Debug, Clone, Serialize)]
 pub struct Regression {
+    pub id: Uuid,
     pub passed: bool,
     pub serial: String,
     pub detail: String,
@@ -402,14 +413,14 @@ pub async fn record_regression(pool: &PgPool, script_id: Uuid, node_id: Uuid, se
 /// 每个脚本最近一次回归，按脚本编号。
 pub async fn latest_regressions(pool: &PgPool, script_ids: &[Uuid]) -> Result<std::collections::HashMap<Uuid, Regression>, sqlx::Error> {
     let rows = sqlx::query(
-        "select distinct on (script_id) script_id, passed, serial, detail, duration_ms, created_at
+        "select distinct on (script_id) script_id, id, passed, serial, detail, duration_ms, created_at
          from script_regressions where script_id = any($1) order by script_id, created_at desc",
     )
     .bind(script_ids)
     .fetch_all(pool)
     .await?;
     rows.iter()
-        .map(|row| Ok((row.try_get("script_id")?, Regression { passed: row.try_get("passed")?, serial: row.try_get("serial")?, detail: row.try_get("detail")?, duration_ms: row.try_get("duration_ms")?, created_at: row.try_get("created_at")? })))
+        .map(|row| Ok((row.try_get("script_id")?, Regression { id: row.try_get("id")?, passed: row.try_get("passed")?, serial: row.try_get("serial")?, detail: row.try_get("detail")?, duration_ms: row.try_get("duration_ms")?, created_at: row.try_get("created_at")? })))
         .collect()
 }
 

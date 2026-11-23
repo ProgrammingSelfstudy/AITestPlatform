@@ -86,6 +86,8 @@ pub(crate) fn routes(app: AppState, paths: Paths) -> Router {
         .route("/api/regression-requests/{id}/result", put(crate::scripts_api::finish_request))
         .route("/api/node/regression-requests/claim", put(crate::scripts_api::claim_request))
         .route("/api/node/regression-requests/abandon", put(crate::scripts_api::abandon_requests))
+        .route("/api/scripts/{id}/heal-source", get(crate::scripts_api::heal_source))
+        .route("/api/scripts/{id}/triage", put(crate::scripts_api::submit_triage))
         .route("/api/scripts/{id}/files", get(crate::scripts_api::files))
         .route("/api/scripts/{id}/self-check", put(crate::scripts_api::self_check))
         .route("/api/scripts/{id}/approve", post(crate::scripts_api::approve).route_layer(authorize_write.clone()))

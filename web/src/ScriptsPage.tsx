@@ -1,7 +1,7 @@
 import { Button, Empty, Input, Modal, Select, Skeleton, Space, Table, Typography } from "antd";
 import type { ColumnsType } from "antd/es/table";
 import { useCallback, useState } from "react";
-import { cancelRegression, decideScript, fetchNodes, fetchScripts, requestRegression, type RegressionRequest, type ScriptRow, type ScriptStatus } from "./api";
+import { cancelRegression, decideScript, fetchNodes, fetchScripts, requestRegression, type RegressionRequest, type ScriptRow, type ScriptStatus, type Triage } from "./api";
 import { readReviewToken, rememberReviewToken, writeTokenAction } from "./reviewLogic";
 import ReviewTokenDialog from "./ReviewTokenDialog";
 import { formatDate, LoadError, Pill, type PillKind } from "./runUi";
@@ -43,6 +43,13 @@ const REQUEST: Record<RegressionRequest["status"], { kind: PillKind; text: strin
   finished: { kind: "info", text: "已完成" },
   failed: { kind: "blocked", text: "没得到结论" },
   cancelled: { kind: "cancelled", text: "已取消" },
+};
+
+// 自愈分诊的结论。「定位失效」只产出候选，不代表已经修好；「业务行为错误」说明失败是对的
+const TRIAGE: Record<Triage["verdict"], { kind: PillKind; text: (t: Triage) => string }> = {
+  locator_broken: { kind: "info", text: (t) => `定位失效，已产出修复候选 v${t.healed_version ?? "?"}` },
+  business_bug: { kind: "failed", text: () => "疑似产品缺陷，待人处理" },
+  unsure: { kind: "uncertain", text: () => "分不清，待人判断" },
 };
 
 const MODEL = { claude_cli: "Claude 命令行", codex_exec: "Codex" } as const;
@@ -174,7 +181,18 @@ export default function ScriptsPage() {
         </div>
       ),
     },
-    { title: "版本", dataIndex: "version", width: 72, render: (v: number) => <span className="mono">v{v}</span> },
+    {
+      title: "版本", dataIndex: "version", width: 100,
+      render: (v: number, row) => {
+        const parent = row.healed_from ? data?.find((s) => s.id === row.healed_from) : undefined;
+        return (
+          <span className="device-model-cell">
+            <span className="mono">v{v}</span>
+            {row.healed_from && <span className="device-model-sub" title="自愈产出的候选，要重新自检、人工获准">修自 v{parent?.version ?? "?"}</span>}
+          </span>
+        );
+      },
+    },
     {
       title: "状态", dataIndex: "status", width: 170,
       render: (status: ScriptStatus) => <Pill kind={STATUS[status].kind}>{STATUS[status].text}</Pill>,
@@ -208,6 +226,9 @@ export default function ScriptsPage() {
             {!active && r && <span className="device-model-sub mono">{formatDate(r.created_at)} · {r.serial}</span>}
             {!active && !r && !failedRequest && (row.status === "approved" ? <span className="device-model-sub">还没回归过</span> : "—")}
             {failedRequest && <span className="device-model-sub wrap-text">{q.detail}</span>}
+            {!active && r && !r.passed && row.last_triage?.regression_id === r.id && (
+              <Pill kind={TRIAGE[row.last_triage.verdict].kind} title={row.last_triage.reason}>{TRIAGE[row.last_triage.verdict].text(row.last_triage)}</Pill>
+            )}
           </span>
         );
       },
@@ -241,9 +262,10 @@ export default function ScriptsPage() {
           <Typography.Title level={3}>回归脚本</Typography.Title>
           <p className="page-desc">
             通过的执行会生成脚本版本：候选 → 在真机上自检 → 人工获准。只有「已获准」的版本才能被平台选来回归，
-            同一用例同时只有一个获准版本。生成和自检在执行节点上用命令行进行（node gen-script / self-check），这里显示结果并做获准、下线和拒绝的决定。
+            同一用例同时只有一个获准版本。生成、自检和自愈在执行节点上用命令行进行（node gen-script / self-check / heal），这里显示结果并做获准、下线和拒绝的决定。
             已获准的版本可以在自己的节点上点「回归」：不花模型额度，但会占用那台节点的手机；请求排队后由节点自己领取，手机忙着跑任务时会继续排队。
-            回归失败是结论，不会改脚本状态：可能是产品退化，也可能是脚本随界面改版失效，需要人判断。
+            回归失败是结论，不会改脚本状态：可能是产品退化，也可能是脚本随界面改版失效，需要人判断；
+            可以在节点上用 node heal 做自愈分诊：只有确定是控件定位失效才产出修复候选（仍要自检、人工获准，先下线旧版本），业务行为错误保留失败，分不清交人工。
           </p>
         </div>
       </div>
@@ -272,6 +294,12 @@ export default function ScriptsPage() {
                     <div>
                       <strong>最近一次回归（{row.last_regression.passed ? "通过" : "失败，可能是产品退化，也可能是脚本随界面改版失效，需要人判断"}，用时 {(row.last_regression.duration_ms / 1000).toFixed(0)} 秒）：</strong>
                       <pre className="script-note">{row.last_regression.detail}</pre>
+                    </div>
+                  )}
+                  {row.last_triage && (
+                    <div>
+                      <strong>自愈分诊（{TRIAGE[row.last_triage.verdict].text(row.last_triage)}，针对{row.last_triage.regression_id === row.last_regression?.id ? "最近一次" : "更早的一次"}失败）：</strong>
+                      <pre className="script-note">{row.last_triage.reason}</pre>
                     </div>
                   )}
                   {row.status_note && (

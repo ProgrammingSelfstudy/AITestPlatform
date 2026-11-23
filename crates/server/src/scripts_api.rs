@@ -18,6 +18,7 @@ use uuid::Uuid;
 use crate::api::ApiState;
 use crate::regress_requests::{self, RequestError};
 use crate::scripts::{self, NewScript, ScriptError, ScriptRecord};
+use crate::triage::{self, TriageError};
 
 /// 最多 6 个文件、每个 64 KiB，加上摘要和 JSON 开销，512 KiB 足够，超过就是异常请求。
 const MAX_BODY: usize = 512 * 1024;
@@ -287,6 +288,8 @@ pub(crate) struct ProjectScript {
     last_regression: Option<scripts::Regression>,
     /// 最近一次从页面发起的回归请求（排队、运行中、已结束），没有就是 null
     last_request: Option<regress_requests::RequestView>,
+    /// 最近一次自愈分诊，没有就是 null；只有它的 regression_id 等于 last_regression.id 才是针对最近这次失败的
+    last_triage: Option<triage::TriageView>,
 }
 
 /// `GET /api/projects/{project}/scripts`：项目里所有用例的全部脚本版本，只有元数据，不含源码。
@@ -295,7 +298,8 @@ pub(crate) async fn list_project(State(state): State<ApiState>, RoutePath(projec
     let ids: Vec<Uuid> = rows.iter().map(|(_, _, script)| script.id).collect();
     let mut latest = scripts::latest_regressions(state.app.pool(), &ids).await.map_err(|e| internal(&e))?;
     let mut requests = regress_requests::latest(state.app.pool(), &ids).await.map_err(|e| internal(&e))?;
-    Ok(Json(rows.into_iter().map(|(case_code, case_title, script)| ProjectScript { last_regression: latest.remove(&script.id), last_request: requests.remove(&script.id), case_code, case_title, script }).collect()))
+    let mut triages = triage::latest(state.app.pool(), &ids).await.map_err(|e| internal(&e))?;
+    Ok(Json(rows.into_iter().map(|(case_code, case_title, script)| ProjectScript { last_regression: latest.remove(&script.id), last_request: requests.remove(&script.id), last_triage: triages.remove(&script.id), case_code, case_title, script }).collect()))
 }
 
 /// `GET /api/projects/{project}/cases/{code}/approved-script`：节点取某用例当前已获准的脚本版本和源码，去本机回归。
@@ -337,6 +341,75 @@ pub(crate) async fn regression(State(state): State<ApiState>, RoutePath(id): Rou
             tracing::error!("记录回归时出现不该出现的错误：{e}");
             Err(fail(StatusCode::INTERNAL_SERVER_ERROR, "记录失败"))
         }
+    }
+}
+
+/// `GET /api/scripts/{id}/heal-source`：节点取自愈要用的材料。只能取来源于自己节点的脚本（自愈要用本节点的会员额度和本地轨迹）。
+/// 只有已获准的版本才有可分诊的失败；没有失败（最近一次回归通过或没回归过）时 `regression` 为 null。
+pub(crate) async fn heal_source(State(state): State<ApiState>, RoutePath(id): RoutePath<String>, request: Request) -> Result<Json<serde_json::Value>, Failure> {
+    let (script_id, _) = own_script(&state, request.headers(), &id).await?;
+    let row = sqlx::query("select s.status, s.version, s.files, s.source_run_id, c.code from scripts s join test_cases c on c.id = s.case_id where s.id = $1")
+        .bind(script_id)
+        .fetch_one(state.app.pool())
+        .await
+        .map_err(|e| internal(&e))?;
+    let regression = triage::latest_failure(state.app.pool(), script_id).await.map_err(|e| internal(&e))?;
+    Ok(Json(serde_json::json!({
+        "id": script_id,
+        "status": row.try_get::<String, _>("status").map_err(|e| internal(&e))?,
+        "version": row.try_get::<i32, _>("version").map_err(|e| internal(&e))?,
+        "case_code": row.try_get::<String, _>("code").map_err(|e| internal(&e))?,
+        "source_run_id": row.try_get::<Uuid, _>("source_run_id").map_err(|e| internal(&e))?,
+        "files": row.try_get::<serde_json::Value, _>("files").map_err(|e| internal(&e))?,
+        "regression": regression,
+    })))
+}
+
+/// 节点提交的分诊。拒绝未知字段。
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TriageBody {
+    regression_id: Uuid,
+    verdict: String,
+    reason: String,
+    /// 只有 locator_broken 带这些
+    files: Option<BTreeMap<String, String>>,
+    sha256: Option<BTreeMap<String, String>>,
+    #[serde(default)]
+    notes: String,
+    source: Option<String>,
+    model: Option<String>,
+    effort: Option<String>,
+}
+
+/// `PUT /api/scripts/{id}/triage`：节点回报分诊结论。「定位失效」带修复文件，归档成新的候选（记下来源版本）；
+/// 其余结论不改任何脚本。同一次失败只能分诊一次。
+pub(crate) async fn submit_triage(State(state): State<ApiState>, RoutePath(id): RoutePath<String>, request: Request) -> Result<(StatusCode, Json<serde_json::Value>), Failure> {
+    let (script_id, node_id) = own_script(&state, request.headers(), &id).await?;
+    let bytes = to_bytes(request.into_body(), MAX_BODY).await.map_err(|_| fail(StatusCode::PAYLOAD_TOO_LARGE, "请求体太大"))?;
+    let body: TriageBody = serde_json::from_slice(&bytes).map_err(|_| fail(StatusCode::BAD_REQUEST, "请求格式不对"))?;
+    let verdict = triage::Verdict::parse(&body.verdict).ok_or_else(|| fail(StatusCode::UNPROCESSABLE_ENTITY, "分诊结论只能是 locator_broken、business_bug 或 unsure"))?;
+    if body.notes.chars().count() > MAX_NOTES_CHARS {
+        return Err(fail(StatusCode::UNPROCESSABLE_ENTITY, "备注太长"));
+    }
+    let fix = match (body.files, body.sha256) {
+        (None, None) => None,
+        (Some(files), Some(file_sha256)) => {
+            let source = body.source.unwrap_or_default();
+            if !matches!(source.as_str(), "claude_cli" | "codex_exec") {
+                return Err(fail(StatusCode::UNPROCESSABLE_ENTITY, "模型来源只能是 claude_cli 或 codex_exec"));
+            }
+            Some(triage::Fix { files, file_sha256, notes: body.notes, gen_source: source, gen_model: body.model, gen_effort: body.effort })
+        }
+        _ => return Err(fail(StatusCode::UNPROCESSABLE_ENTITY, "修复文件和它的摘要要一起给")),
+    };
+    let submission = triage::Submission { regression_id: body.regression_id, verdict, reason: body.reason, fix };
+    match triage::submit(state.app.pool(), node_id, script_id, submission).await {
+        Ok(healed) => Ok((StatusCode::CREATED, Json(serde_json::json!({"healed": healed})))),
+        Err(e @ (TriageError::Invalid(_) | TriageError::Candidate(_))) => Err((StatusCode::UNPROCESSABLE_ENTITY, e.to_string())),
+        Err(e @ (TriageError::NotApproved(_) | TriageError::NoFailure | TriageError::Stale | TriageError::AlreadyTriaged)) => Err((StatusCode::CONFLICT, e.to_string())),
+        Err(TriageError::NotFound) => Err(fail(StatusCode::NOT_FOUND, "没有这个脚本")),
+        Err(TriageError::Db(e)) => Err(internal(&e)),
     }
 }
 

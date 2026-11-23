@@ -14,6 +14,7 @@ pub mod users;
 pub mod runs;
 pub mod scripts;
 mod scripts_api;
+pub mod triage;
 #[cfg(feature = "test-support")]
 pub mod test_support;
 

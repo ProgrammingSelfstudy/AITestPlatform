@@ -165,10 +165,21 @@ export interface Models {
 export type ScriptStatus = "candidate" | "self_check_passed" | "approved" | "rejected" | "retired";
 
 export interface Regression {
+  id: string;
   passed: boolean;
   serial: string;
   detail: string;
   duration_ms: number;
+  created_at: string;
+}
+
+/** 自愈分诊：locator_broken 定位失效（已产出修复候选）、business_bug 业务行为错误（保留失败）、unsure 分不清（交人工） */
+export interface Triage {
+  regression_id: string;
+  verdict: "locator_broken" | "business_bug" | "unsure";
+  reason: string;
+  healed_script_id: string | null;
+  healed_version: number | null;
   created_at: string;
 }
 
@@ -198,6 +209,9 @@ export interface ScriptRow {
   status_note: string | null;
   last_regression: Regression | null;
   last_request: RegressionRequest | null;
+  last_triage: Triage | null;
+  /** 自愈产出的候选：它是从哪个版本修来的 */
+  healed_from: string | null;
   created_at: string;
   updated_at: string;
 }
