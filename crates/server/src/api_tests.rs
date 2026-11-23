@@ -2218,3 +2218,27 @@ async fn 页面创建名字_要密码_重名拒绝_库里只存哈希() {
     assert_eq!(status, StatusCode::OK);
     assert!(String::from_utf8_lossy(&body).contains("小明"));
 }
+
+#[tokio::test]
+async fn 创建名字时认领节点_只能认领没主人的_认领不成名字也不创建() {
+    let temp = TempPaths::with_config();
+    let state = test_state(config()).await;
+    let app = temp.app(state.clone());
+    let (free, owned) = (Uuid::new_v4(), Uuid::new_v4());
+    let someone: Uuid = sqlx::query_scalar("insert into users (name) values ('别人') returning id").fetch_one(state.pool()).await.unwrap();
+    for (id, owner) in [(free, None), (owned, Some(someone))] {
+        sqlx::query("insert into nodes (id, caps, online, last_seen, secret_hash, owner_user_id) values ($1, '{}', true, now(), 'x', $2)")
+            .bind(id).bind(owner).execute(state.pool()).await.unwrap();
+    }
+    let body = |name: &str, node: Uuid| json!({"name": name, "password": "secret-123", "claim_node": node}).to_string();
+
+    let (status, _, _) = request(&app, Method::POST, "/api/users", &WRITE_HEADERS, body("小明", owned)).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    let n: i64 = sqlx::query_scalar("select count(*) from users where name = '小明'").fetch_one(state.pool()).await.unwrap();
+    assert_eq!(n, 0, "认领不成，名字不能留下");
+
+    let (status, _, _) = request(&app, Method::POST, "/api/users", &WRITE_HEADERS, body("小明", free)).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let owner: String = sqlx::query_scalar("select u.name from nodes n join users u on u.id = n.owner_user_id where n.id = $1").bind(free).fetch_one(state.pool()).await.unwrap();
+    assert_eq!(owner, "小明");
+}

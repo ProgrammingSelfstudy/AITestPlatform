@@ -1,6 +1,6 @@
-import { Button, Input, Modal } from "antd";
-import { useState } from "react";
-import { createUser } from "./api";
+import { Button, Input, Modal, Select } from "antd";
+import { useEffect, useState } from "react";
+import { createUser, fetchNodes, type NodeView } from "./api";
 import { cleanName, formatExpiry, rememberUserName } from "./identity";
 
 const linkStyle = { background: "none", border: "none", padding: 0, color: "var(--accent)", cursor: "pointer", font: "inherit", textDecoration: "underline" } as const;
@@ -15,7 +15,17 @@ export default function IdentityHint({ expiresAt, onForget, onCreated, className
   const [name, setName] = useState("");
   const [password, setPassword] = useState("");
   const [busy, setBusy] = useState(false);
+  const [nodes, setNodes] = useState<NodeView[]>([]);
+  const [claim, setClaim] = useState<string | undefined>();
   const [error, setError] = useState("");
+
+  // 打开弹窗时取在线且没有主人的节点，供认领
+  useEffect(() => {
+    if (!open) return;
+    const ctl = new AbortController();
+    fetchNodes(ctl.signal).then((all) => setNodes(all.filter((n) => n.online && !n.owner))).catch(() => setNodes([]));
+    return () => ctl.abort();
+  }, [open]);
 
   const submit = async () => {
     const clean = cleanName(name);
@@ -24,12 +34,13 @@ export default function IdentityHint({ expiresAt, onForget, onCreated, className
     setBusy(true);
     setError("");
     try {
-      const created = await createUser(clean, password);
+      const created = await createUser(clean, password, claim);
       rememberUserName(created);
       onCreated?.(created);
       setOpen(false);
       setName("");
       setPassword("");
+      setClaim(undefined);
     } catch (e) {
       setError(e instanceof Error ? e.message : "创建失败");
     } finally {
@@ -54,6 +65,13 @@ export default function IdentityHint({ expiresAt, onForget, onCreated, className
             <div style={{ display: "grid", gap: 12 }}>
               <Input placeholder="名字（1 到 40 个字）" value={name} onChange={(e) => setName(e.target.value)} maxLength={40} />
               <Input.Password placeholder="密码（至少 6 个字符）" value={password} onChange={(e) => setPassword(e.target.value)} onPressEnter={submit} autoComplete="new-password" />
+              <Select
+                allowClear
+                placeholder={nodes.length ? "认领一个没有主人的在线节点（可不选）" : "现在没有可认领的节点（节点没设 NODE_USER_NAME 才没有主人）"}
+                value={claim}
+                onChange={setClaim}
+                options={nodes.map((n) => ({ value: n.node_id, label: `${n.caps.os} · ${n.node_id.slice(0, 8)}` }))}
+              />
               {error && <div role="alert" style={{ color: "var(--danger, #cf1322)" }}>{error}</div>}
               <Button type="primary" loading={busy} onClick={submit}>创建</Button>
             </div>

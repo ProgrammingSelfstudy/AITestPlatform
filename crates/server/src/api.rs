@@ -393,6 +393,9 @@ async fn list_users(State(state): State<ApiState>) -> Result<impl IntoResponse, 
 struct NewUser {
     name: String,
     password: String,
+    /// 顺便认领的节点（没有主人的才行）；不填就只创建名字
+    #[serde(default)]
+    claim_node: Option<Uuid>,
 }
 
 /// 页面上创建名字：输入名字和密码，名字没被占就登记成功。密码只存哈希，不回显、不进日志。
@@ -404,12 +407,13 @@ async fn create_user(State(state): State<ApiState>, Json(body): Json<NewUser>) -
     if !(crate::users::MIN_PASSWORD_CHARS..=crate::users::MAX_PASSWORD_CHARS).contains(&chars) {
         return Err((StatusCode::BAD_REQUEST, format!("密码要 {} 到 {} 个字符", crate::users::MIN_PASSWORD_CHARS, crate::users::MAX_PASSWORD_CHARS)));
     }
-    match crate::users::register_with_password(state.app.pool(), &name, &body.password).await.map_err(|e| {
+    match crate::users::register_with_password(state.app.pool(), &name, &body.password, body.claim_node).await.map_err(|e| {
         tracing::error!("创建名字失败：{e}");
         (StatusCode::INTERNAL_SERVER_ERROR, "创建名字失败".to_string())
     })? {
         crate::users::Register::Created => Ok((StatusCode::CREATED, Json(serde_json::json!({ "name": name })))),
         crate::users::Register::Taken => Err((StatusCode::CONFLICT, format!("「{name}」已经有人用了，换一个名字"))),
+        crate::users::Register::NodeUnavailable => Err((StatusCode::CONFLICT, "这个节点不存在，或已经有主人了；名字没有创建，请换一个节点或不选节点".to_string())),
     }
 }
 

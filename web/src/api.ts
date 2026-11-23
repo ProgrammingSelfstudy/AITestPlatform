@@ -549,8 +549,8 @@ export async function scanNodeApp(nodeId: string, source: string, userName: stri
 
 /** 登记过的名字（节点启动带 NODE_USER_NAME 时登记），给「我是谁」做提示。名字不是机密。 */
 /** 创建名字：名字没被占就登记成功；密码服务端只存哈希。不需要复核口令。 */
-export async function createUser(name: string, password: string): Promise<string> {
-  const response = await post("/api/users", { name, password }, "");
+export async function createUser(name: string, password: string, claimNode?: string): Promise<string> {
+  const response = await post("/api/users", { name, password, ...(claimNode ? { claim_node: claimNode } : {}) }, "");
   return ((await response.json()) as { name: string }).name;
 }
 export const fetchUsers = (signal?: AbortSignal) => get<string[]>("/api/users", signal);

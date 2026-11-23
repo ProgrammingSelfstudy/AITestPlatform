@@ -111,25 +111,42 @@ pub enum Register {
     Created,
     /// 名字已经有人登记（节点启动登记的或别人创建的）
     Taken,
+    /// 要认领的节点不存在，或已经有主人了（不能抢别人的节点）
+    NodeUnavailable,
 }
 
 pub const MIN_PASSWORD_CHARS: usize = 6;
 pub const MAX_PASSWORD_CHARS: usize = 128;
 
 /// 页面上创建名字：名字合格、密码长度合格，名字没被占才登记，密码只存 argon2 哈希。
-pub async fn register_with_password(pool: &PgPool, name: &str, password: &str) -> anyhow::Result<Register> {
+/// `claim_node`：顺便认领一个还没有主人的节点（同一个事务：认领不成，名字也不创建）。
+pub async fn register_with_password(pool: &PgPool, name: &str, password: &str, claim_node: Option<Uuid>) -> anyhow::Result<Register> {
     use argon2::{password_hash::PasswordHasher, Argon2};
     let password = password.to_string();
     // argon2 吃 CPU，放到阻塞线程里算，别卡住异步运行时
     let hash = tokio::task::spawn_blocking(move || Argon2::default().hash_password(password.as_bytes()).map(|h| h.to_string()))
         .await?
         .map_err(|e| anyhow::anyhow!("计算密码哈希失败：{e}"))?;
-    let done = sqlx::query("insert into users (name, password_hash) values ($1, $2) on conflict (name) do nothing")
+    let mut tx = pool.begin().await?;
+    let user: Option<Uuid> = sqlx::query_scalar("insert into users (name, password_hash) values ($1, $2) on conflict (name) do nothing returning id")
         .bind(name)
         .bind(hash)
-        .execute(pool)
+        .fetch_optional(&mut *tx)
         .await?;
-    Ok(if done.rows_affected() == 1 { Register::Created } else { Register::Taken })
+    let Some(user) = user else { return Ok(Register::Taken) };
+    if let Some(node) = claim_node {
+        // 只认领「存在且没有主人」的节点；条件写在 update 里，两个人同时认领也只有一个成功
+        let claimed = sqlx::query("update nodes set owner_user_id = $1 where id = $2 and owner_user_id is null")
+            .bind(user)
+            .bind(node)
+            .execute(&mut *tx)
+            .await?;
+        if claimed.rows_affected() != 1 {
+            return Ok(Register::NodeUnavailable); // 事务随之回滚，名字不会被创建
+        }
+    }
+    tx.commit().await?;
+    Ok(Register::Created)
 }
 
 pub async fn list_names(pool: &PgPool) -> Result<Vec<String>, sqlx::Error> {
