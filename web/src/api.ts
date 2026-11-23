@@ -459,6 +459,11 @@ export async function saveNodeRoles(nodeId: string, roles: RoleInput[], token: s
   await post(rolesPath(nodeId), { roles }, token, userHeaders(userName));
 }
 
+/** 解除节点和主人的绑定（只有主人能解除）。解除后别人可以认领；节点若仍带原来的 NODE_USER_NAME 重启会再绑回去。 */
+export async function releaseNode(nodeId: string, token: string, userName: string): Promise<void> {
+  await post(`/api/nodes/${encodeURIComponent(nodeId)}/release`, {}, token, userHeaders(userName));
+}
+
 /** 节点还没有任何角色时，用服务端模板（config/models.json）初始化，不带 Key。 */
 export async function initNodeRoles(nodeId: string, token: string, userName: string): Promise<void> {
   await post(`${rolesPath(nodeId)}/init-template`, {}, token, userHeaders(userName));

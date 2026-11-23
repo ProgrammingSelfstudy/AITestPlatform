@@ -73,6 +73,7 @@ pub(crate) fn routes(app: AppState, paths: Paths) -> Router {
         .route("/api/admin/proposals/{id}/dismiss", post(crate::admin::api_dismiss))
         .route("/api/nodes/{id}/apps", get(node_apps))
         .route("/api/nodes/{id}/apps/{source}/scan", post(scan_node_app))
+        .route("/api/nodes/{id}/release", post(release_node).route_layer(authorize_write.clone()))
         .route("/api/nodes/{id}/roles/init-template", post(init_node_roles).route_layer(authorize_write.clone()))
         .route("/api/nodes/{id}/roles/{role}/check", post(check_node_role).route_layer(authorize_write.clone()))
         .route(
@@ -368,6 +369,14 @@ async fn init_node_roles(State(state): State<ApiState>, Path(id): Path<String>, 
     let (_, models) = read_models(&state.paths.models).await?;
     let roles = models.roles.into_iter().map(|config| protocol::RoleSet { config, api_key: None }).collect();
     push_roles(&state, node, roles).await
+}
+
+/// 解除节点绑定：只有这个节点的主人（名字对得上）能解除。解除后节点没有主人，任何人可以认领。
+/// 注意：节点若仍用原来的 `NODE_USER_NAME` 启动，重新连上来会再绑回去。
+async fn release_node(State(state): State<ApiState>, Path(id): Path<String>, headers: axum::http::HeaderMap) -> Result<StatusCode, ApiError> {
+    let node = require_owned(&state, &headers, &id).await?;
+    sqlx::query("update nodes set owner_user_id = null where id = $1").bind(node).execute(state.app.pool()).await.map_err(|e| internal("解除节点绑定失败", e))?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn check_node_role(State(state): State<ApiState>, Path((id, role)): Path<(String, String)>, headers: axum::http::HeaderMap) -> Result<StatusCode, ApiError> {

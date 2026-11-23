@@ -2242,3 +2242,35 @@ async fn 创建名字时认领节点_只能认领没主人的_认领不成名字
     let owner: String = sqlx::query_scalar("select u.name from nodes n join users u on u.id = n.owner_user_id where n.id = $1").bind(free).fetch_one(state.pool()).await.unwrap();
     assert_eq!(owner, "小明");
 }
+
+#[tokio::test]
+async fn 解除节点绑定_只有主人能解除_解除后没有主人() {
+    let temp = TempPaths::with_config();
+    let state = with_token(test_state(config()).await, Some(REVIEW_TOKEN));
+    let app = temp.app(state.clone());
+    let node = Uuid::new_v4();
+    let owner: Uuid = sqlx::query_scalar("insert into users (name) values ('测试用户') returning id").fetch_one(state.pool()).await.unwrap();
+    sqlx::query("insert into users (name) values ('别人')").execute(state.pool()).await.unwrap();
+    sqlx::query("insert into nodes (id, caps, online, last_seen, secret_hash, owner_user_id) values ($1, '{}', true, now(), 'x', $2)")
+        .bind(node).bind(owner).execute(state.pool()).await.unwrap();
+    let path = format!("/api/nodes/{node}/release");
+    let as_user = |name: &'static str| {
+        let mut h = review_headers(REVIEW_TOKEN);
+        h.push(("x-user-name", name));
+        h
+    };
+
+    // 不是主人（别人 / 没填名字）：拒绝，绑定不变
+    for headers in [as_user("%E5%88%AB%E4%BA%BA"), review_headers(REVIEW_TOKEN)] {
+        let (status, _, _) = request(&app, Method::POST, &path, &headers, "{}").await;
+        assert!(status == StatusCode::FORBIDDEN || status == StatusCode::UNAUTHORIZED, "{status}");
+    }
+    let still: Option<Uuid> = sqlx::query_scalar("select owner_user_id from nodes where id = $1").bind(node).fetch_one(state.pool()).await.unwrap();
+    assert_eq!(still, Some(owner));
+
+    // 主人解除成功
+    let (status, _, _) = request(&app, Method::POST, &path, &as_user(USER_NAME), "{}").await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let after: Option<Uuid> = sqlx::query_scalar("select owner_user_id from nodes where id = $1").bind(node).fetch_one(state.pool()).await.unwrap();
+    assert_eq!(after, None);
+}

@@ -7,6 +7,7 @@ import {
   initNodeRoles,
   ROLE_SOURCES,
   saveNodeRoles,
+  releaseNode,
   type CheckStatus,
   type ModelRole,
   type NodeRoles,
@@ -80,6 +81,7 @@ const IDLE_POLL: RolesPollState = { status: "idle" };
 type WriteIntent =
   | { kind: "save"; payload: RoleInput[]; createdId: string | null }
   | { kind: "init" }
+  | { kind: "release" }
   | { kind: "check"; roleId: string; roleName: string }
   | { kind: "delete"; roleId: string; roleName: string; payload: RoleInput[] };
 
@@ -716,6 +718,9 @@ export default function RolesPage() {
           setDraftNewRole(null);
         }
         setActionNotice("角色配置已保存并下发到节点。");
+      } else if (intent.kind === "release") {
+        await releaseNode(selectedNodeId, token, trimmedName);
+        setActionNotice("已解除绑定：这个节点现在没有主人，创建名字时可以认领它。节点若仍用原来的 NODE_USER_NAME 启动，重启后会再绑回去。");
       } else if (intent.kind === "init") {
         await initNodeRoles(selectedNodeId, token, trimmedName);
         setActionNotice("已用平台模板初始化角色并下发到节点，请逐个检测后再使用。");
@@ -1010,6 +1015,11 @@ export default function RolesPage() {
 
           <div className="roles-control-meta">
             <span>自动轮询 {REFRESH_MS / 1000}s</span>
+            {canAct && (
+              <Button size="small" danger disabled={busy} loading={busyAction === "release"} onClick={() => void executeWrite({ kind: "release" })}>
+                解除节点绑定
+              </Button>
+            )}
             {dirtyCount > 0 && (
               <span className="roles-dirty-pill">{dirtyCount} 项未保存</span>
             )}
