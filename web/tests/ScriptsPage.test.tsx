@@ -145,7 +145,8 @@ test("发起回归：选在线节点、填个人令牌、再输审核口令，PO
 
   // 没有审核口令：先弹口令框，不能直接发
   expect(posts()).toHaveLength(0);
-  const tokenDialog = await screen.findByRole("dialog", { name: "输入审核口令" });
+  // 按标题文字找弹窗，不用可访问名称：antd 在测试环境里给所有控件同一个占位 id，页面上多一个 Select 就会让名称解析串到别处
+  const tokenDialog = (await screen.findByText("输入审核口令")).closest<HTMLElement>("[role=dialog]")!;
   await user.type(within(tokenDialog).getByLabelText("审核口令"), "review-token-1");
   await user.click(within(tokenDialog).getByRole("button", { name: /确\s*认/ }));
 
@@ -183,7 +184,7 @@ test("发起回归被服务端拒绝：弹窗里显示服务端原因，不关�
   await user.type(within(dialog).getByLabelText("个人令牌"), "u_personal-1");
   await user.click(within(dialog).getByRole("button", { name: /排队回归/ }));
   expect(await within(dialog).findByText(/只有已获准的脚本版本能回归/)).toBeInTheDocument();
-  expect(screen.queryByRole("dialog", { name: "输入审核口令" })).not.toBeInTheDocument();
+  expect(screen.queryByText("输入审核口令")).not.toBeInTheDocument();
   expect(posts()).toHaveLength(1);
 });
 
@@ -211,4 +212,111 @@ test("项目里还没有脚本时给出引导", async () => {
   serve([]);
   render(<ScriptsPage />);
   expect(await screen.findByText(/还没有脚本/)).toBeInTheDocument();
+});
+
+// ───── 摘要条、筛选和排序 ─────
+
+/** 一组覆盖各种情况的脚本：每个分组至少一条，顺序故意打乱，用来验证页面自己排序 */
+function mixedRows(): ScriptRow[] {
+  return [
+    script({ id: "ok", case_code: "TC-02", version: 1, status: "approved", last_regression: regression(true, "r-ok") }),
+    script({ id: "retired", case_code: "TC-11", version: 2, status: "retired" }),
+    script({ id: "pending", case_code: "TC-08", version: 4, status: "self_check_passed" }),
+    script({ id: "bug", case_code: "TC-04", version: 3, status: "approved", last_regression: regression(false, "r-bug"), last_triage: triage("business_bug", { regression_id: "r-bug" }) }),
+    script({ id: "unsure", case_code: "TC-01", version: 2, status: "approved", last_regression: regression(false, "r-unsure"), last_triage: triage("unsure", { regression_id: "r-unsure" }) }),
+    script({ id: "plainfail", case_code: "TC-06", version: 1, status: "approved", last_regression: regression(false, "r-plain") }),
+    script({ id: "noconclusion", case_code: "TC-10", version: 2, status: "approved", last_request: request("failed", "手机没连上") }),
+    script({ id: "cand", case_code: "TC-12", version: 1, status: "candidate" }),
+  ];
+}
+
+/** 表格里各行的用例编号，按页面上的顺序（不含表头） */
+const orderOnPage = () => screen.getAllByRole("row").slice(1).map((r) => r.querySelector(".code-tag")?.textContent ?? "");
+
+const card = (name: RegExp) => screen.getByRole("button", { name });
+
+test("摘要条的数字和行里的标签用同一套规则：分诊只算针对最近那次失败的", async () => {
+  serve([...mixedRows(), script({ id: "stale", case_code: "TC-20", version: 1, status: "approved", last_regression: regression(false, "r-new"), last_triage: triage("business_bug", { regression_id: "r-old" }) })]);
+  render(<ScriptsPage />);
+  await rowOf(4);
+  // 已获准 6（ok、bug、unsure、plainfail、noconclusion、stale）；待获准 1；回归失败 4（bug、unsure、plainfail、stale）；
+  // 疑似缺陷只有 1：stale 的分诊是针对更早的失败，不能算
+  expect(card(/已获准/)).toHaveTextContent("6");
+  expect(card(/待获准/)).toHaveTextContent("1");
+  expect(card(/最近回归失败/)).toHaveTextContent("4");
+  expect(card(/疑似产品缺陷/)).toHaveTextContent("1");
+  expect(card(/分不清/)).toHaveTextContent("1");
+});
+
+test("默认排序：疑似缺陷、分不清、其他回归失败、没得到结论、待获准、已获准、候选，已下线沉底", async () => {
+  serve(mixedRows());
+  render(<ScriptsPage />);
+  await rowOf(4);
+  expect(orderOnPage()).toEqual(["TC-04", "TC-01", "TC-06", "TC-10", "TC-08", "TC-02", "TC-12", "TC-11"]);
+});
+
+test("点摘要卡片筛选，再点一次恢复；卡片带按下状态", async () => {
+  serve(mixedRows());
+  const user = userEvent.setup();
+  render(<ScriptsPage />);
+  await rowOf(4);
+  const bug = card(/疑似产品缺陷/);
+  expect(bug).toHaveAttribute("aria-pressed", "false");
+  await user.click(bug);
+  expect(bug).toHaveAttribute("aria-pressed", "true");
+  expect(orderOnPage()).toEqual(["TC-04"]);
+  await user.click(bug);
+  expect(bug).toHaveAttribute("aria-pressed", "false");
+  expect(orderOnPage()).toHaveLength(8);
+});
+
+test("处理视图：待处理包含待获准、回归失败、没得到结论和有分诊的；回归失败只看失败", async () => {
+  serve(mixedRows());
+  const user = userEvent.setup();
+  render(<ScriptsPage />);
+  await rowOf(4);
+  await user.click(screen.getByText(/待处理 \(/));
+  expect(orderOnPage()).toEqual(["TC-04", "TC-01", "TC-06", "TC-10", "TC-08"]);
+  await user.click(screen.getByText("回归失败", { selector: ".ant-segmented-item-label" }));
+  expect(orderOnPage()).toEqual(["TC-04", "TC-01", "TC-06"]);
+  await user.click(screen.getByText("分不清", { selector: ".ant-segmented-item-label" }));
+  expect(orderOnPage()).toEqual(["TC-01"]);
+});
+
+test("按脚本状态筛选和处理视图可以叠加；没有交集时给出重置", async () => {
+  serve(mixedRows());
+  const user = userEvent.setup();
+  render(<ScriptsPage />);
+  await rowOf(4);
+  await user.click(screen.getByRole("combobox", { name: "按脚本状态筛选" }));
+  await user.click(await screen.findByText("已下线", { selector: ".ant-select-item-option-content" }));
+  expect(orderOnPage()).toEqual(["TC-11"]);
+  // 已下线 + 疑似缺陷：没有交集
+  await user.click(screen.getByText("疑似缺陷", { selector: ".ant-segmented-item-label" }));
+  expect(await screen.findByText("没有符合当前筛选条件的脚本")).toBeInTheDocument();
+  await user.click(screen.getByRole("button", { name: "重置筛选条件" }));
+  expect(orderOnPage()).toHaveLength(8);
+});
+
+test("点摘要卡片会清掉另一个筛选条件（卡片和下拉互斥，不会悄悄叠加出空表）", async () => {
+  serve(mixedRows());
+  const user = userEvent.setup();
+  render(<ScriptsPage />);
+  await rowOf(4);
+  await user.click(screen.getByRole("combobox", { name: "按脚本状态筛选" }));
+  await user.click(await screen.findByText("已下线", { selector: ".ant-select-item-option-content" }));
+  expect(orderOnPage()).toEqual(["TC-11"]);
+  await user.click(card(/疑似产品缺陷/));
+  expect(orderOnPage()).toEqual(["TC-04"]);
+});
+
+test("失败行不会被标成通过：回归失败的行有「回归失败」文字，没有「回归通过」", async () => {
+  serve(mixedRows());
+  render(<ScriptsPage />);
+  const fail = await rowOf(3);
+  expect(within(fail).getByText("回归失败")).toBeInTheDocument();
+  expect(within(fail).queryByText("回归通过")).not.toBeInTheDocument();
+  expect(fail.className).toContain("script-row-failed");
+  const unsure = await rowOf(2);
+  expect(unsure.className).toContain("script-row-uncertain");
 });
