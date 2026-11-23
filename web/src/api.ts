@@ -172,6 +172,15 @@ export interface Regression {
   created_at: string;
 }
 
+/** 页面发起的回归请求：排队 → 节点领取运行 → 完成（得到结论）或失败（没得到结论）。结论本身在 last_regression。 */
+export interface RegressionRequest {
+  id: string;
+  node_id: string;
+  status: "queued" | "running" | "finished" | "failed" | "cancelled";
+  detail: string;
+  requested_at: string;
+}
+
 /** 回归脚本的一个版本（只有元数据，不含源码） */
 export interface ScriptRow {
   id: string;
@@ -188,6 +197,7 @@ export interface ScriptRow {
   status: ScriptStatus;
   status_note: string | null;
   last_regression: Regression | null;
+  last_request: RegressionRequest | null;
   created_at: string;
   updated_at: string;
 }
@@ -262,6 +272,16 @@ export async function cancelRun(id: string, token: string): Promise<void> {
 /** 获准、下线、拒绝脚本：人的决定，用审核口令。原因下线和拒绝必填，获准可不写。 */
 export async function decideScript(id: string, action: "approve" | "retire" | "reject", note: string, token: string): Promise<void> {
   await post(`/api/scripts/${encodeURIComponent(id)}/${action}`, { note }, token);
+}
+
+/** 在自己的节点上排一次回归：审核口令加个人令牌（和发起任务同一套），个人令牌只在本次请求中使用。 */
+export async function requestRegression(scriptId: string, nodeId: string, token: string, userToken: string): Promise<void> {
+  await post(`/api/scripts/${encodeURIComponent(scriptId)}/regress`, { node_id: nodeId }, token, { "x-user-token": userToken });
+}
+
+/** 取消还在排队的回归请求；节点已经领走的取消不了。 */
+export async function cancelRegression(requestId: string, token: string, userToken: string): Promise<void> {
+  await post(`/api/regression-requests/${encodeURIComponent(requestId)}/cancel`, {}, token, { "x-user-token": userToken });
 }
 
 export async function submitReview(id: string, review: ReviewSubmission, token: string): Promise<number> {

@@ -241,6 +241,7 @@ pub(crate) async fn claim_next_with_accounts(pool: &PgPool, node_id: Uuid, accou
                  where d.node_id = $1 and n.online and d.status = 'idle'
                    and ($2::text is null or d.serial > $2)
                    and not exists (select 1 from runs x where x.device_id = d.id and x.status in ('assigned','running','judging','node_lost'))
+                   and not exists (select 1 from regression_requests q where q.node_id = d.node_id and q.serial = d.serial and q.status = 'running')
                  order by d.serial for update of d skip locked limit 1",
             )
             .bind(node_id)

@@ -8,6 +8,7 @@ pub mod cases;
 mod evidence_sign;
 mod files;
 pub mod recording_retention;
+pub mod regress_requests;
 mod reviews;
 pub mod users;
 pub mod runs;
@@ -125,6 +126,8 @@ impl AppState {
         // 服务进程重启（或崩溃）时没有走「节点离线」那条路径：库里还停在执行中的 run 一并转 node_lost，
         // 否则节点重连后会被当成「没有这个 run」而被放弃
         runs::all_nodes_lost(&mut tx).await.map_err(run_err)?;
+        // 服务重启前领走的回归请求，结果已经无从得知（节点回报时会被拒），不能让它们一直占着设备
+        regress_requests::fail_running(&mut tx, None, None, "服务重启，这次回归的结果没有回报").await?;
         tx.commit().await?;
         Ok(Self(Arc::new(Inner {
             cfg,
@@ -149,6 +152,7 @@ impl AppState {
                    status = case
                      when excluded.status = 'offline' then 'offline'
                      when exists (select 1 from runs r where r.device_id = devices.id and r.status in ('assigned','running','judging','node_lost')) then 'busy'
+                     when exists (select 1 from regression_requests q where q.node_id = devices.node_id and q.serial = devices.serial and q.status = 'running') then 'busy'
                      else excluded.status end,
                    last_seen = now()",
             )

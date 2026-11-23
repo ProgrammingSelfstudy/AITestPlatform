@@ -180,6 +180,25 @@ async fn main() -> anyhow::Result<()> {
     match real_config(&cfg)? {
         Some(rc) => {
             tracing::info!("真实执行器已启用");
+            // 只有一台确定的设备时才接页面发起的回归（多台设备要显式指定用哪台：`node regress --serial`）
+            if allow.len() == 1 {
+                // node_id 要等节点第一次连上服务端才有，所以配置拿不到时隔几秒重试，而不是放弃
+                tokio::spawn(async {
+                    let check = loop {
+                        match check_config(None) {
+                            Ok(check) => break check,
+                            Err(error) => {
+                                tracing::info!("暂时不能接收页面发起的回归，稍后重试：{error:#}");
+                                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                            }
+                        }
+                    };
+                    tracing::info!("接收页面发起的回归，使用设备 {}", check.serial);
+                    node::regress_poll::serve(check, std::time::Duration::from_secs(5)).await;
+                });
+            } else {
+                tracing::info!("HAFA_DEVICE_ALLOW 不是恰好一台设备，不接收页面发起的回归");
+            }
             tokio::select! {
                 r = run(cfg, Only { inner: AdbDevices::default(), serials: allow }, RealExecutor(rc)) => r?,
                 _ = tokio::signal::ctrl_c() => tracing::info!("收到退出信号，节点停止"),

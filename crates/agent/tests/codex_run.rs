@@ -53,7 +53,7 @@ struct Fx {
     home: PathBuf,
 }
 
-/// 小时限：卡住 / 工具挂住 0.8 秒，重连 3 条判坏，退避 10ms。
+/// 小时限：卡住 / 工具挂住 2.5 秒，重连 3 条判坏，退避 10ms。
 fn small() -> Limits {
     // 阈值不能太紧：续跑要重新起进程、跑模型目录和审计，整个工作区并行测试时曾因 800ms 偶发多判一次卡住
     Limits { stall: Duration::from_millis(2500), start_stall: Duration::from_millis(2500), tool_hang: Duration::from_millis(2500), reconnect_limit: 3, backoff_unit: Duration::from_millis(10) }
@@ -201,11 +201,11 @@ sleep 30"#,
 
 #[tokio::test]
 async fn need_human期间不算卡住() {
-    // 工具挂住时限 0.8 秒，need_human 等了 1.6 秒，仍不能判卡住
+    // 等待要明确超过工具挂住时限（small() 里是 2.5 秒）：不超过就测不到豁免，还会在高负载下因余量太小偶发失败
     let f = fx(&format!(
         r#"{THREAD}
 {}
-sleep 1.6
+sleep 4
 echo '{{"type":"item.completed","item":{{"type":"mcp_tool_call","server":"device","tool":"need_human","status":"completed"}}}}'
 {TURN}"#,
         tool_start("need_human")

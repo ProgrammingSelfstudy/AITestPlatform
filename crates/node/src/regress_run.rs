@@ -34,6 +34,12 @@ struct Approved {
 
 /// 回归 `project` 里的 `case_code`，用它当前已获准的版本。
 pub async fn regress(cfg: &CheckConfig, project: &str, case_code: &str) -> anyhow::Result<Outcome> {
+    regress_script(cfg, project, case_code, None).await
+}
+
+/// 同 [`regress`]；`expect` 给了就必须正好是这个脚本：页面请求回归的是排队时那个获准版本，
+/// 排队期间换了版本就不回归，免得把「另一个版本的结果」记成人点的那次。
+pub async fn regress_script(cfg: &CheckConfig, project: &str, case_code: &str, expect: Option<Uuid>) -> anyhow::Result<Outcome> {
     let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(30)).build()?;
     let mut url = cfg.platform_http.clone();
     url.path_segments_mut().map_err(|_| anyhow::anyhow!("平台地址不能带路径"))?.pop_if_empty().extend(["api", "projects", project, "cases", case_code, "approved-script"]);
@@ -45,6 +51,9 @@ pub async fn regress(cfg: &CheckConfig, project: &str, case_code: &str) -> anyho
         other => bail!("取已获准脚本失败：平台返回 {other}"),
     }
     let script: Approved = response.json().await.context("平台返回的脚本格式不对")?;
+    if let Some(expect) = expect.filter(|expect| *expect != script.id) {
+        bail!("请求回归的脚本 {expect} 已不是用例 {case_code} 当前的获准版本（现在是版本 {}），没有回归", script.version);
+    }
 
     std::fs::create_dir_all(&cfg.work_dir).context("无法创建回归工作目录")?;
     let root = write_package(&cfg.work_dir, &script.files)?;

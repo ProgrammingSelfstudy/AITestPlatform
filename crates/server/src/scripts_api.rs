@@ -16,6 +16,7 @@ use sqlx::Row;
 use uuid::Uuid;
 
 use crate::api::ApiState;
+use crate::regress_requests::{self, RequestError};
 use crate::scripts::{self, NewScript, ScriptError, ScriptRecord};
 
 /// 最多 6 个文件、每个 64 KiB，加上摘要和 JSON 开销，512 KiB 足够，超过就是异常请求。
@@ -284,6 +285,8 @@ pub(crate) struct ProjectScript {
     script: ScriptRecord,
     /// 最近一次回归，没跑过就是 null
     last_regression: Option<scripts::Regression>,
+    /// 最近一次从页面发起的回归请求（排队、运行中、已结束），没有就是 null
+    last_request: Option<regress_requests::RequestView>,
 }
 
 /// `GET /api/projects/{project}/scripts`：项目里所有用例的全部脚本版本，只有元数据，不含源码。
@@ -291,7 +294,8 @@ pub(crate) async fn list_project(State(state): State<ApiState>, RoutePath(projec
     let rows = scripts::list_by_project(state.app.pool(), &project).await.map_err(|e| internal(&e))?;
     let ids: Vec<Uuid> = rows.iter().map(|(_, _, script)| script.id).collect();
     let mut latest = scripts::latest_regressions(state.app.pool(), &ids).await.map_err(|e| internal(&e))?;
-    Ok(Json(rows.into_iter().map(|(case_code, case_title, script)| ProjectScript { last_regression: latest.remove(&script.id), case_code, case_title, script }).collect()))
+    let mut requests = regress_requests::latest(state.app.pool(), &ids).await.map_err(|e| internal(&e))?;
+    Ok(Json(rows.into_iter().map(|(case_code, case_title, script)| ProjectScript { last_regression: latest.remove(&script.id), last_request: requests.remove(&script.id), case_code, case_title, script }).collect()))
 }
 
 /// `GET /api/projects/{project}/cases/{code}/approved-script`：节点取某用例当前已获准的脚本版本和源码，去本机回归。
@@ -334,6 +338,104 @@ pub(crate) async fn regression(State(state): State<ApiState>, RoutePath(id): Rou
             Err(fail(StatusCode::INTERNAL_SERVER_ERROR, "记录失败"))
         }
     }
+}
+
+/// 页面发起回归的请求体。
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RegressRequest {
+    node_id: Uuid,
+}
+
+/// 校验个人令牌，并确认节点属于这个人：回归占用的是节点的手机，只能发到自己的节点（规则 9）。
+async fn require_owner(state: &ApiState, headers: &axum::http::HeaderMap, node_id: Uuid) -> Result<(), Failure> {
+    let token = headers.get("x-user-token").and_then(|h| h.to_str().ok()).unwrap_or_default();
+    let user = crate::users::user_by_token(state.app.pool(), token).await.map_err(|e| internal(&e))?.ok_or_else(|| fail(StatusCode::UNAUTHORIZED, "需要有效的个人令牌才能发起回归"))?;
+    match crate::users::check_node_owner(state.app.pool(), node_id, user).await.map_err(|e| internal(&e))? {
+        crate::users::NodeOwner::Owned => Ok(()),
+        crate::users::NodeOwner::Missing => Err(fail(StatusCode::NOT_FOUND, "没有这个节点")),
+        crate::users::NodeOwner::NotYours => Err(fail(StatusCode::FORBIDDEN, "只能使用自己的节点发起回归")),
+    }
+}
+
+fn request_failure(error: RequestError) -> Failure {
+    match error {
+        RequestError::ScriptNotFound | RequestError::NotFound => (StatusCode::NOT_FOUND, error.to_string()),
+        RequestError::NotApproved(_) | RequestError::Duplicate => (StatusCode::CONFLICT, error.to_string()),
+        RequestError::Db(e) => internal(&e),
+    }
+}
+
+/// `POST /api/scripts/{id}/regress`：在自己的节点上排一次回归。只有已获准的版本能回归；不花模型额度，但会占用节点的手机。
+/// 请求只是排队，由节点自己领取、在自己的手机上跑，结果通过 `regressions` 接口记录。
+pub(crate) async fn request_regression(State(state): State<ApiState>, RoutePath(id): RoutePath<String>, headers: axum::http::HeaderMap, Json(body): Json<RegressRequest>) -> Result<(StatusCode, Json<serde_json::Value>), Failure> {
+    require_owner(&state, &headers, body.node_id).await?;
+    let script_id: Uuid = id.parse().map_err(|_| fail(StatusCode::NOT_FOUND, "没有这个脚本"))?;
+    let request_id = regress_requests::create(state.app.pool(), script_id, body.node_id).await.map_err(request_failure)?;
+    Ok((StatusCode::CREATED, Json(serde_json::json!({"id": request_id}))))
+}
+
+/// `POST /api/regression-requests/{id}/cancel`：取消还在排队的请求。节点已经领走（手机在跑）的不能取消。
+pub(crate) async fn cancel_request(State(state): State<ApiState>, RoutePath(id): RoutePath<String>, headers: axum::http::HeaderMap) -> Result<StatusCode, Failure> {
+    let id: Uuid = id.parse().map_err(|_| fail(StatusCode::NOT_FOUND, "没有这个回归请求"))?;
+    let node = regress_requests::node_of(state.app.pool(), id).await.map_err(|e| internal(&e))?.ok_or_else(|| fail(StatusCode::NOT_FOUND, "没有这个回归请求"))?;
+    require_owner(&state, &headers, node).await?;
+    regress_requests::cancel(state.app.pool(), id).await.map_err(request_failure)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ClaimBody {
+    serial: String,
+}
+
+/// `PUT /api/node/regression-requests/claim`：节点带着它要用的设备来领一个回归请求。
+/// 有就返回 200 和要回归的脚本；没有，或设备正忙，返回 204。
+pub(crate) async fn claim_request(State(state): State<ApiState>, request: Request) -> Result<axum::response::Response, Failure> {
+    use axum::response::IntoResponse;
+    let node_id = crate::node_identity(&state.app, request.headers()).await.map_err(|status| (status, String::new()))?;
+    let bytes = to_bytes(request.into_body(), 4096).await.map_err(|_| fail(StatusCode::PAYLOAD_TOO_LARGE, "请求体太大"))?;
+    let body: ClaimBody = serde_json::from_slice(&bytes).map_err(|_| fail(StatusCode::BAD_REQUEST, "请求格式不对"))?;
+    if body.serial.trim().is_empty() || body.serial.chars().count() > 128 {
+        return Err(fail(StatusCode::UNPROCESSABLE_ENTITY, "设备序列号为空或太长"));
+    }
+    match regress_requests::claim(state.app.pool(), node_id, &body.serial).await.map_err(|e| internal(&e))? {
+        Some(claimed) => Ok(Json(claimed).into_response()),
+        None => Ok(StatusCode::NO_CONTENT.into_response()),
+    }
+}
+
+/// `PUT /api/node/regression-requests/abandon`：节点进程刚启动时调用：它自己没有在跑回归，
+/// 之前领走而没回报的请求都作废，免得一直占着设备。
+pub(crate) async fn abandon_requests(State(state): State<ApiState>, request: Request) -> Result<StatusCode, Failure> {
+    let node_id = crate::node_identity(&state.app, request.headers()).await.map_err(|status| (status, String::new()))?;
+    let bytes = to_bytes(request.into_body(), 4096).await.map_err(|_| fail(StatusCode::PAYLOAD_TOO_LARGE, "请求体太大"))?;
+    let body: ClaimBody = serde_json::from_slice(&bytes).map_err(|_| fail(StatusCode::BAD_REQUEST, "请求格式不对"))?;
+    let mut conn = state.app.pool().acquire().await.map_err(|e| internal(&e))?;
+    regress_requests::fail_running(&mut conn, Some(node_id), Some(&body.serial), "节点进程重启，这次回归的结果没有回报").await.map_err(|e| internal(&e))?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FinishBody {
+    /// 得到了回归结论（通过或失败都算，结论记在回归记录里）；否则是没能得到结论
+    finished: bool,
+    detail: String,
+}
+
+/// `PUT /api/regression-requests/{id}/result`：节点回报这个请求的结果。只有领走它的节点、且仍在运行中才能回报。
+pub(crate) async fn finish_request(State(state): State<ApiState>, RoutePath(id): RoutePath<String>, request: Request) -> Result<StatusCode, Failure> {
+    let node_id = crate::node_identity(&state.app, request.headers()).await.map_err(|status| (status, String::new()))?;
+    let id: Uuid = id.parse().map_err(|_| fail(StatusCode::NOT_FOUND, "没有这个回归请求"))?;
+    let bytes = to_bytes(request.into_body(), 64 * 1024).await.map_err(|_| fail(StatusCode::PAYLOAD_TOO_LARGE, "请求体太大"))?;
+    let body: FinishBody = serde_json::from_slice(&bytes).map_err(|_| fail(StatusCode::BAD_REQUEST, "请求格式不对"))?;
+    if body.detail.chars().count() > MAX_DETAIL_CHARS {
+        return Err(fail(StatusCode::UNPROCESSABLE_ENTITY, "说明太长（最多 1800 字）"));
+    }
+    regress_requests::finish(state.app.pool(), node_id, id, body.finished, &body.detail).await.map_err(request_failure)?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// 原始数据库错误只写日志，不返回给调用方。
