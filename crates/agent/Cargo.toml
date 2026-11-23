@@ -15,6 +15,7 @@ serde_yaml_ng = "0.10.0"
 sha2 = "0.11.1"
 tokio = { version = "1.54.1", features = ["process", "io-util", "time", "rt", "macros", "rt-multi-thread", "net"] }
 tracing = "0.1.44"
+uuid = { version = "1.29.3", features = ["v4"] }
 
 [dev-dependencies]
 device = { path = "../device" }
