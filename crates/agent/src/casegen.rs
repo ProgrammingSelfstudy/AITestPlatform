@@ -137,6 +137,12 @@ impl Default for CodexGen {
 
 /// Codex：只读沙箱、不落会话，截图写进一个只放截图的临时目录，用 `-i` 传入；提示词走标准输入。
 pub async fn generate_codex(opts: &CodexGen, input: &Input<'_>) -> Outcome {
+    let prompt = format!("{CASEGEN_SYSTEM}\n\n---\n\n{}", build_prompt(input));
+    codex_run(opts, &prompt, input.images).await
+}
+
+/// Codex 通用调用：提示词走标准输入，可选带截图（`-i`）；只读沙箱、不落会话、没有任何工具可用。
+pub async fn codex_run(opts: &CodexGen, prompt: &str, images: &[Image]) -> Outcome {
     use tokio::io::AsyncWriteExt as _;
     let start = std::time::Instant::now();
     let fail = |m: String| Outcome { failure: Some(m), wall_s: start.elapsed().as_secs_f64(), ..Default::default() };
@@ -146,7 +152,7 @@ pub async fn generate_codex(opts: &CodexGen, input: &Input<'_>) -> Outcome {
     }
     let result = async {
         let mut files = vec![];
-        for (i, image) in input.images.iter().enumerate() {
+        for (i, image) in images.iter().enumerate() {
             let path = dir.join(format!("ui_{}.{}", i + 1, ext(&image.media_type)));
             std::fs::write(&path, &image.bytes).map_err(|e| format!("无法写入截图：{e}"))?;
             files.push(path);
@@ -174,7 +180,6 @@ pub async fn generate_codex(opts: &CodexGen, input: &Input<'_>) -> Outcome {
         cmd.stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::piped()).kill_on_drop(true);
         let mut child = cmd.spawn().map_err(|e| format!("无法启动 codex 命令行：{e}"))?;
         if let Some(mut stdin) = child.stdin.take() {
-            let prompt = format!("{CASEGEN_SYSTEM}\n\n---\n\n{}", build_prompt(input));
             let _ = stdin.write_all(prompt.as_bytes()).await;
         }
         let out = match tokio::time::timeout(opts.total_timeout, child.wait_with_output()).await {
@@ -273,18 +278,18 @@ pub fn parse_reviews(text: &str) -> Result<Vec<ReviewItem>, String> {
     serde_json::from_str::<Wrapper>(&text[start..=end]).map(|w| w.reviews).map_err(|e| format!("评审员的输出不是合法的复核 JSON：{e}"))
 }
 
-/// 评审员复核：纯文本、没有任何工具。Claude 走纯文本角色隔离；agy 不挂任何 MCP，调用了任何工具都作废。
-pub async fn review(source: ModelSource, model: Option<String>, effort: Option<String>, doc: &str, cases: &[CaseBrief]) -> Outcome {
+/// 纯文本调模型：没有任何工具、不给截图。Claude 走纯文本角色隔离；agy 不挂任何 MCP，调用了任何工具整次作废；
+/// Codex 只读沙箱。评审员复核和管理员聊天共用。失败只给分类后的说明，不带账号信息。
+pub async fn run_text(source: ModelSource, model: Option<String>, effort: Option<String>, system: &str, prompt: &str) -> Outcome {
     let start = std::time::Instant::now();
-    let prompt = build_review_prompt(doc, cases);
     match source {
         ModelSource::ClaudeCli => {
             let base = ClaudeOpts { model, effort, ..Default::default() };
             if let Err(reason) = claude_cli::check_login(&base).await {
                 return Outcome { failure: Some(reason.to_string()), wall_s: start.elapsed().as_secs_f64(), ..Default::default() };
             }
-            let opts = ClaudeOpts { tools: vec![], allowed_tools: vec![], mcp_config: None, system_prompt: Some(REVIEW_SYSTEM.into()), ..base };
-            let out = claude_cli::run_text_only(&opts, &prompt).await;
+            let opts = ClaudeOpts { tools: vec![], allowed_tools: vec![], mcp_config: None, system_prompt: Some(system.into()), ..base };
+            let out = claude_cli::run_text_only(&opts, prompt).await;
             claude_outcome(out, start.elapsed().as_secs_f64())
         }
         ModelSource::Agy => {
@@ -292,21 +297,27 @@ pub async fn review(source: ModelSource, model: Option<String>, effort: Option<S
             if let Err(reason) = crate::agy_cli::check_login(&opts).await {
                 return Outcome { failure: Some(reason.to_string()), wall_s: start.elapsed().as_secs_f64(), ..Default::default() };
             }
-            let out = crate::agy_cli::run(&opts, &format!("{REVIEW_SYSTEM}\n\n---\n\n{prompt}")).await;
+            let out = crate::agy_cli::run(&opts, &format!("{system}\n\n---\n\n{prompt}")).await;
             let wall_s = start.elapsed().as_secs_f64();
             if !out.violations.is_empty() || !out.denied.is_empty() {
-                return Outcome { failure: Some("评审员调用了不该用的工具，这次复核作废".into()), wall_s, ..Default::default() };
+                return Outcome { failure: Some("模型调用了不该用的工具，这次结果作废".into()), wall_s, ..Default::default() };
             }
             match out.failure {
                 None if !out.text.trim().is_empty() => Outcome { text: out.text, wall_s, ..Default::default() },
-                None => Outcome { failure: Some("评审员没有返回内容".into()), wall_s, ..Default::default() },
+                None => Outcome { failure: Some("模型没有返回内容".into()), wall_s, ..Default::default() },
                 Some(crate::agy_cli::Failure::Quota(_)) => Outcome { failure: Some("agy 额度用完或被限流".into()), quota_exhausted: true, wall_s, ..Default::default() },
                 Some(crate::agy_cli::Failure::Auth(_)) => Outcome { failure: Some("agy 登录失效".into()), wall_s, ..Default::default() },
                 Some(other) => Outcome { failure: Some(short(&format!("{other:?}"))), wall_s, ..Default::default() },
             }
         }
-        other => Outcome { failure: Some(format!("来源 {other:?} 不能当评审员")), ..Default::default() },
+        ModelSource::CodexExec => codex_run(&CodexGen { model, effort, ..Default::default() }, &format!("{system}\n\n---\n\n{prompt}"), &[]).await,
+        other => Outcome { failure: Some(format!("来源 {other:?} 不能用来做纯文本对话")), ..Default::default() },
     }
+}
+
+/// 评审员复核：纯文本、没有任何工具。
+pub async fn review(source: ModelSource, model: Option<String>, effort: Option<String>, doc: &str, cases: &[CaseBrief]) -> Outcome {
+    run_text(source, model, effort, REVIEW_SYSTEM, &build_review_prompt(doc, cases)).await
 }
 
 #[cfg(test)]

@@ -67,6 +67,10 @@ pub(crate) fn routes(app: AppState, paths: Paths) -> Router {
         .route("/api/casegen-requests/{id}/result", put(crate::modules::api_finish).layer(axum::extract::DefaultBodyLimit::max(2 * 1024 * 1024)))
         .route("/api/nodes/{id}/roles", post(set_node_roles).route_layer(authorize_write.clone()).get(node_roles))
         .route("/api/users", get(list_users))
+        .route("/api/admin/chat", get(crate::admin::api_chat))
+        .route("/api/admin/messages", post(crate::admin::api_send).route_layer(authorize_write.clone()))
+        .route("/api/admin/proposals/{id}/confirm", post(crate::admin::api_confirm).route_layer(authorize_write.clone()))
+        .route("/api/admin/proposals/{id}/dismiss", post(crate::admin::api_dismiss))
         .route("/api/nodes/{id}/apps", get(node_apps))
         .route("/api/nodes/{id}/apps/{source}/scan", post(scan_node_app))
         .route("/api/nodes/{id}/roles/init-template", post(init_node_roles).route_layer(authorize_write.clone()))
@@ -204,6 +208,8 @@ fn source_supported(role: &RoleConfig) -> bool {
         RoleSlot::Judge => matches!(role.source, ModelSource::ClaudeCli | ModelSource::Agy),
         // 要看 UI 截图：Claude（stream-json 图片输入）和 Codex（-i）都实测能看图；agy 的图片输入还没验证，先不开放
         RoleSlot::CaseWriter => matches!(role.source, ModelSource::ClaudeCli | ModelSource::CodexExec),
+        // 管理员只说话（纯文本），三个本机来源都行
+        RoleSlot::Planner => matches!(role.source, ModelSource::ClaudeCli | ModelSource::CodexExec | ModelSource::Agy),
     }
 }
 
@@ -1010,6 +1016,7 @@ mod evidence_tests {
                 conns: Default::default(),
                 roles: Default::default(),
                 apps: Default::default(),
+                admin_asks: Default::default(),
             })),
             Paths {
                 models: PathBuf::new(),

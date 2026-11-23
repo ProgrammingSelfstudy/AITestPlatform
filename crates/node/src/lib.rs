@@ -500,6 +500,13 @@ async fn session<D: Devices, E: RunExecutor>(cfg: &NodeConfig, devices: &D, runn
                                 let _ = tx.send(NodeMsg::AppsReport(protocol::AppsReport { apps: vec![scan] }));
                             });
                         }
+                        ServerMsg::AdminAsk(ask) => {
+                            // 在后台回答，不堵住这条连接。用本机的管理员角色、本机的模型和额度（规则 9）；没有这个角色就如实说没有
+                            let (roles, tx) = (roles.clone(), role_tx.clone());
+                            tokio::spawn(async move {
+                                let _ = tx.send(NodeMsg::AdminAnswer(admin_answer(&roles, ask).await));
+                            });
+                        }
                         ServerMsg::Ping | ServerMsg::Welcome(_) => {}
                         // 人工处理结果、画面订阅还没接入：明确记一笔，不能假装收到了
                         other => tracing::warn!("这类消息还不处理，已忽略：{other:?}"),
@@ -509,6 +516,28 @@ async fn session<D: Devices, E: RunExecutor>(cfg: &NodeConfig, devices: &D, runn
                 },
                 Some(Ok(_)) => {}
             }
+        }
+    }
+}
+
+/// 管理员回答一句话：找本机的管理员角色（请求指定了就用它，没有就用第一个；一个都没有就如实说没有，不换别的角色）。
+/// 只是说话：没有任何工具，提议由服务端核对、人确认后才会执行。
+async fn admin_answer(roles: &roles::RoleStore, ask: protocol::AdminAsk) -> protocol::AdminAnswer {
+    let fail = |error: String| protocol::AdminAnswer { ask_id: ask.ask_id, ok: false, reply: String::new(), proposals: vec![], error };
+    let configs = roles.configs();
+    let Some(role) = configs.iter().find(|r| r.slot == protocol::RoleSlot::Planner && ask.role_id.as_deref().is_none_or(|id| r.id == id)) else {
+        return fail("这个节点没有配置「管理员」角色（或指定的角色不存在），请先在「角色与模型」页配置并检测".into());
+    };
+    match agent::admin::answer(role.source, Some(role.default.model.clone()), role.default.effort.clone(), &ask).await {
+        Ok((reply, proposals, dropped)) => {
+            let reply = if dropped > 0 { format!("{reply}\n\n（管理员有 {dropped} 条提议格式不对或不在允许的范围内，已忽略。）") } else { reply };
+            protocol::AdminAnswer { ask_id: ask.ask_id, ok: true, reply, proposals, error: String::new() }
+        }
+        Err((reason, quota)) => {
+            if quota {
+                tracing::warn!("管理员角色额度用完，已停止，不换计费方式");
+            }
+            fail(reason)
         }
     }
 }
@@ -586,6 +615,32 @@ mod tests {
         assert_eq!(load_node_id(&dir), Some(id));
         std::fs::write(node_id_path(&dir), "不是 uuid").unwrap();
         assert_eq!(load_node_id(&dir), None, "文件内容坏了要当作没有，而不是报错退出");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn 没有管理员角色时如实回答没有_不换别的角色() {
+        let dir = std::env::temp_dir().join(format!("node_admin_{}", Uuid::new_v4()));
+        let store = roles::RoleStore::open(&dir, roles::real_probe());
+        // 只配了一个判定员：不能拿来当管理员
+        store
+            .set(vec![protocol::RoleSet {
+                config: protocol::RoleConfig {
+                    id: "j".into(),
+                    slot: protocol::RoleSlot::Judge,
+                    name: "判定员".into(),
+                    source: ModelSource::ClaudeCli,
+                    default: protocol::RoleDefault { model: "m".into(), effort: None },
+                    models: vec![protocol::RoleModelOption { model: "m".into(), efforts: vec![] }],
+                },
+                api_key: None,
+            }])
+            .unwrap();
+        let ask = protocol::AdminAsk { ask_id: Uuid::new_v4(), role_id: None, context: "现状".into(), history: vec![], message: "你好".into() };
+        let answer = admin_answer(&store, ask.clone()).await;
+        assert!(!answer.ok && answer.proposals.is_empty());
+        assert!(answer.error.contains("没有配置「管理员」角色"), "{}", answer.error);
+        assert_eq!(answer.ask_id, ask.ask_id);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

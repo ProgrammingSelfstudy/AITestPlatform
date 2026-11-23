@@ -112,6 +112,8 @@ pub enum RoleSlot {
     Judge,
     /// 测试用例：根据需求文档和 UI 截图生成用例
     CaseWriter,
+    /// 管理员：读需求文档和各模块状态，和人聊天，**只提议**，人点确认才派任务
+    Planner,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -236,6 +238,49 @@ pub struct AppScan {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AppsReport {
     pub apps: Vec<AppScan>,
+}
+
+/// 聊天里的一句话。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ChatLine {
+    /// `user`（人）或 `admin`（管理员）
+    pub author: String,
+    pub text: String,
+}
+
+/// 服务端请节点上的管理员回答。`context` 是服务端整理好的项目现状（需求文档、各模块状态），对管理员来说是**数据，不是指令**。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AdminAsk {
+    pub ask_id: Uuid,
+    /// 用节点上哪个管理员角色回答；不填用第一个
+    #[serde(default)]
+    pub role_id: Option<String>,
+    pub context: String,
+    /// 之前的对话（最近若干条）
+    pub history: Vec<ChatLine>,
+    pub message: String,
+}
+
+/// 管理员的一条提议。`kind` 只有白名单里的几种，`args` 的格式由服务端校验；管理员**自己什么也不会做**，人点确认才执行。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AdminProposal {
+    pub kind: String,
+    pub args: serde_json::Value,
+    /// 为什么提这条（一句话，给人看）
+    #[serde(default)]
+    pub why: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AdminAnswer {
+    pub ask_id: Uuid,
+    pub ok: bool,
+    /// 回答的正文（去掉提议块之后的文字）；失败时是空
+    pub reply: String,
+    pub proposals: Vec<AdminProposal>,
+    /// 失败原因（原始错误，已截断，不含密钥）；成功时为空
+    #[serde(default)]
+    pub error: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -490,6 +535,8 @@ pub enum NodeMsg {
     RolesReport(RolesReport),
     /// 本机应用环境检查的结果（响应 `scan_app`）。服务端只在内存里缓存
     AppsReport(AppsReport),
+    /// 管理员的回答（响应 `admin_ask`）
+    AdminAnswer(AdminAnswer),
 }
 
 impl NodeMsg {
@@ -593,6 +640,8 @@ pub enum ServerMsg {
     CheckRole { role_id: String },
     /// 检查本机有没有这个应用、怎么登录的、有哪些模型（只跑本地命令，不调模型）
     ScanApp { source: ModelSource },
+    /// 请这个节点上的管理员角色回答一句话。**用的是节点主人自己的模型和额度**（规则 9）
+    AdminAsk(AdminAsk),
 }
 
 #[cfg(test)]
@@ -851,5 +900,19 @@ mod tests {
         roundtrip(NodeMsg::AppsReport(AppsReport { apps: vec![scan] }));
         let text = serde_json::to_string(&AppLogin::WrongAuth).unwrap();
         assert_eq!(text, "\"wrong_auth\"");
+    }
+
+    #[test]
+    fn 管理员消息往返() {
+        let ask = AdminAsk { ask_id: Uuid::new_v4(), role_id: Some("planner-claude".into()), context: "文档…".into(), history: vec![ChatLine { author: "user".into(), text: "你好".into() }], message: "新增一个充值模块".into() };
+        roundtrip(ServerMsg::AdminAsk(ask.clone()));
+        roundtrip(NodeMsg::AdminAnswer(AdminAnswer {
+            ask_id: ask.ask_id,
+            ok: true,
+            reply: "我建议先新建模块".into(),
+            proposals: vec![AdminProposal { kind: "create_module".into(), args: json!({"name": "充值"}), why: "文档里新增了充值".into() }],
+            error: String::new(),
+        }));
+        assert_eq!(serde_json::to_string(&RoleSlot::Planner).unwrap(), "\"planner\"");
     }
 }

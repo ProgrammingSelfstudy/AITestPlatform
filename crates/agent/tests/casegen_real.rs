@@ -75,3 +75,22 @@ async fn claude_复核用例() {
 async fn agy_复核用例() {
     review_run(ModelSource::Agy, "gemini-4-neon-high").await;
 }
+
+/// 管理员对真实 Claude 说一句话（默认忽略，花少量额度）：合成的项目现状，一条已批准的用例，让它提议发起测试。
+/// 只断言「回答能解析、提议在白名单里」，并打印回答供人看。
+#[tokio::test]
+#[ignore]
+async fn claude_管理员回答并提议() {
+    let ask = protocol::AdminAsk {
+        ask_id: uuid::Uuid::nil(),
+        role_id: None,
+        context: "【需求文档（最新）】\n语聊房：用户可以进入语聊房、上麦。\n\n【模块】\n- 模块「语聊房」：用例 2 条，已批准 1 条，需要人工确认 1 条，正在测试的 run 0 个\n    已批准用例 GEN-aaaaaa-01：进入语聊房\n".into(),
+        history: vec![],
+        message: "语聊房模块现在能测吗？能的话帮我安排一下。".into(),
+    };
+    let (reply, proposals, dropped) = agent::admin::answer(ModelSource::ClaudeCli, Some("claude-opus-5-5".into()), None, &ask).await.expect("管理员应当回答成功");
+    println!("回答：{reply}\n提议：{proposals:#?}\n被丢掉：{dropped}");
+    assert!(!reply.trim().is_empty());
+    assert!(!reply.contains("<proposals>"), "回答正文里不应留下提议块");
+    assert!(proposals.iter().all(|p| agent::admin::KINDS.contains(&p.kind.as_str())));
+}

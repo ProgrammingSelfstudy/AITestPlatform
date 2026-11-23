@@ -67,6 +67,7 @@ fn lazy_state() -> AppState {
         conns: tokio::sync::Mutex::new(HashMap::new()),
         roles: Default::default(),
         apps: Default::default(),
+        admin_asks: Default::default(),
     }))
 }
 
@@ -982,6 +983,215 @@ async fn 数据大家共用_我可以用自己的节点和额度跑别人的用�
     let (status, _, bytes) = run_as("runner", world.node).await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{}", text(&bytes));
     assert!(text(&bytes).contains("各人自己的额度"), "{}", text(&bytes));
+}
+
+// ---------------------------------------------------------------- 管理员：只提议，人点确认才执行
+
+fn planner_roles_report() -> protocol::RolesReport {
+    protocol::RolesReport {
+        roles: vec![
+            report_role("planner", protocol::RoleSlot::Planner, ModelSource::ClaudeCli, "m", &[], None, protocol::CheckStatus::Ok),
+            report_role("exec", protocol::RoleSlot::Executor, ModelSource::CodexExec, "执行模型", &["high"], Some("high"), protocol::CheckStatus::Ok),
+            report_role("judge", protocol::RoleSlot::Judge, ModelSource::ClaudeCli, "判定模型", &[], None, protocol::CheckStatus::Ok),
+        ],
+    }
+}
+
+fn admin_post(world: &World, name: &'static str, path: String, body: Value) -> impl std::future::Future<Output = (StatusCode, Bytes)> {
+    let mut h = review_headers(REVIEW_TOKEN);
+    h.push(("x-user-name", name));
+    let app = world.app.clone();
+    async move {
+        let (status, _, bytes) = request(&app, Method::POST, &path, &h, body.to_string()).await;
+        (status, bytes)
+    }
+}
+
+async fn admin_chat(world: &World, name: &'static str) -> Value {
+    json_body(&request(&world.app, Method::GET, "/api/admin/chat", &user_headers(name), "").await.2)
+}
+
+fn answer(ask_id: Uuid, reply: &str, proposals: Vec<protocol::AdminProposal>) -> protocol::AdminAnswer {
+    protocol::AdminAnswer { ask_id, ok: true, reply: reply.into(), proposals, error: String::new() }
+}
+
+fn proposal(kind: &str, args: Value) -> protocol::AdminProposal {
+    protocol::AdminProposal { kind: kind.into(), args, why: "测试".into() }
+}
+
+#[tokio::test]
+async fn 管理员_发消息要有名字_有能回答的节点_同时只问一句() {
+    let world = World::new().await;
+    // 没填名字 401；查看对话也要先说是谁（对话是各人自己的）
+    assert_eq!(request(&world.app, Method::GET, "/api/admin/chat", &[], "").await.0, StatusCode::UNAUTHORIZED);
+    let mut h = review_headers(REVIEW_TOKEN);
+    assert_eq!(request(&world.app, Method::POST, "/api/admin/messages", &h, json!({"message": "你好"}).to_string()).await.0, StatusCode::UNAUTHORIZED);
+    h.push(("x-user-name", USER_NAME));
+    // 节点不在线 / 没有检测通过的管理员角色：400 并说明
+    let (status, bytes) = admin_post(&world, USER_NAME, "/api/admin/messages".into(), json!({"message": "你好"})).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(text(&bytes).contains("没有能回答的节点") && text(&bytes).contains("不在线"), "{}", text(&bytes));
+    let mut node_rx = world.state.connect_fake_node(world.node).await;
+    let (status, bytes) = admin_post(&world, USER_NAME, "/api/admin/messages".into(), json!({"message": "你好"})).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(text(&bytes).contains("管理员"), "{}", text(&bytes));
+    world.state.set_roles_report_for_test(world.node, planner_roles_report());
+    // 空消息 400
+    assert_eq!(admin_post(&world, USER_NAME, "/api/admin/messages".into(), json!({"message": "  "})).await.0, StatusCode::BAD_REQUEST);
+    // 正常发出去：节点收到提问，带着项目现状；同时只能问一句
+    let (status, bytes) = admin_post(&world, USER_NAME, "/api/admin/messages".into(), json!({"message": "新增了充值需求"})).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{}", text(&bytes));
+    let Some(protocol::ServerMsg::AdminAsk(ask)) = node_rx.recv().await else { panic!("节点应当收到管理员提问") };
+    assert_eq!((ask.message.as_str(), ask.role_id.as_deref()), ("新增了充值需求", Some("planner")));
+    assert!(ask.context.contains("需求文档") && ask.context.contains("模块"), "{}", ask.context);
+    assert_eq!(admin_post(&world, USER_NAME, "/api/admin/messages".into(), json!({"message": "再问一句"})).await.0, StatusCode::CONFLICT);
+    assert!(admin_chat(&world, USER_NAME).await["pending"]["ask_id"].is_string());
+}
+
+#[tokio::test]
+async fn 管理员_提议先核对_确认才执行_管理员自己什么也不做() {
+    let world = World::new().await;
+    // 先有一批已批准的用例（测试用户自己生成并批准）
+    let (module, _, codes) = generated_module(&world, "语聊房").await;
+    sqlx::query("update test_cases set review_status = 'approved' where module_id = $1 and code = $2").bind(module).bind(&codes[0]).execute(world.state.pool()).await.unwrap();
+    let mut node_rx = world.state.connect_fake_node(world.node).await;
+    world.state.set_roles_report_for_test(world.node, planner_roles_report());
+    let (status, _) = admin_post(&world, USER_NAME, "/api/admin/messages".into(), json!({"message": "新增了充值需求，帮我安排"})).await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let Some(protocol::ServerMsg::AdminAsk(ask)) = node_rx.recv().await else { panic!("节点应当收到提问") };
+    // 现状里有已批准的用例，管理员能看到
+    assert!(ask.context.contains(&codes[0]), "{}", ask.context);
+    // 管理员回答：两条好的提议，加几条有问题的（不存在的模块、没批准的用例、已有的模块、自己批准用例）
+    let reply = answer(ask.ask_id, "建议新建充值模块，并测一下语聊房", vec![
+        proposal("create_module", json!({"name": "充值"})),
+        proposal("run_tests", json!({"module": "语聊房", "case_codes": [codes[0], codes[1], "GEN-不存在"]})),
+        proposal("run_tests", json!({"module": "不存在的模块", "case_codes": [codes[0]]})),
+        proposal("run_tests", json!({"module": "语聊房", "case_codes": [codes[1]]})),
+        proposal("create_module", json!({"name": "语聊房"})),
+        proposal("approve_case", json!({"code": codes[1]})),
+    ]);
+    crate::admin::on_answer(world.state.pool(), world.state.admin_asks(), world.node, reply).await.unwrap();
+    let chat = admin_chat(&world, USER_NAME).await;
+    assert!(chat["pending"].is_null());
+    let messages = chat["messages"].as_array().unwrap();
+    assert_eq!(messages.iter().map(|m| m["author"].as_str().unwrap()).collect::<Vec<_>>(), ["user", "admin"]);
+    let admin = &messages[1];
+    let text_of_admin = admin["text"].as_str().unwrap();
+    assert!(text_of_admin.contains("核对不通过") && text_of_admin.contains("不存在的模块") && text_of_admin.contains("已经存在"), "{text_of_admin}");
+    let proposals = admin["proposals"].as_array().unwrap();
+    assert_eq!(proposals.len(), 2, "只有通过核对的两条变成卡片：{proposals:?}");
+    assert!(proposals.iter().all(|p| p["status"] == "pending"));
+    // 还没点确认：什么都没发生（没建模块、没建任务）
+    let modules: i64 = sqlx::query_scalar("select count(*) from modules where name = '充值'").fetch_one(world.state.pool()).await.unwrap();
+    let tasks: i64 = sqlx::query_scalar("select count(*) from tasks").fetch_one(world.state.pool()).await.unwrap();
+    assert_eq!((modules, tasks), (0, 0), "管理员只提议，不动手");
+    let create_id = proposals.iter().find(|p| p["kind"] == "create_module").unwrap()["id"].as_str().unwrap().to_string();
+    let run_id = proposals.iter().find(|p| p["kind"] == "run_tests").unwrap()["id"].as_str().unwrap().to_string();
+    // run_tests 里只留下真的存在且已批准的那一条用例
+    assert_eq!(proposals.iter().find(|p| p["kind"] == "run_tests").unwrap()["args"]["case_codes"], json!([codes[0]]));
+    // 别人（没填名字 / 另一个人）不能确认你的提议
+    sqlx::query("insert into users (name) values ('admin-other')").execute(world.state.pool()).await.unwrap();
+    assert_eq!(admin_post(&world, "admin-other", format!("/api/admin/proposals/{create_id}/confirm"), json!({})).await.0, StatusCode::NOT_FOUND);
+    assert_eq!(request(&world.app, Method::POST, &format!("/api/admin/proposals/{create_id}/confirm"), &review_headers(REVIEW_TOKEN), "{}").await.0, StatusCode::UNAUTHORIZED);
+    // 确认新建模块：真的建了；再点一次不会再建（已经处理过）
+    let (status, bytes) = admin_post(&world, USER_NAME, format!("/api/admin/proposals/{create_id}/confirm"), json!({})).await;
+    assert_eq!(status, StatusCode::OK, "{}", text(&bytes));
+    let modules: i64 = sqlx::query_scalar("select count(*) from modules where name = '充值'").fetch_one(world.state.pool()).await.unwrap();
+    assert_eq!(modules, 1);
+    assert_eq!(admin_post(&world, USER_NAME, format!("/api/admin/proposals/{create_id}/confirm"), json!({})).await.0, StatusCode::NOT_FOUND);
+    // 确认发起测试：用你的节点建任务，用节点上检测通过的执行员和判定员角色
+    let (status, bytes) = admin_post(&world, USER_NAME, format!("/api/admin/proposals/{run_id}/confirm"), json!({})).await;
+    assert_eq!(status, StatusCode::OK, "{}", text(&bytes));
+    let task = json_body(&bytes)["next"]["task_id"].as_str().unwrap().to_string();
+    let (node, executor, judge): (Uuid, Value, Value) = sqlx::query_as("select node_id, executor, judge from tasks where id = $1::uuid").bind(&task).fetch_one(world.state.pool()).await.unwrap();
+    assert_eq!(node, world.node);
+    assert_eq!((executor["source"].as_str(), executor["model"].as_str()), (Some("codex_exec"), Some("执行模型")));
+    assert_eq!((judge["source"].as_str(), judge["model"].as_str()), (Some("claude_cli"), Some("判定模型")));
+    let after = admin_chat(&world, USER_NAME).await;
+    let statuses: Vec<&str> = after["messages"][1]["proposals"].as_array().unwrap().iter().map(|p| p["status"].as_str().unwrap()).collect();
+    assert_eq!(statuses, ["confirmed", "confirmed"]);
+}
+
+#[tokio::test]
+async fn 管理员_忽略提议_确认时已经过期或节点不在线都如实失败() {
+    let world = World::new().await;
+    let (module, _, codes) = generated_module(&world, "语聊房").await;
+    sqlx::query("update test_cases set review_status = 'approved' where module_id = $1").bind(module).execute(world.state.pool()).await.unwrap();
+    let mut node_rx = world.state.connect_fake_node(world.node).await;
+    world.state.set_roles_report_for_test(world.node, planner_roles_report());
+    let ask_for = |text: &'static str| {
+        let (app, mut h) = (world.app.clone(), review_headers(REVIEW_TOKEN));
+        h.push(("x-user-name", USER_NAME));
+        async move { request(&app, Method::POST, "/api/admin/messages", &h, json!({"message": text}).to_string()).await.0 }
+    };
+    // 第一轮：一条发起测试，一条新建模块
+    assert_eq!(ask_for("第一句").await, StatusCode::ACCEPTED);
+    let Some(protocol::ServerMsg::AdminAsk(first)) = node_rx.recv().await else { panic!() };
+    crate::admin::on_answer(world.state.pool(), world.state.admin_asks(), world.node, answer(first.ask_id, "好", vec![
+        proposal("run_tests", json!({"module": "语聊房", "case_codes": [codes[0]]})),
+        proposal("create_module", json!({"name": "支付"})),
+    ])).await.unwrap();
+    let chat = admin_chat(&world, USER_NAME).await;
+    let props = chat["messages"][1]["proposals"].as_array().unwrap().clone();
+    let id_of = |kind: &str| props.iter().find(|p| p["kind"] == kind).unwrap()["id"].as_str().unwrap().to_string();
+    // 忽略：不执行，状态是 dismissed，之后再确认不行
+    let dismiss = id_of("create_module");
+    let mut dismiss_headers = WRITE_HEADERS.to_vec();
+    dismiss_headers.push(("x-user-name", USER_NAME));
+    let (status, _, _) = request(&world.app, Method::POST, &format!("/api/admin/proposals/{dismiss}/dismiss"), &dismiss_headers, "{}").await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(admin_post(&world, USER_NAME, format!("/api/admin/proposals/{dismiss}/confirm"), json!({})).await.0, StatusCode::NOT_FOUND);
+    let n: i64 = sqlx::query_scalar("select count(*) from modules where name = '支付'").fetch_one(world.state.pool()).await.unwrap();
+    assert_eq!(n, 0);
+    // 确认前用例被人拒绝了：提议过期，如实失败，不建任务
+    sqlx::query("update test_cases set review_status = 'rejected' where module_id = $1").bind(module).execute(world.state.pool()).await.unwrap();
+    let (status, bytes) = admin_post(&world, USER_NAME, format!("/api/admin/proposals/{}/confirm", id_of("run_tests")), json!({})).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(text(&bytes).contains("过期"), "{}", text(&bytes));
+    let tasks: i64 = sqlx::query_scalar("select count(*) from tasks").fetch_one(world.state.pool()).await.unwrap();
+    assert_eq!(tasks, 0);
+    let st: String = sqlx::query_scalar("select status from admin_proposals where id = $1::uuid").bind(id_of("run_tests")).fetch_one(world.state.pool()).await.unwrap();
+    assert_eq!(st, "failed");
+    // 第二轮：用例恢复批准，但确认时节点已经断线：如实说节点不在线，不建任务
+    sqlx::query("update test_cases set review_status = 'approved' where module_id = $1").bind(module).execute(world.state.pool()).await.unwrap();
+    assert_eq!(ask_for("第二句").await, StatusCode::ACCEPTED);
+    let Some(protocol::ServerMsg::AdminAsk(second)) = node_rx.recv().await else { panic!() };
+    crate::admin::on_answer(world.state.pool(), world.state.admin_asks(), world.node, answer(second.ask_id, "再来", vec![proposal("run_tests", json!({"module": "语聊房", "case_codes": [codes[0]]}))])).await.unwrap();
+    let chat = admin_chat(&world, USER_NAME).await;
+    let id = chat["messages"].as_array().unwrap().last().unwrap()["proposals"][0]["id"].as_str().unwrap().to_string();
+    world.state.disconnect_fake_node_for_test(world.node).await;
+    let (status, bytes) = admin_post(&world, USER_NAME, format!("/api/admin/proposals/{id}/confirm"), json!({})).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(text(&bytes).contains("不在线"), "{}", text(&bytes));
+}
+
+#[tokio::test]
+async fn 管理员_回答失败如实显示_别的节点冒送的回答被忽略() {
+    let world = World::new().await;
+    let mut node_rx = world.state.connect_fake_node(world.node).await;
+    world.state.set_roles_report_for_test(world.node, planner_roles_report());
+    let mut h = review_headers(REVIEW_TOKEN);
+    h.push(("x-user-name", USER_NAME));
+    assert_eq!(request(&world.app, Method::POST, "/api/admin/messages", &h, json!({"message": "你好"}).to_string()).await.0, StatusCode::ACCEPTED);
+    let Some(protocol::ServerMsg::AdminAsk(ask)) = node_rx.recv().await else { panic!() };
+    // 别的节点送来对应这个提问的回答：忽略（提问还在等）
+    let intruder = Uuid::new_v4();
+    crate::admin::on_answer(world.state.pool(), world.state.admin_asks(), intruder, answer(ask.ask_id, "冒充", vec![])).await.unwrap();
+    assert!(admin_chat(&world, USER_NAME).await["pending"]["ask_id"].is_string(), "冒送的回答不能结束这次提问");
+    // 自己的节点回报失败（额度用完等）：原样显示原因，标成错误
+    let failed = protocol::AdminAnswer { ask_id: ask.ask_id, ok: false, reply: String::new(), proposals: vec![], error: "Claude 会员额度用完或被限流".into() };
+    crate::admin::on_answer(world.state.pool(), world.state.admin_asks(), world.node, failed).await.unwrap();
+    let chat = admin_chat(&world, USER_NAME).await;
+    let last = chat["messages"].as_array().unwrap().last().unwrap().clone();
+    assert_eq!(last["is_error"], true);
+    assert!(last["text"].as_str().unwrap().contains("额度用完"));
+    assert!(chat["pending"].is_null());
+    // 同一个回答再送一次：已经处理过，忽略
+    crate::admin::on_answer(world.state.pool(), world.state.admin_asks(), world.node, answer(ask.ask_id, "重复", vec![])).await.unwrap();
+    assert_eq!(admin_chat(&world, USER_NAME).await["messages"].as_array().unwrap().len(), 2);
+    // 别人看不到你的对话
+    sqlx::query("insert into users (name) values ('admin-peek')").execute(world.state.pool()).await.unwrap();
+    assert_eq!(admin_chat(&world, "admin-peek").await["messages"].as_array().unwrap().len(), 0);
 }
 
 struct World {

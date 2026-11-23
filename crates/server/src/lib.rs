@@ -3,6 +3,7 @@
 //! 服务默认只监听本机（`PLATFORM_ALLOW_LAN=1` 才允许放开局域网，见 main.rs）。账号明文只经节点令牌认证的一次性接口交给执行节点。
 
 pub mod accounts;
+mod admin;
 mod api;
 pub mod cases;
 mod evidence_sign;
@@ -85,6 +86,8 @@ struct Inner {
     roles: std::sync::Mutex<HashMap<Uuid, protocol::RolesReport>>,
     /// 各节点最近一次本机应用环境检查的结果（按来源保存最新一条）。只在内存里。
     apps: std::sync::Mutex<HashMap<Uuid, HashMap<protocol::ModelSource, protocol::AppScan>>>,
+    /// 还没回答的管理员提问（问出去、节点还没回）。只在内存里
+    admin_asks: admin::PendingAsks,
 }
 
 #[derive(Clone)]
@@ -145,6 +148,7 @@ impl AppState {
             conns: Mutex::new(HashMap::new()),
             roles: Default::default(),
             apps: Default::default(),
+            admin_asks: Default::default(),
         })))
     }
 
@@ -286,9 +290,27 @@ impl AppState {
         self.0.roles.lock().unwrap().get(&node_id).cloned()
     }
 
+    pub(crate) fn admin_asks(&self) -> &admin::PendingAsks {
+        &self.0.admin_asks
+    }
+
     /// 节点最近一次对各应用的环境检查结果。
     pub fn app_scans(&self, node_id: Uuid) -> HashMap<protocol::ModelSource, protocol::AppScan> {
         self.0.apps.lock().unwrap().get(&node_id).cloned().unwrap_or_default()
+    }
+
+    /// 仅测试：假装这个节点连着（没有真的 WebSocket），返回「服务端发给节点的消息」的接收端，测试里可以看到发出去了什么。
+    #[cfg(test)]
+    pub(crate) async fn connect_fake_node(&self, node_id: Uuid) -> mpsc::UnboundedReceiver<ServerMsg> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.0.conns.lock().await.insert(node_id, Conn { conn_id: Uuid::new_v4(), tx });
+        rx
+    }
+
+    /// 仅测试：假装节点断线了。
+    #[cfg(test)]
+    pub(crate) async fn disconnect_fake_node_for_test(&self, node_id: Uuid) {
+        self.0.conns.lock().await.remove(&node_id);
     }
 
     /// 仅测试：直接放一条应用检查结果。
@@ -433,6 +455,7 @@ impl AppState {
                 tracing::warn!(%node_id, run_id = %n.run_id, kind = ?n.kind, "run 需要人工：{}", n.reason);
                 Ok(())
             }
+            NodeMsg::AdminAnswer(answer) => admin::on_answer(pool, &self.0.admin_asks, node_id, answer).await.map_err(Into::into),
             NodeMsg::AppsReport(report) => {
                 let mut all = self.0.apps.lock().unwrap();
                 let node = all.entry(node_id).or_default();
@@ -826,6 +849,7 @@ mod credential_auth_tests {
             conns: Mutex::new(HashMap::new()),
             roles: Default::default(),
             apps: Default::default(),
+            admin_asks: Default::default(),
         }));
         let lease = Uuid::new_v4().to_string();
         for (authorization, status) in [
