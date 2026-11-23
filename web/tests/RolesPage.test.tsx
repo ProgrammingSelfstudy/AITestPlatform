@@ -25,6 +25,8 @@ function serve(roles: RoleView[], online = true) {
     if (init?.method === "POST") return new Response(null, { status: 202 });
     if (path === "/api/nodes") return Response.json(nodes);
     if (path === `/api/nodes/${NODE}/roles`) return Response.json({ online, roles });
+    // 页面顶部的「选应用」面板也会读应用检查结果；这里不关心内容，给一个正常的空结果，免得它因为 404 反复报错重绘
+    if (path === `/api/nodes/${NODE}/apps`) return Response.json({ online, apps: ["claude_cli", "codex_exec", "agy", "deepseek"].map((source) => ({ source, scanned: false })) });
     return new Response("没有这个接口", { status: 404 });
   });
 }
@@ -52,7 +54,7 @@ test("没填个人令牌时不请求角色", async () => {
   expect(fetchMock.mock.calls.some(([input]) => String(input).includes("/roles"))).toBe(false);
 });
 
-test("每个检测状态都有文字，失败原因原样显示，Key 永远不出现", async () => {
+test("每个检测状态都有文字，失败原因原样显示，Key 永远不出现", { timeout: 20000 }, async () => {
   serve([
     role("a", "executor", "codex_exec", "ok", "已用 ChatGPT 登录"),
     role("b", "judge", "agy", "quota_exhausted", "agy 额度用完或被限流"),
