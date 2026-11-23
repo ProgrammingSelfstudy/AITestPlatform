@@ -15,7 +15,7 @@ use serde::Deserialize;
 use serde_json::json;
 use uuid::Uuid;
 
-use crate::selfcheck_run::{authed, describe, environment_failure, run_pytest, tail, write_package, CheckConfig};
+use crate::selfcheck_run::{authed, describe, environment_failure, run_pytest, scrub, tail, write_package, CheckConfig};
 
 #[derive(Debug)]
 pub struct Outcome {
@@ -40,7 +40,7 @@ pub async fn regress(cfg: &CheckConfig, project: &str, case_code: &str) -> anyho
 /// 同 [`regress`]；`expect` 给了就必须正好是这个脚本：页面请求回归的是排队时那个获准版本，
 /// 排队期间换了版本就不回归，免得把「另一个版本的结果」记成人点的那次。
 pub async fn regress_script(cfg: &CheckConfig, project: &str, case_code: &str, expect: Option<Uuid>) -> anyhow::Result<Outcome> {
-    let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(30)).build()?;
+    let client = crate::platform_client(std::time::Duration::from_secs(30))?;
     let mut url = cfg.platform_http.clone();
     url.path_segments_mut().map_err(|_| anyhow::anyhow!("平台地址不能带路径"))?.pop_if_empty().extend(["api", "projects", project, "cases", case_code, "approved-script"]);
     let response = authed(cfg, client.get(url)).send().await.context("连不上平台服务端")?;
@@ -64,10 +64,10 @@ pub async fn regress_script(cfg: &CheckConfig, project: &str, case_code: &str, e
     let elapsed = started.elapsed();
 
     if let Some(marker) = environment_failure(&output) {
-        bail!("{marker}，属于环境问题，不记录这次回归。原始输出：\n{}", tail(&output));
+        bail!("{marker}，属于环境问题，不记录这次回归。原始输出：\n{}", scrub(cfg, &tail(&output)));
     }
     let passed = code == Some(0);
-    let detail = describe(passed, code, &output, &script.case_code, script.version);
+    let detail = scrub(cfg, &describe(passed, code, &output, &script.case_code, script.version));
     let body = json!({"serial": cfg.serial, "passed": passed, "detail": detail, "duration_ms": elapsed.as_millis().min(i32::MAX as u128) as u64});
     let mut report = cfg.platform_http.clone();
     report.path_segments_mut().map_err(|_| anyhow::anyhow!("平台地址不能带路径"))?.pop_if_empty().extend(["api", "scripts", &script.id.to_string(), "regressions"]);

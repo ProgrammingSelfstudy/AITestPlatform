@@ -1,7 +1,9 @@
-use super::python::{Kind, Statement, Token, split};
+use super::python::{Kind, Statement, Token, comma_parts, split};
 
 pub(super) fn check_try(stmt: &Statement<'_>, mut report: impl FnMut(usize, &str)) {
     let body_has_assertion = stmt.body.iter().any(contains_assertion);
+    // else 里的断言只有 try 体不抛异常才会执行：except 一旦吞掉异常，else 的断言就被跳过，测试在没断言的情况下通过
+    let else_has_assertion = stmt.clauses.iter().any(|clause| clause.is("else") && clause.body.iter().any(contains_assertion));
     let mut assertion_before_finally = body_has_assertion;
     for clause in &stmt.clauses {
         if clause.is("except") {
@@ -13,10 +15,10 @@ pub(super) fn check_try(stmt: &Statement<'_>, mut report: impl FnMut(usize, &str
                     .is_some_and(|name| name.is("BaseException"))
             {
                 report(clause.line(), "禁止裸 except 和 except BaseException");
-            } else if body_has_assertion && !propagates_failure(&clause.body) {
+            } else if (body_has_assertion || else_has_assertion) && !propagates_failure(&clause.body) {
                 report(
                     clause.line(),
-                    "except 可能吞掉断言，处理路径必须执行 raise 或 pytest.fail(...)",
+                    "except 可能吞掉断言（含 else 里的断言会被跳过），处理路径必须执行 raise 或 pytest.fail(...)",
                 );
             }
         }
@@ -28,6 +30,46 @@ pub(super) fn check_try(stmt: &Statement<'_>, mut report: impl FnMut(usize, &str
             assertion_before_finally |= clause.body.iter().any(contains_assertion);
         }
     }
+}
+
+/// 恒真的断言和恒假的分支：写了 assert 却永远不会失败、或者永远不会执行。
+/// 只认字面量（`True`、非零数字、非空字符串、`x or True`；`False`、`None`、`0`、空字符串），不做常量折叠，是启发式。
+pub(super) fn check_constant(stmt: &Statement<'_>, mut report: impl FnMut(usize, &str)) {
+    let head = &stmt.head[1..];
+    if stmt.is("assert") {
+        let condition = comma_parts(head).next().map_or(&[][..], strip_parens);
+        let always_true = matches!(condition, [only] if truthy_literal(only))
+            || condition.windows(2).any(|pair| pair[0].is("or") && truthy_literal(&pair[1]));
+        if always_true {
+            report(stmt.line(), "断言的条件恒为真，永远不会失败，不能当作对预期的断言");
+        }
+    } else if (stmt.is("if") || stmt.is("elif") || stmt.is("while")) && stmt.body.iter().any(contains_assertion) {
+        if matches!(strip_parens(head), [only] if falsy_literal(only)) {
+            report(stmt.line(), "条件恒为假，里面的断言永远不会执行");
+        }
+    }
+}
+
+fn truthy_literal(token: &Token<'_>) -> bool {
+    match &token.kind {
+        Kind::Word("True") => true,
+        Kind::Number(text) => !is_zero(text),
+        Kind::String(literal) => !literal.text.is_empty(),
+        _ => false,
+    }
+}
+
+fn falsy_literal(token: &Token<'_>) -> bool {
+    match &token.kind {
+        Kind::Word("False" | "None") => true,
+        Kind::Number(text) => is_zero(text),
+        Kind::String(literal) => literal.text.is_empty() && !literal.formatted,
+        _ => false,
+    }
+}
+
+fn is_zero(text: &str) -> bool {
+    text.chars().all(|c| matches!(c, '0' | '.' | '_'))
 }
 
 pub(super) fn count(statements: &[Statement<'_>]) -> usize {

@@ -33,7 +33,13 @@ use tokio_tungstenite::tungstenite::Message;
 pub use runner::{NoExecutor, Reporter, RunExecutor, Runner};
 use uuid::Uuid;
 
-fn platform_client(timeout: Duration) -> reqwest::Result<reqwest::Client> {
+/// 占住某台设备的本地锁，直到返回值被丢弃。节点自己的任务执行器、页面发起的回归都用同一把按序列号的锁；
+/// 对外公开是为了让集成测试能模拟「设备正被本地的录屏和收尾占着」。
+pub async fn hold_device(serial: &str) -> impl Send + Sync + 'static {
+    recorder::lock_device(serial).await
+}
+
+pub(crate) fn platform_client(timeout: Duration) -> reqwest::Result<reqwest::Client> {
     reqwest::Client::builder()
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())

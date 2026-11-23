@@ -130,6 +130,22 @@ pub(crate) fn check_with_redactions(
     violations
 }
 
+/// 测试文件里所有顶层 `test_` 函数的显式 `assert` 数量（按解析结果数，不是按行首匹配）。
+/// 文档字符串、注释里的 `assert` 不算，嵌套定义里的不算，`try` 体里的不算（和规则 8 的计数一致）。
+/// 文件缺失或解析不了返回 0。给自愈用：修复版的断言数量不能比原脚本少。
+pub fn assertion_count(files: &BTreeMap<String, String>, case_code: &str) -> usize {
+    let Some(key) = case_key(case_code) else { return 0 };
+    let Some(source) = files.get(&format!("test_{key}.py")) else { return 0 };
+    let source = source.replace("\r\n", "\n").replace('\r', "\n");
+    let Ok(lines) = python::lex(&source) else { return 0 };
+    let Ok(suite) = python::parse(&lines) else { return 0 };
+    suite
+        .iter()
+        .filter(|stmt| stmt.is("def") && stmt.head[1].name().is_some_and(|name| name.starts_with("test_")))
+        .map(|stmt| assertions::count(&stmt.body))
+        .sum()
+}
+
 pub(crate) fn contains_sensitive(text: &str, redactions: &[(String, String)]) -> bool {
     sensitive::contains(text) || contains_known(text, redactions)
 }
@@ -188,6 +204,9 @@ impl FileCheck<'_, '_> {
                         self.report(stmt.line(), 9, "sleep 必须直接调用并使用不超过 3 秒的常量");
                     }
                 }
+            }
+            if stmt.is("assert") || stmt.is("if") || stmt.is("elif") || stmt.is("while") {
+                assertions::check_constant(stmt, |line, message| self.report(line, 8, message));
             }
             if stmt.is("for") {
                 let (_, iterable) = split(&stmt.head[1..], "in").expect("for 已解析");

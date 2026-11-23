@@ -22,8 +22,12 @@ pub enum RequestError {
     NotApproved(String),
     #[error("这个脚本在该节点上已经有一个排队或运行中的回归请求")]
     Duplicate,
-    #[error("没有这个回归请求，或它已经不是这个状态")]
+    #[error("没有这个回归请求")]
     NotFound,
+    #[error("{0}")]
+    Conflict(&'static str),
+    #[error("这个回归请求不是你的节点领走的")]
+    NotYours,
     #[error(transparent)]
     Db(#[from] sqlx::Error),
 }
@@ -71,10 +75,29 @@ pub async fn node_of(pool: &PgPool, id: Uuid) -> Result<Option<Uuid>, sqlx::Erro
     sqlx::query_scalar("select node_id from regression_requests where id = $1").bind(id).fetch_optional(pool).await
 }
 
-/// 取消还在排队的请求。已经被节点领走的不能取消（手机已经在跑了）。
+/// 取消还在排队的请求。已经被节点领走的不能取消（手机已经在跑了）；不存在和状态不对分开报。
 pub async fn cancel(pool: &PgPool, id: Uuid) -> Result<(), RequestError> {
     let done = sqlx::query("update regression_requests set status = 'cancelled', finished_at = clock_timestamp() where id = $1 and status = 'queued'").bind(id).execute(pool).await?;
-    if done.rows_affected() == 0 { Err(RequestError::NotFound) } else { Ok(()) }
+    if done.rows_affected() > 0 {
+        return Ok(());
+    }
+    let exists: bool = sqlx::query_scalar("select exists (select 1 from regression_requests where id = $1)").bind(id).fetch_one(pool).await?;
+    Err(if exists { RequestError::Conflict("这个请求已经被节点领走或已经结束，不能取消") } else { RequestError::NotFound })
+}
+
+/// 设备上没有活跃的 run、也没有运行中的回归时，把被标成 `busy` 的设备放回 `idle`。
+/// 领取回归时设备被标 `busy`；回归结束、作废、超时都要放回来，否则要等下一次心跳才恢复。`node` 为空表示所有节点。
+async fn release_devices(conn: &mut sqlx::PgConnection, node: Option<Uuid>) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "update devices d set status = 'idle'
+         where d.status = 'busy' and ($1::uuid is null or d.node_id = $1)
+           and not exists (select 1 from runs r where r.device_id = d.id and r.status in ('assigned','running','judging','node_lost'))
+           and not exists (select 1 from regression_requests q where q.node_id = d.node_id and q.serial = d.serial and q.status = 'running')",
+    )
+    .bind(node)
+    .execute(conn)
+    .await?;
+    Ok(())
 }
 
 /// 把运行中的请求转成失败。`node` 为空表示所有节点（服务重启时用）；带节点和设备时只处理那台设备
@@ -88,8 +111,28 @@ pub async fn fail_running(conn: &mut sqlx::PgConnection, node: Option<Uuid>, ser
     .bind(node)
     .bind(serial)
     .bind(reason)
-    .execute(conn)
+    .execute(&mut *conn)
     .await?;
+    release_devices(conn, node).await?;
+    Ok(done.rows_affected())
+}
+
+/// 领走后超过时限没回报的请求转成失败并释放设备。放在后台定时任务里也放在领取前：
+/// 不依赖节点还在轮询，也不会因为领取时设备「看起来忙」而被回滚。
+pub async fn expire_stale(pool: &PgPool, node: Option<Uuid>) -> Result<u64, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let done = sqlx::query(
+        "update regression_requests set status = 'failed', detail = '节点领取后超过时限没有回报结果', finished_at = clock_timestamp()
+         where status = 'running' and ($1::uuid is null or node_id = $1) and claimed_at < clock_timestamp() - make_interval(mins => $2)",
+    )
+    .bind(node)
+    .bind(CLAIM_TIMEOUT_MINUTES)
+    .execute(&mut *tx)
+    .await?;
+    if done.rows_affected() > 0 {
+        release_devices(&mut tx, node).await?;
+    }
+    tx.commit().await?;
     Ok(done.rows_affected())
 }
 
@@ -98,20 +141,15 @@ pub async fn fail_running(conn: &mut sqlx::PgConnection, node: Option<Uuid>, ser
 /// 只有设备在线、空闲、没有活跃 run、也没有别的回归在占用时才领；否则返回 `None`，请求继续排队。
 /// 领取时再确认脚本仍是已获准版本，不是的直接标失败并继续找下一个。
 pub async fn claim(pool: &PgPool, node_id: Uuid, serial: &str) -> Result<Option<Claimed>, sqlx::Error> {
+    // 先单独提交超时清理：它不能和后面「设备忙就返回」放在同一个事务里，否则早退时会被一起回滚
+    expire_stale(pool, Some(node_id)).await?;
     let mut tx = pool.begin().await?;
-    sqlx::query(
-        "update regression_requests set status = 'failed', detail = '节点领取后超过时限没有回报结果', finished_at = clock_timestamp()
-         where node_id = $1 and status = 'running' and claimed_at < clock_timestamp() - make_interval(mins => $2)",
-    )
-    .bind(node_id)
-    .bind(CLAIM_TIMEOUT_MINUTES)
-    .execute(&mut *tx)
-    .await?;
 
-    // 先锁设备行：和派发 run 串行化
+    // 先锁设备行：和派发 run 串行化。只排除离线设备；「是否被占用」按事实（活跃 run、运行中的回归）判断，
+    // 不看 devices.status：这一列里的 busy 本身就可能是上一次没回报的回归留下的
     let device: Option<(Uuid, String)> = sqlx::query_as("select id, status from devices where node_id = $1 and serial = $2 for update").bind(node_id).bind(serial).fetch_optional(&mut *tx).await?;
     let Some((device_id, status)) = device else { return Ok(None) };
-    if status != "idle" {
+    if status == "offline" {
         return Ok(None);
     }
     let occupied: bool = sqlx::query_scalar(
@@ -150,6 +188,8 @@ pub async fn claim(pool: &PgPool, node_id: Uuid, serial: &str) -> Result<Option<
             continue;
         }
         sqlx::query("update regression_requests set status = 'running', serial = $2, claimed_at = clock_timestamp() where id = $1").bind(id).bind(serial).execute(&mut *tx).await?;
+        // 真正改一下设备行：只锁不改的话，并发里正在选设备的派发查询沿用旧快照，可能仍把这台设备选走
+        sqlx::query("update devices set status = 'busy' where id = $1").bind(device_id).execute(&mut *tx).await?;
         tx.commit().await?;
         return Ok(Some(Claimed { id, script_id: row.try_get("script_id")?, project: row.try_get("project")?, case_code: row.try_get("code")? }));
     }
@@ -159,14 +199,19 @@ pub async fn claim(pool: &PgPool, node_id: Uuid, serial: &str) -> Result<Option<
 /// `finished` 表示得到了回归结论（结论记在 script_regressions）；否则是失败，`detail` 写原因。
 pub async fn finish(pool: &PgPool, node_id: Uuid, id: Uuid, finished: bool, detail: &str) -> Result<(), RequestError> {
     let status = if finished { "finished" } else { "failed" };
-    let done = sqlx::query("update regression_requests set status = $3, detail = $4, finished_at = clock_timestamp() where id = $1 and node_id = $2 and status = 'running'")
-        .bind(id)
-        .bind(node_id)
-        .bind(status)
-        .bind(detail)
-        .execute(pool)
-        .await?;
-    if done.rows_affected() == 0 { Err(RequestError::NotFound) } else { Ok(()) }
+    let mut tx = pool.begin().await?;
+    let row: Option<(Uuid, String)> = sqlx::query_as("select node_id, status from regression_requests where id = $1 for update").bind(id).fetch_optional(&mut *tx).await?;
+    let Some((owner, current)) = row else { return Err(RequestError::NotFound) };
+    if owner != node_id {
+        return Err(RequestError::NotYours);
+    }
+    if current != "running" {
+        return Err(RequestError::Conflict("这个回归请求已经不是运行中（服务重启、超时作废或已经回报过），结果没有更新"));
+    }
+    sqlx::query("update regression_requests set status = $2, detail = $3, finished_at = clock_timestamp() where id = $1").bind(id).bind(status).bind(detail).execute(&mut *tx).await?;
+    release_devices(&mut tx, Some(node_id)).await?;
+    tx.commit().await?;
+    Ok(())
 }
 
 /// 每个脚本最近一次回归请求，按脚本编号。

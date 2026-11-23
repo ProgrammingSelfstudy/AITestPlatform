@@ -182,13 +182,13 @@ fn 运行时的参数名契约补齐签名并支持模块前缀通配() {
     assert!(
         check_body(
             "import hafa_automation.runtime",
-            "ui.tap('More', exact=True)\nassert True, '预期出现面板'"
+            "ui.tap('More', exact=True)\nassert 'More' != '', '预期出现面板'"
         )
         .is_empty()
     );
     let issues = check_body(
         "import hafa_automation_other.runtime",
-        "ui.tap('More', True)\nassert True",
+        "ui.tap('More', True)\nassert 'More' != ''",
     );
     assert_eq!(issues.iter().map(|v| v.rule).collect::<Vec<_>>(), [2, 4]);
     let mut changed = runtime;
@@ -543,13 +543,13 @@ fn 规则七检查异常处理块内的循环控制和计数器绑定() {
 #[test]
 fn 规则八只统计测试函数内的显式断言并包含内层语句块() {
     let one = source(
-        "def helper():\n    assert True",
+        "def helper():\n    assert ui.has('Other')",
         &format!("# assert True\ntext = 'assert True'\nif ui.has('Music'):\n    {ASSERT}"),
     );
     valid(&one, 1);
     invalid(&one, 2, 8, None);
     invalid(
-        &source("", "def helper():\n    assert True\nhelper()"),
+        &source("", "def helper():\n    assert ui.has('Other')\nhelper()"),
         1,
         8,
         Some(5),
@@ -733,4 +733,53 @@ fn 规则九固定等待最多三秒且不可隐藏为别名() {
         9,
         Some(1),
     );
+}
+
+// ───── 规则 8 补漏：评审（agy）发现并经复现的绕过写法 ─────
+
+#[test]
+fn 规则八_恒真断言不算断言() {
+    invalid(&source("", "assert True, \"预期显示 Music\""), 1, 8, None);
+    invalid(&source("", "assert 1, \"预期显示 Music\""), 1, 8, None);
+    invalid(&source("", "assert \"非空字符串\", \"预期显示 Music\""), 1, 8, None);
+    invalid(&source("", "assert ui.has(\"Music\") or True, \"预期显示 Music\""), 1, 8, None);
+    // 不是恒真：条件里有真实的判断
+    valid(&source("", ASSERT), 1);
+    valid(&source("", "assert \"Music\" in ui.labels(), \"预期显示 Music\""), 1);
+    valid(&source("", "assert ui.has(\"Music\") and True, \"预期显示 Music\""), 1);
+    valid(&source("", "assert 0 == 0 or ui.has(\"Music\"), \"预期显示 Music\""), 1);
+}
+
+#[test]
+fn 规则八_恒假分支里的断言不会执行() {
+    invalid(&source("", "if False:\n    assert ui.has(\"Music\"), \"预期显示 Music\""), 1, 8, None);
+    invalid(&source("", "if 0:\n    assert ui.has(\"Music\"), \"预期显示 Music\""), 1, 8, None);
+    invalid(&source("", "if None:\n    assert ui.has(\"Music\"), \"预期显示 Music\""), 1, 8, None);
+    invalid(&source("", "if (False):\n    assert ui.has(\"Music\"), \"预期显示 Music\""), 1, 8, None);
+    // 恒假但里面没有断言：这里不管（不影响断言数量）
+    valid(&source("", &format!("{ASSERT}\nif False:\n    ui.tap(\"Music\")")), 1);
+    // 正常的条件分支
+    valid(&source("", &format!("if ui.has(\"Music\"):\n    {ASSERT}\nelse:\n    pytest.fail(\"没有 Music\")")), 1);
+}
+
+#[test]
+fn 规则八_try_except_else_吞异常会跳过_else_里的断言() {
+    let swallow = "try:\n    ui.tap(\"Music\")\nexcept Exception:\n    pass\nelse:\n    assert ui.has(\"Music\"), \"预期显示 Music\"";
+    invalid(&source("", swallow), 1, 8, None);
+    // except 路径会 raise 或 pytest.fail：失败不会被吞
+    valid(&source("", "try:\n    ui.tap(\"Music\")\nexcept Exception:\n    pytest.fail(\"点击失败\")\nelse:\n    assert ui.has(\"Music\"), \"预期显示 Music\""), 1);
+    valid(&source("", "try:\n    ui.tap(\"Music\")\nexcept Exception:\n    raise\nelse:\n    assert ui.has(\"Music\"), \"预期显示 Music\""), 1);
+    // 没有 else 断言、try 体也没有断言：等待超时返回 False 的写法仍然放行
+    valid(&source("", &format!("try:\n    ui.tap(\"Music\")\nexcept Exception:\n    pass\n{ASSERT}")), 1);
+}
+
+#[test]
+fn 断言计数不被文档字符串和注释里的_assert_欺骗() {
+    use agent::scriptcheck::assertion_count;
+    let files = |text: &str| BTreeMap::from([(TEST.to_string(), text.to_string())]);
+    let tricky = source("", "\"\"\"\nassert 文档字符串里的\nassert 又一行\n\"\"\"\n# assert 注释里的\nassert ui.has(\"Music\"), \"预期显示 Music\"");
+    assert_eq!(assertion_count(&files(&tricky), CASE), 1);
+    // 单行写法 `if x: assert y` 也要数到
+    let one_line = source("", "assert ui.has(\"a\"), \"x\"\nif ui.has(\"b\"):\n    assert ui.has(\"c\"), \"y\"");
+    assert_eq!(assertion_count(&files(&one_line), CASE), 2);
 }

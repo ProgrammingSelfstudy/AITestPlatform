@@ -111,7 +111,7 @@ impl FakeClaude {
     fn new(w: &World, events: &[String]) -> Self {
         let script = w.dir.join(format!("claude_{}.sh", Uuid::new_v4()));
         let body = format!(
-            "set -eu\ncat > \"$0.prompt\"\nprintf '%s\\n' \"$@\" > \"$0.args\"\necho x >> \"$0.calls\"\ncat <<'SCRIPTGEN_EVENTS'\n{}\nSCRIPTGEN_EVENTS\n",
+            "set -eu\ncase \"$*\" in *\"auth status\"*) printf '%s\\n' '{{\"loggedIn\":true,\"authMethod\":\"claude.ai\",\"apiProvider\":\"firstParty\",\"subscriptionType\":\"pro\"}}'; exit 0;; esac\ncat > \"$0.prompt\"\nprintf '%s\\n' \"$@\" > \"$0.args\"\necho x >> \"$0.calls\"\ncat <<'SCRIPTGEN_EVENTS'\n{}\nSCRIPTGEN_EVENTS\n",
             events.join("\n")
         );
         fs::write(&script, body).unwrap();

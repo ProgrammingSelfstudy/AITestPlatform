@@ -33,7 +33,7 @@ n=$(cat "$0.n" 2>/dev/null || echo 0); echo $((n+1)) > "$0.n"
 fail() {
   mkdir -p "$HAFA_ARTIFACT_DIR"
   echo "Confirm 按钮 (content-desc)" > "$HAFA_ARTIFACT_DIR/TC-04-abc123-call-elements.txt"
-  echo "AssertionError: 目标歌曲没找到"; echo "1 failed in 0.5s"; exit 1
+  echo "AssertionError: 目标歌曲没找到 (adb -s $HAFA_SERIAL)"; echo "1 failed in 0.5s"; exit 1
 }
 case "$(cat "$f")" in
   *ENVLATER*) [ "$n" = 0 ] && fail; echo "准备前置状态失败（退出码 1）：手机没连上"; exit 1;;
@@ -200,7 +200,7 @@ struct FakeClaude {
 impl FakeClaude {
     fn new(w: &World, events: &[String]) -> Self {
         let script = w.dir.join(format!("claude_{}.sh", Uuid::new_v4()));
-        let body = format!("set -eu\ncat > \"$0.prompt\"\nprintf '%s\\n' \"$@\" > \"$0.args\"\necho x >> \"$0.calls\"\ncat <<'SCRIPTGEN_EVENTS'\n{}\nSCRIPTGEN_EVENTS\n", events.join("\n"));
+        let body = format!("set -eu\ncase \"$*\" in *\"auth status\"*) printf '%s\\n' '{{\"loggedIn\":true,\"authMethod\":\"claude.ai\",\"apiProvider\":\"firstParty\",\"subscriptionType\":\"pro\"}}'; exit 0;; esac\ncat > \"$0.prompt\"\nprintf '%s\\n' \"$@\" > \"$0.args\"\necho x >> \"$0.calls\"\ncat <<'SCRIPTGEN_EVENTS'\n{}\nSCRIPTGEN_EVENTS\n", events.join("\n"));
         fs::write(&script, body).unwrap();
         let opts = ClaudeOpts { bin: "/bin/sh".into(), pre_args: vec![script.to_string_lossy().into()], cwd: Some(w.dir.clone()), stall_timeout: Duration::from_secs(5), total_timeout: Duration::from_secs(10), ..Default::default() };
         Self { script, opts }
@@ -434,4 +434,57 @@ async fn 只有已获准且最近回归失败的脚本才能分诊() {
     transition(w.st.pool(), id, ScriptStatus::Retired, Some("下线")).await.unwrap();
     let result = submit(w.st.pool(), w.node, id, Submission { regression_id: reg, verdict: TriageVerdict::Unsure, reason: "x".into(), fix: None }).await;
     assert!(matches!(result, Err(TriageError::NotApproved(_))), "下线后不能分诊：{result:?}");
+}
+
+// ───── 评审（agy）发现并经核实的缺陷的回归测试 ─────
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn 重试已经成功的提交_报已经分诊过_不是内容相同() {
+    let w = world().await;
+    let python = fake_python(&w);
+    let id = regressed(&w, &python, "FAIL").await;
+    let reg = latest_regression_id(&w, id).await;
+    let claude = FakeClaude::new(&w, &[reply("locator_broken", "文案变了", Some((TEST_POC, PAGE_POC)))]);
+    heal_script(&heal_config(&w, &python, &claude), id).await.unwrap();
+    // 响应丢了、节点重试同一份提交：修复内容和上次归档的版本一样，但真实原因是「已经分诊过了」
+    let retry = submit(w.st.pool(), w.node, id, Submission { regression_id: reg, verdict: TriageVerdict::LocatorBroken, reason: "文案变了".into(), fix: Some(fix_of(TEST_POC, PAGE_POC)) }).await;
+    assert!(matches!(retry, Err(TriageError::AlreadyTriaged)), "{retry:?}");
+    assert_eq!(script_count(&w).await, 2, "重试不能再多归档一个版本");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn 用例改版后不能自愈_在花额度之前就拒绝() {
+    let w = world().await;
+    let python = fake_python(&w);
+    let id = regressed(&w, &python, "FAIL").await;
+    sqlx::query("update test_cases set version = version + 1").execute(w.st.pool()).await.unwrap();
+    let claude = FakeClaude::new(&w, &[reply("locator_broken", "不该被调用", Some((TEST_POC, PAGE_POC)))]);
+    let error = message(heal_script(&heal_config(&w, &python, &claude), id).await.unwrap_err());
+    assert!(error.contains("用例内容在这次脚本的来源执行之后改过"), "{error}");
+    assert_eq!(claude.calls(), 0, "用例改版后归档会被拒绝，不能先花额度");
+    assert!(triages(&w).await.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn 模型给的原因和备注过长_截断后仍能落库_不让额度白花() {
+    let w = world().await;
+    let python = fake_python(&w);
+    let id = regressed(&w, &python, "FAIL").await;
+    let long_reason = "依据很长很长。".repeat(300);
+    let claude = FakeClaude::new(&w, &[reply("business_bug", &long_reason, None)]);
+    heal_script(&heal_config(&w, &python, &claude), id).await.unwrap();
+    let stored: i32 = sqlx::query_scalar("select char_length(reason) from script_triages").fetch_one(w.st.pool()).await.unwrap();
+    assert!(stored <= 1000 && stored > 900, "原因应截断到 1000 字以内而不是被 422 拒掉：{stored}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn 自愈的重跑输出和分诊原因里不带设备序列号() {
+    let w = world().await;
+    let python = fake_python(&w);
+    let id = regressed(&w, &python, "FAIL").await;
+    let claude = FakeClaude::new(&w, &[reply("unsure", "设备 DEV0 上看不出来", None)]);
+    heal_script(&heal_config(&w, &python, &claude), id).await.unwrap();
+    assert!(!claude.prompt().contains("DEV0"), "模型输入里不能有设备序列号");
+    let reason: String = sqlx::query_scalar("select reason from script_triages").fetch_one(w.st.pool()).await.unwrap();
+    assert!(!reason.contains("DEV0"), "落库的原因里不能有设备序列号：{reason}");
 }

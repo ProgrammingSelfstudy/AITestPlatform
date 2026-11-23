@@ -296,6 +296,11 @@ impl AppState {
                     Ok(_) => {}
                     Err(e) => tracing::error!("清理掉线 run 失败：{e}"),
                 }
+                match regress_requests::expire_stale(&pool, None).await {
+                    Ok(n) if n > 0 => tracing::warn!("{n} 个回归请求领走后超时没回报，已作废并释放设备"),
+                    Ok(_) => {}
+                    Err(e) => tracing::error!("清理超时的回归请求失败：{e}"),
+                }
                 match accounts::expire_leases(&pool, grace).await {
                     Ok(n) if n > 0 => tracing::warn!("已回收 {n} 个到期账号租约"),
                     Ok(_) => {}

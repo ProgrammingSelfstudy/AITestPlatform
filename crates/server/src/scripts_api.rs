@@ -354,6 +354,14 @@ pub(crate) async fn heal_source(State(state): State<ApiState>, RoutePath(id): Ro
         .await
         .map_err(|e| internal(&e))?;
     let regression = triage::latest_failure(state.app.pool(), script_id).await.map_err(|e| internal(&e))?;
+    // 来源执行之后用例内容变过：旧执行不能再据此归档新版本（归档时会被拒绝），节点要在花额度之前就知道
+    let case_changed: bool = sqlx::query_scalar(
+        "select r.case_version <> c.version from scripts s join runs r on r.id = s.source_run_id join test_cases c on c.id = s.case_id where s.id = $1",
+    )
+    .bind(script_id)
+    .fetch_one(state.app.pool())
+    .await
+    .map_err(|e| internal(&e))?;
     Ok(Json(serde_json::json!({
         "id": script_id,
         "status": row.try_get::<String, _>("status").map_err(|e| internal(&e))?,
@@ -361,6 +369,7 @@ pub(crate) async fn heal_source(State(state): State<ApiState>, RoutePath(id): Ro
         "case_code": row.try_get::<String, _>("code").map_err(|e| internal(&e))?,
         "source_run_id": row.try_get::<Uuid, _>("source_run_id").map_err(|e| internal(&e))?,
         "files": row.try_get::<serde_json::Value, _>("files").map_err(|e| internal(&e))?,
+        "case_changed": case_changed,
         "regression": regression,
     })))
 }
@@ -434,7 +443,8 @@ async fn require_owner(state: &ApiState, headers: &axum::http::HeaderMap, node_i
 fn request_failure(error: RequestError) -> Failure {
     match error {
         RequestError::ScriptNotFound | RequestError::NotFound => (StatusCode::NOT_FOUND, error.to_string()),
-        RequestError::NotApproved(_) | RequestError::Duplicate => (StatusCode::CONFLICT, error.to_string()),
+        RequestError::NotApproved(_) | RequestError::Duplicate | RequestError::Conflict(_) => (StatusCode::CONFLICT, error.to_string()),
+        RequestError::NotYours => (StatusCode::FORBIDDEN, error.to_string()),
         RequestError::Db(e) => internal(&e),
     }
 }

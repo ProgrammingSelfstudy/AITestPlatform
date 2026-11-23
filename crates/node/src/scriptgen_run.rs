@@ -111,7 +111,7 @@ async fn fetch_previous(cfg: &GenConfig, client: &reqwest::Client, id: Uuid, cas
 
 /// 为 `run_id` 生成回归脚本候选并上传归档。
 pub async fn generate_and_upload(cfg: &GenConfig, run_id: Uuid) -> anyhow::Result<Outcome> {
-    let client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(30)).build()?;
+    let client = crate::platform_client(std::time::Duration::from_secs(30))?;
 
     // 1. 取来源：完整用例、最终结果、逐条判定、Judge 角色。
     let response = authed(cfg, client.get(url(cfg, &format!("api/runs/{run_id}/script-source"))?)).send().await.context("连不上平台服务端")?;

@@ -89,6 +89,12 @@ pub(crate) fn environment_failure(output: &str) -> Option<&'static str> {
     ["准备前置状态失败", "关房失败"].into_iter().find(|marker| output.contains(marker))
 }
 
+/// 把设备序列号从要上报给平台、给模型看的文字里去掉：pytest 的报错和 adb 的输出常带 `-s <序列号>`，
+/// 而序列号不一定能被形态过滤（如 `R5CR123`）识别出来，所以按本节点已知的序列号精确替换。
+pub(crate) fn scrub(cfg: &CheckConfig, text: &str) -> String {
+    if cfg.serial.trim().is_empty() { text.to_string() } else { text.replace(cfg.serial.as_str(), "（设备序列号）") }
+}
+
 pub(crate) fn tail(text: &str) -> String {
     let chars: Vec<char> = text.trim().chars().collect();
     chars[chars.len().saturating_sub(DETAIL_CHARS)..].iter().collect()
@@ -152,7 +158,7 @@ pub(crate) async fn run_pytest(cfg: &CheckConfig, root: &Path) -> anyhow::Result
 
 /// 对 `script_id` 做一次真机自检并回报平台。返回结果和给人看的说明。
 pub async fn self_check(cfg: &CheckConfig, script_id: Uuid) -> anyhow::Result<(Outcome, String)> {
-    let client = reqwest::Client::builder().timeout(Duration::from_secs(30)).build()?;
+    let client = crate::platform_client(std::time::Duration::from_secs(30))?;
     let url = |path: &str| cfg.platform_http.join(path).with_context(|| format!("无法拼出平台地址 {path}"));
 
     let response = authed(cfg, client.get(url(&format!("api/scripts/{script_id}/files"))?)).send().await.context("连不上平台服务端")?;
@@ -176,10 +182,10 @@ pub async fn self_check(cfg: &CheckConfig, script_id: Uuid) -> anyhow::Result<(O
     let (code, output) = result?;
 
     if let Some(marker) = environment_failure(&output) {
-        bail!("{marker}，属于环境问题，脚本保持候选。原始输出：\n{}", tail(&output));
+        bail!("{marker}，属于环境问题，脚本保持候选。原始输出：\n{}", scrub(cfg, &tail(&output)));
     }
     let passed = code == Some(0);
-    let detail = describe(passed, code, &output, &source.case_code, source.version);
+    let detail = scrub(cfg, &describe(passed, code, &output, &source.case_code, source.version));
 
     let body = json!({"passed": passed, "detail": detail});
     let response = authed(cfg, client.put(url(&format!("api/scripts/{script_id}/self-check"))?)).json(&body).send().await.context("回报自检结果时连不上平台服务端")?;

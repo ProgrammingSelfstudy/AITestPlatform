@@ -9,7 +9,6 @@
 //!   获准的原版本在人决定之前不动。业务行为错误和分不清不改脚本，失败的回归记录原样保留。
 
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use agent::claude_cli::ClaudeOpts;
 use agent::scriptgen::{HealContext, HealVerdict, ScriptgenError, ScriptgenInput, ScriptgenOpts, builtin_contract, heal};
@@ -21,7 +20,7 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::scriptgen_run::read_trace;
-use crate::selfcheck_run::{authed, environment_failure, run_pytest, tail, write_package, CheckConfig};
+use crate::selfcheck_run::{authed, environment_failure, run_pytest, scrub, tail, write_package, CheckConfig};
 
 pub struct HealConfig {
     pub check: CheckConfig,
@@ -50,6 +49,9 @@ struct Failure {
 #[derive(Deserialize)]
 struct HealSource {
     status: String,
+    /// 来源执行之后用例内容变过：旧执行不能再据此归档新版本
+    #[serde(default)]
+    case_changed: bool,
     version: i64,
     source_run_id: Uuid,
     files: std::collections::BTreeMap<String, String>,
@@ -63,6 +65,14 @@ struct RunSource {
     case_spec: CaseSpec,
     judge_items: Vec<JudgeItem>,
     judge: RoleModel,
+}
+
+/// 按字符数截断（不会切在中文中间），超出的部分用省略号表示。
+fn clip_chars(text: &str, limit: usize) -> String {
+    if text.chars().count() <= limit {
+        return text.to_string();
+    }
+    format!("{}…", text.chars().take(limit.saturating_sub(1)).collect::<String>())
 }
 
 /// 失败现场的控件文字上限：够模型判断，又不把整页塞进去。
@@ -98,7 +108,7 @@ fn get_json_error(status: StatusCode, what: &str) -> anyhow::Error {
 /// 对已获准的 `script_id` 做一次自愈分诊并把结论回报平台。
 pub async fn heal_script(cfg: &HealConfig, script_id: Uuid) -> anyhow::Result<Report> {
     let check = &cfg.check;
-    let client = reqwest::Client::builder().timeout(Duration::from_secs(30)).build()?;
+    let client = crate::platform_client(std::time::Duration::from_secs(30))?;
     let url = |path: &str| check.platform_http.join(path).with_context(|| format!("无法拼出平台地址 {path}"));
 
     // 1. 取脚本和最近一次回归，先把不该花额度的情况都挡掉。
@@ -109,6 +119,9 @@ pub async fn heal_script(cfg: &HealConfig, script_id: Uuid) -> anyhow::Result<Re
     let script: HealSource = response.json().await.context("平台返回的脚本格式不对")?;
     if script.status != "approved" {
         bail!("脚本版本 {} 的状态是 {}，只有已获准的版本才需要自愈", script.version, script.status);
+    }
+    if script.case_changed {
+        bail!("用例内容在这次脚本的来源执行之后改过，旧执行不能再据此归档修复版本（会被平台拒绝），请重新执行用例后再生成脚本");
     }
     let failure = match script.regression {
         None => bail!("脚本版本 {} 还没有回归记录，没有可分诊的失败", script.version),
@@ -139,7 +152,7 @@ pub async fn heal_script(cfg: &HealConfig, script_id: Uuid) -> anyhow::Result<Re
     let _ = std::fs::remove_dir_all(&root);
     let (code, output) = rerun?;
     if let Some(marker) = environment_failure(&output) {
-        bail!("{marker}，属于环境问题，这次失败没有分诊。原始输出：\n{}", tail(&output));
+        bail!("{marker}，属于环境问题，这次失败没有分诊。原始输出：\n{}", scrub(check, &tail(&output)));
     }
 
     // 4. 分诊。重跑通过就不花额度：原失败可能是偶发，交人工。
@@ -147,6 +160,8 @@ pub async fn heal_script(cfg: &HealConfig, script_id: Uuid) -> anyhow::Result<Re
         (HealVerdict::Unsure, "重新运行这个脚本通过了，原来的失败可能是偶发或环境波动，没有修改脚本，请人判断是否需要再观察".to_string(), None)
     } else {
         let contract = builtin_contract();
+        // 本节点已知的设备序列号精确登记：形态过滤认不出所有序列号，不登记就可能带进模型输入和落库的分诊原因
+        let redactions = vec![(check.serial.clone(), "（设备序列号）".to_string())];
         let opts = ScriptgenOpts { role: source.judge.clone(), claude: cfg.claude.clone() };
         let context = HealContext { files: &script.files, failure: &tail(&output), elements: &elements };
         let result = heal(
@@ -158,7 +173,7 @@ pub async fn heal_script(cfg: &HealConfig, script_id: Uuid) -> anyhow::Result<Re
                 judge_items: &source.judge_items,
                 ui_map: &cfg.ui_map,
                 contract: &contract,
-                redactions: &[],
+                redactions: &redactions,
                 previous_attempt: None,
             },
             &context,
@@ -169,11 +184,13 @@ pub async fn heal_script(cfg: &HealConfig, script_id: Uuid) -> anyhow::Result<Re
     };
 
     // 5. 回报结论；定位失效时带上修复文件，由服务端归档成候选。
+    // 服务端对分诊原因最多 1000 字、备注最多 4000 字：模型没有长度约束，超了会在花完额度之后被 422 拒掉，整次分诊白做
+    let reason = scrub(check, &clip_chars(&reason, 1000));
     let mut body = json!({"regression_id": failure.regression_id, "verdict": verdict.as_str(), "reason": reason});
     if let Some(fix) = &fix {
         body["files"] = json!(fix.files);
         body["sha256"] = json!(fix.sha256);
-        body["notes"] = json!(fix.notes);
+        body["notes"] = json!(clip_chars(&fix.notes, 4000));
         body["source"] = json!("claude_cli");
         body["model"] = json!(fix.model);
         body["effort"] = json!(fix.effort);

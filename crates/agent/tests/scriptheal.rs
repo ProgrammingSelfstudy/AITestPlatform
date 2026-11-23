@@ -150,9 +150,12 @@ fn reply(verdict: &str, reason: &str, files: Option<(&str, &str)>) -> String {
     success(&value.to_string())
 }
 
-/// 在页面文件末尾加一行注释：内容变了，但断言一条没少，静态校验也不受影响。
+/// 真正改了定位：把 Music 面板入口的文案换成新的。断言一条没少，静态校验也不受影响，
+/// 除注释和空白外和原脚本不同（只加注释不算实际修改，见 `只加注释或空白不算实际修改`）。
 fn relocated_page() -> String {
-    format!("{PAGE_POC}\n# 重新按文案定位\n")
+    let changed = PAGE_POC.replacen("MUSIC = \"Music\"", "MUSIC = \"Music Library\"", 1);
+    assert_ne!(changed, PAGE_POC, "夹具里要有这一行");
+    changed
 }
 
 async fn run(fake: &FakeClaude, failure: &str, elements: &str) -> Result<agent::scriptgen::HealResult, ScriptgenError> {
@@ -224,7 +227,7 @@ async fn 修复删掉断言就拒绝_不能靠放宽断言让脚本通过() {
             .collect::<Vec<_>>()
             .join("\n")
     };
-    assert!(assert_count(&[(TEST_NAME.to_string(), weaker.clone())].into()) < assert_count(&[(TEST_NAME.to_string(), TEST_POC.to_string())].into()));
+    assert!(assert_count(&[(TEST_NAME.to_string(), weaker.clone())].into(), "TC-04") < assert_count(&[(TEST_NAME.to_string(), TEST_POC.to_string())].into(), "TC-04"));
     let bad = reply("locator_broken", "定位变了", Some((&weaker, PAGE_POC)));
     let fake = fake_events(&[bad.clone(), bad]);
     let result = run(&fake, "失败", "x").await.unwrap();
@@ -288,7 +291,99 @@ async fn 来源执行不是整体通过时不调用模型() {
 }
 
 #[test]
-fn 断言计数只数语句级assert() {
-    let files: BTreeMap<String, String> = [("a.py".to_string(), "def f():\n    assert x\n    assert(y)\n    assert_ok(z)\n    # assert w\n    asserted = 1\n".to_string())].into();
-    assert_eq!(assert_count(&files), 2);
+fn 断言计数用解析器数_文档字符串和注释里的不算() {
+    let source = "import pytest\n\n@pytest.mark.case(\"TC-04\")\ndef test_tc04(ui):\n    \"\"\"\n    assert 文档字符串里的\n    \"\"\"\n    # assert 注释里的\n    assert ui.has(\"a\"), \"x\"\n    assert(ui.has(\"b\"))\n    assert_ok(ui)\n    asserted = 1\n";
+    let files: BTreeMap<String, String> = [(TEST_NAME.to_string(), source.to_string())].into();
+    assert_eq!(assert_count(&files, "TC-04"), 2);
+    assert_eq!(assert_count(&files, "TC-99"), 0, "没有对应的测试文件");
+    let broken: BTreeMap<String, String> = [(TEST_NAME.to_string(), "def (:".to_string())].into();
+    assert_eq!(assert_count(&broken, "TC-04"), 0, "解析不了返回 0");
+}
+
+#[tokio::test]
+async fn 只加注释或空白不算实际修改() {
+    let commented = format!("{TEST_POC}\n\n# 重新定位了\n");
+    let reply_text = reply("locator_broken", "定位变了", Some((&commented, PAGE_POC)));
+    let fake = fake_events(&[reply_text.clone(), reply_text]);
+    let result = run(&fake, "失败", "x").await.unwrap();
+    assert_eq!(result.verdict, HealVerdict::Unsure, "{}", result.reason);
+    assert!(result.reason.contains("没有实际修改"), "{}", result.reason);
+}
+
+#[tokio::test]
+async fn 不是会员登录就不调用模型_不走_api_key() {
+    // 各种不合规的登录状态：未登录、API Key、第三方 provider、没有订阅
+    for login in [
+        r#"{"loggedIn":false,"authMethod":"none"}"#,
+        r#"{"loggedIn":true,"authMethod":"api_key","apiProvider":"firstParty"}"#,
+        r#"{"loggedIn":true,"authMethod":"claude.ai","apiProvider":"bedrock","subscriptionType":"pro"}"#,
+        r#"{"loggedIn":true,"authMethod":"claude.ai","apiProvider":"firstParty","subscriptionType":null}"#,
+    ] {
+        let fake = FakeClaude::with_login("echo 不该被调用 >> \"$0.calls\"", login);
+        let files = original();
+        let result = heal(&opts(&fake), Inputs::new().input(), &HealContext { files: &files, failure: "f", elements: "" }).await;
+        assert!(matches!(result, Err(ScriptgenError::Claude(message)) if message.contains("会员登录")), "{login} => {result:?}");
+        assert!(!fake.dir.join("claude.sh.calls").exists(), "登录检查没过，模型一次都不能调：{login}");
+    }
+}
+
+#[tokio::test]
+async fn 修复里的重复文件名和超出个数的文件不会被悄悄折叠掉() {
+    let bad = TEST_POC.replace("assert", "assertion_removed =");
+    let page = relocated_page();
+    let quote = |text: &str| serde_json::to_string(text).unwrap();
+    // 同一个文件名出现两次：前一个是违规版本，后一个是合规版本。折叠成映射会丢掉前一个，绕过「文件名重复」检查
+    let duplicate = format!(
+        r#"{{"verdict":"locator_broken","reason":"定位变了","files":{{"{TEST_NAME}":{},"{TEST_NAME}":{},"{PAGE_NAME}":{}}},"notes":"x"}}"#,
+        quote(&bad), quote(TEST_POC), quote(&page)
+    );
+    // 另一种：多于 6 个文件，后面夹带不允许的文件名
+    let extra = format!(
+        r#"{{"verdict":"locator_broken","reason":"定位变了","files":{{"{TEST_NAME}":{t},"{TEST_NAME}":{t},"{TEST_NAME}":{t},"{TEST_NAME}":{t},"{TEST_NAME}":{t},"{TEST_NAME}":{t},"evil.py":"import os"}},"notes":"x"}}"#,
+        t = quote(TEST_POC)
+    );
+    for raw in [duplicate, extra] {
+        let reply = success(&raw);
+        let fake = fake_events(&[reply.clone(), reply]);
+        let result = run(&fake, "失败", "x").await.unwrap();
+        assert_eq!(result.verdict, HealVerdict::Unsure, "重复或超量的文件必须被拒绝：{}", result.reason);
+        assert!(result.fix.is_none());
+    }
+}
+
+/// 把 TEST_POC 里第一条 assert 换成给定的写法，用来验证「看起来有断言、实际不会失败」的修复被拒绝。
+fn with_first_assert_replaced(replacement: &str) -> String {
+    let mut done = false;
+    TEST_POC
+        .lines()
+        .map(|line| {
+            if !done && line.trim_start().starts_with("assert ") {
+                done = true;
+                let indent = &line[..line.len() - line.trim_start().len()];
+                replacement.lines().map(|part| format!("{indent}{part}")).collect::<Vec<_>>().join("\n")
+            } else {
+                line.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[tokio::test]
+async fn 修复把断言换成恒真_恒假分支_或吞异常的写法_都不采用() {
+    let page = relocated_page();
+    let cases = [
+        ("恒真断言", "assert True, \"预期显示 Music\""),
+        ("or True", "assert ui.has(\"Music\") or True, \"预期显示 Music\""),
+        ("恒假分支", "if False:\n    assert ui.has(\"Music\"), \"预期显示 Music\""),
+        ("吞异常后跳过 else 里的断言", "try:\n    ui.tap(\"Music\")\nexcept Exception:\n    pass\nelse:\n    assert ui.has(\"Music\"), \"预期显示 Music\""),
+    ];
+    for (name, replacement) in cases {
+        let test = with_first_assert_replaced(replacement);
+        let reply_text = reply("locator_broken", "定位变了", Some((&test, &page)));
+        let fake = fake_events(&[reply_text.clone(), reply_text]);
+        let result = run(&fake, "失败", "x").await.unwrap();
+        assert_eq!(result.verdict, HealVerdict::Unsure, "{name} 必须被拒绝：{}", result.reason);
+        assert!(result.fix.is_none(), "{name}");
+    }
 }

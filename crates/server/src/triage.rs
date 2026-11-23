@@ -136,6 +136,12 @@ pub async fn submit(pool: &PgPool, node_id: Uuid, script_id: Uuid, submission: S
     if latest_id != submission.regression_id {
         return Err(TriageError::Stale);
     }
+    // 先查这次失败是不是已经分诊过：节点重试已经成功的提交时，修复内容会和上次归档的版本重复，
+    // 不先查就会报成「内容相同」的 422，而不是真实原因（已经分诊过）
+    let already: bool = sqlx::query_scalar("select exists (select 1 from script_triages where regression_id = $1)").bind(latest_id).fetch_one(&mut *tx).await?;
+    if already {
+        return Err(TriageError::AlreadyTriaged);
+    }
 
     let healed = match submission.fix {
         Some(fix) => {

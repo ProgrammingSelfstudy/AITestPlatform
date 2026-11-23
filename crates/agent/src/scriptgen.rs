@@ -451,6 +451,9 @@ pub async fn generate(
         allowed_tools: vec![],
         ..opts.claude.clone()
     };
+    // 和 Judge 一样，调模型前先确认是本机 Claude 会员登录（规则 1）：run_text_only 只剥掉环境变量里的 API Key，
+    // 挡不住 ~/.claude 或钥匙串里配置的 API Key、第三方 provider，那样会悄悄改走按量计费
+    claude_cli::check_login(&claude).await.map_err(ScriptgenError::Claude)?;
     let mut prompt = prepared.prompt.clone();
     let mut repair = false;
     loop {
@@ -544,25 +547,29 @@ struct HealPayload {
     notes: String,
 }
 
-/// 脚本里语句级 `assert` 的数量（含 `assert x` 和 `assert(x)`）。启发式：不解析 Python，只数行首。
-/// 用来拦「修复时顺手删断言或把断言放宽到不存在」，不是断言语义检查。
-pub fn assert_count(files: &BTreeMap<String, String>) -> usize {
-    files
-        .values()
-        .flat_map(|source| source.lines())
-        .filter(|line| {
-            let line = line.trim_start();
-            line.strip_prefix("assert").is_some_and(|rest| rest.starts_with([' ', '(']))
-        })
-        .count()
+/// 测试函数里显式 `assert` 的数量：用静态校验的解析器数，不是按行首匹配（文档字符串、注释里的 assert 不算）。
+/// 用来拦「修复时顺手删断言」，不是断言语义检查：恒真断言、吞异常的写法由静态校验的规则 8 另外拦。
+pub fn assert_count(files: &BTreeMap<String, String>, case_code: &str) -> usize {
+    scriptcheck::assertion_count(files, case_code)
 }
 
-/// 自愈只允许改定位：断言不能比原脚本少，内容也不能和原脚本一样（一样就是没修）。
-fn weaker_or_same(original: &BTreeMap<String, String>, healed: &BTreeMap<String, String>) -> Option<Violation> {
-    if healed == original {
-        return Some(Violation::new("输出", 1, 0, "修复后的脚本和原脚本完全相同，没有实际修改"));
+/// 去掉注释、空行和行尾空白后的源码，用来判断修复到底有没有实际修改：只加一行注释或空格不算。
+fn substantive(files: &BTreeMap<String, String>) -> BTreeMap<&str, String> {
+    files
+        .iter()
+        .map(|(name, source)| {
+            let code = source.lines().map(str::trim_end).filter(|line| !line.trim_start().is_empty() && !line.trim_start().starts_with('#')).collect::<Vec<_>>().join("\n");
+            (name.as_str(), code)
+        })
+        .collect()
+}
+
+/// 自愈只允许改定位：断言不能比原脚本少，除注释和空白外也必须有实际修改。
+fn weaker_or_same(original: &BTreeMap<String, String>, healed: &BTreeMap<String, String>, case_code: &str) -> Option<Violation> {
+    if substantive(healed) == substantive(original) {
+        return Some(Violation::new("输出", 1, 0, "修复后的脚本和原脚本除注释和空白外完全相同，没有实际修改"));
     }
-    let (before, after) = (assert_count(original), assert_count(healed));
+    let (before, after) = (assert_count(original, case_code), assert_count(healed, case_code));
     (after < before).then(|| Violation::new("输出", 1, 0, &format!("修复后的断言（{after} 条）比原脚本（{before} 条）少：自愈只能改定位，不能删或放宽断言")))
 }
 
@@ -587,6 +594,7 @@ pub async fn heal(opts: &ScriptgenOpts, input: ScriptgenInput<'_>, heal: &HealCo
         allowed_tools: vec![],
         ..opts.claude.clone()
     };
+    claude_cli::check_login(&claude).await.map_err(ScriptgenError::Claude)?;
     let mut prompt = format!("{}\n\n### 自愈输入\n{material:#}", prepared.prompt);
     let mut repaired = false;
     loop {
@@ -617,8 +625,10 @@ pub async fn heal(opts: &ScriptgenOpts, input: ScriptgenInput<'_>, heal: &HealCo
             _ => return unsure("模型给出的结论不在三种之内，交人工判断".into()),
         }
         // 定位失效：修复文件必须过全部校验。复用生成的校验：先拼回 files/notes 再验。
-        let text = serde_json::to_string(&json!({"files": payload.files.iter().cloned().collect::<BTreeMap<_, _>>(), "notes": payload.notes})).expect("可序列化");
-        let checked = validate_payload(&text, &prepared, &input).and_then(|(files, notes)| match weaker_or_same(heal.files, &files) {
+        // 手工拼 JSON 对象：不能先收进 BTreeMap，那样会悄悄丢掉重复的文件名、也让超过 6 个文件的输出变少，绕过 validate_payload 的检查
+        let object = payload.files.iter().map(|(name, source)| format!("{}:{}", Value::from(name.as_str()), Value::from(source.as_str()))).collect::<Vec<_>>().join(",");
+        let text = format!("{{\"files\":{{{object}}},\"notes\":{}}}", Value::from(payload.notes.as_str()));
+        let checked = validate_payload(&text, &prepared, &input).and_then(|(files, notes)| match weaker_or_same(heal.files, &files, &input.case.code) {
             Some(violation) => Err(vec![violation]),
             None => Ok((files, notes)),
         });
