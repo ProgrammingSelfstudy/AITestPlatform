@@ -2274,3 +2274,35 @@ async fn 解除节点绑定_只有主人能解除_解除后没有主人() {
     let after: Option<Uuid> = sqlx::query_scalar("select owner_user_id from nodes where id = $1").bind(node).fetch_one(state.pool()).await.unwrap();
     assert_eq!(after, None);
 }
+
+#[tokio::test]
+async fn 管理员强制解除节点绑定_要管理员账号和密码_不是主人也行() {
+    let temp = TempPaths::with_config();
+    let state = with_token(test_state(config()).await, Some(REVIEW_TOKEN));
+    let app = temp.app(state.clone());
+    let node = Uuid::new_v4();
+    let owner: Uuid = sqlx::query_scalar("insert into users (name) values ('别人') returning id").fetch_one(state.pool()).await.unwrap();
+    sqlx::query("insert into nodes (id, caps, online, last_seen, secret_hash, owner_user_id) values ($1, '{}', false, now(), 'x', $2)")
+        .bind(node).bind(owner).execute(state.pool()).await.unwrap();
+    // 管理员 = 页面创建的名字 + is_admin（由运行服务端的人设置）；普通名字即使密码对也不行
+    let (s1, _, _) = request(&app, Method::POST, "/api/users", &WRITE_HEADERS, json!({"name": "root", "password": "right-pass1"}).to_string()).await;
+    let (s2, _, _) = request(&app, Method::POST, "/api/users", &WRITE_HEADERS, json!({"name": "normal", "password": "right-pass1"}).to_string()).await;
+    assert_eq!((s1, s2), (StatusCode::CREATED, StatusCode::CREATED));
+    sqlx::query("update users set is_admin = true where name = 'root'").execute(state.pool()).await.unwrap();
+    let path = format!("/api/nodes/{node}/force-release");
+    let try_as = |name: &str, password: &str| json!({"name": name, "password": password}).to_string();
+
+    for (n, p) in [("root", "wrong-pass1"), ("normal", "right-pass1"), ("nobody", "right-pass1")] {
+        let (status, _, _) = request(&app, Method::POST, &path, &WRITE_HEADERS, try_as(n, p)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{n}");
+    }
+    let still: Option<Uuid> = sqlx::query_scalar("select owner_user_id from nodes where id = $1").bind(node).fetch_one(state.pool()).await.unwrap();
+    assert_eq!(still, Some(owner));
+
+    let (status, _, _) = request(&app, Method::POST, "/api/nodes/00000000-0000-0000-0000-000000000000/force-release", &WRITE_HEADERS, try_as("root", "right-pass1")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _, _) = request(&app, Method::POST, &path, &WRITE_HEADERS, try_as("root", "right-pass1")).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let after: Option<Uuid> = sqlx::query_scalar("select owner_user_id from nodes where id = $1").bind(node).fetch_one(state.pool()).await.unwrap();
+    assert_eq!(after, None);
+}

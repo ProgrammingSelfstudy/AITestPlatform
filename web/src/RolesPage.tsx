@@ -8,6 +8,7 @@ import {
   ROLE_SOURCES,
   saveNodeRoles,
   releaseNode,
+  forceReleaseNode,
   type CheckStatus,
   type ModelRole,
   type NodeRoles,
@@ -374,6 +375,27 @@ export default function RolesPage() {
   const [deleteTarget, setDeleteTarget] = useState<{ id: string; name: string; isDraftNew: boolean } | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [actionNotice, setActionNotice] = useState<string | null>(null);
+  const [adminOpen, setAdminOpen] = useState(false);
+  const [adminName, setAdminName] = useState("");
+  const [adminPassword, setAdminPassword] = useState("");
+  const [adminBusy, setAdminBusy] = useState(false);
+
+  async function forceRelease() {
+    if (!selectedNodeId || adminBusy) return;
+    setAdminBusy(true);
+    setActionError(null);
+    try {
+      await forceReleaseNode(selectedNodeId, adminName.trim(), adminPassword);
+      setAdminOpen(false);
+      setAdminPassword("");
+      setActionNotice("管理员已强制解除绑定：这个节点现在没有主人，创建名字时可以认领它。节点若仍用原来的 NODE_USER_NAME 启动，重启后会再绑回去。");
+      reloadRoles();
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setAdminBusy(false);
+    }
+  }
 
   const busy = busyAction !== null;
 
@@ -1018,6 +1040,11 @@ export default function RolesPage() {
             {canAct && (
               <Button size="small" danger disabled={busy} loading={busyAction === "release"} onClick={() => void executeWrite({ kind: "release" })}>
                 解除节点绑定
+              </Button>
+            )}
+            {selectedNodeId && !canAct && (
+              <Button size="small" danger disabled={busy} title="不是节点主人也能解除，要用管理员账号" onClick={() => setAdminOpen(true)}>
+                管理员强制解除
               </Button>
             )}
             {dirtyCount > 0 && (
@@ -1729,6 +1756,23 @@ export default function RolesPage() {
           </main>
         </div>
       )}
+
+      {/* 管理员强制解除节点绑定 */}
+      <Modal
+        open={adminOpen}
+        title="管理员强制解除节点绑定"
+        okText="解除"
+        cancelText="取消"
+        okButtonProps={{ danger: true, loading: adminBusy, disabled: !adminName.trim() || !adminPassword }}
+        onOk={() => void forceRelease()}
+        onCancel={() => setAdminOpen(false)}
+        destroyOnHidden
+      >
+        <div style={{ display: "grid", gap: 12 }}>
+          <Input aria-label="管理员账号" placeholder="管理员账号" value={adminName} onChange={(e) => setAdminName(e.target.value)} autoComplete="off" />
+          <Input.Password aria-label="管理员密码" placeholder="管理员密码" value={adminPassword} onChange={(e) => setAdminPassword(e.target.value)} onPressEnter={() => void forceRelease()} autoComplete="new-password" />
+        </div>
+      </Modal>
 
       {/* 删除角色二次确认弹窗 */}
       {deleteTarget && (

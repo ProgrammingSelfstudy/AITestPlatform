@@ -149,6 +149,20 @@ pub async fn register_with_password(pool: &PgPool, name: &str, password: &str, c
     Ok(Register::Created)
 }
 
+/// 校验管理员账号：名字存在、是管理员、密码对得上才返回 true。任何一步不对都是同样的 false（不透露是哪一步）。
+pub async fn verify_admin(pool: &PgPool, name: &str, password: &str) -> Result<bool, sqlx::Error> {
+    use argon2::{password_hash::PasswordVerifier, Argon2, PasswordHash};
+    let hash: Option<String> = sqlx::query_scalar("select password_hash from users where name = $1 and is_admin and password_hash is not null")
+        .bind(name)
+        .fetch_optional(pool)
+        .await?;
+    let Some(hash) = hash else { return Ok(false) };
+    let password = password.to_string();
+    Ok(tokio::task::spawn_blocking(move || PasswordHash::new(&hash).is_ok_and(|parsed| Argon2::default().verify_password(password.as_bytes(), &parsed).is_ok()))
+        .await
+        .unwrap_or(false))
+}
+
 pub async fn list_names(pool: &PgPool) -> Result<Vec<String>, sqlx::Error> {
     sqlx::query_scalar("select name from users order by name").fetch_all(pool).await
 }

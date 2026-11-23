@@ -74,6 +74,7 @@ pub(crate) fn routes(app: AppState, paths: Paths) -> Router {
         .route("/api/nodes/{id}/apps", get(node_apps))
         .route("/api/nodes/{id}/apps/{source}/scan", post(scan_node_app))
         .route("/api/nodes/{id}/release", post(release_node).route_layer(authorize_write.clone()))
+        .route("/api/nodes/{id}/force-release", post(force_release_node))
         .route("/api/nodes/{id}/roles/init-template", post(init_node_roles).route_layer(authorize_write.clone()))
         .route("/api/nodes/{id}/roles/{role}/check", post(check_node_role).route_layer(authorize_write.clone()))
         .route(
@@ -375,8 +376,31 @@ async fn init_node_roles(State(state): State<ApiState>, Path(id): Path<String>, 
 /// 注意：节点若仍用原来的 `NODE_USER_NAME` 启动，重新连上来会再绑回去。
 async fn release_node(State(state): State<ApiState>, Path(id): Path<String>, headers: axum::http::HeaderMap) -> Result<StatusCode, ApiError> {
     let node = require_owned(&state, &headers, &id).await?;
+    clear_owner(&state, node).await
+}
+
+async fn clear_owner(state: &ApiState, node: Uuid) -> Result<StatusCode, ApiError> {
     sqlx::query("update nodes set owner_user_id = null where id = $1").bind(node).execute(state.app.pool()).await.map_err(|e| internal("解除节点绑定失败", e))?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+struct AdminLogin {
+    name: String,
+    password: String,
+}
+
+/// 管理员强制解除：用管理员账号（名字 + 密码）验证，不要求是节点主人，节点离线也行。
+async fn force_release_node(State(state): State<ApiState>, Path(id): Path<String>, Json(body): Json<AdminLogin>) -> Result<StatusCode, ApiError> {
+    if !crate::users::verify_admin(state.app.pool(), body.name.trim(), &body.password).await.map_err(|e| internal("校验管理员失败", e))? {
+        return Err((StatusCode::FORBIDDEN, "管理员账号或密码不对".to_string()));
+    }
+    let node: Uuid = id.parse().map_err(|_| (StatusCode::NOT_FOUND, "没有这个节点".to_string()))?;
+    if !state.app.node_exists(node).await.map_err(|e| internal("查询节点失败", e))? {
+        return Err((StatusCode::NOT_FOUND, "没有这个节点".to_string()));
+    }
+    tracing::warn!("管理员 {} 强制解除节点 {node} 的绑定", body.name.trim());
+    clear_owner(&state, node).await
 }
 
 async fn check_node_role(State(state): State<ApiState>, Path((id, role)): Path<(String, String)>, headers: axum::http::HeaderMap) -> Result<StatusCode, ApiError> {
