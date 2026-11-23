@@ -16,6 +16,10 @@ export default defineConfig(({ mode }) => {
       restoreMocks: true,
     },
     server: {
+      // 默认 5273（5173 常被别的前端项目占用）。想换：PLATFORM_WEB_PORT=5300 pnpm dev。
+      // 被占用就直接报错，不悄悄换到别的端口，免得你访问到别的项目
+      port: Number(env.PLATFORM_WEB_PORT) || 5273,
+      strictPort: true,
       // 局域网访问：PLATFORM_ALLOW_LAN=1 pnpm dev。默认只监听本机。没有登录鉴权，只在可信网络里开
       host: env.PLATFORM_ALLOW_LAN === "1" ? true : "127.0.0.1",
       proxy: {

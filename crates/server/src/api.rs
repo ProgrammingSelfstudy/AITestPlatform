@@ -66,6 +66,8 @@ pub(crate) fn routes(app: AppState, paths: Paths) -> Router {
         .route("/api/modules/{id}/approve-reviewed", post(crate::modules::api_approve_reviewed).route_layer(authorize_write.clone()))
         .route("/api/casegen-requests/{id}/result", put(crate::modules::api_finish).layer(axum::extract::DefaultBodyLimit::max(2 * 1024 * 1024)))
         .route("/api/nodes/{id}/roles", post(set_node_roles).route_layer(authorize_write.clone()).get(node_roles))
+        .route("/api/nodes/{id}/apps", get(node_apps))
+        .route("/api/nodes/{id}/apps/{source}/scan", post(scan_node_app))
         .route("/api/nodes/{id}/roles/init-template", post(init_node_roles).route_layer(authorize_write.clone()))
         .route("/api/nodes/{id}/roles/{role}/check", post(check_node_role).route_layer(authorize_write.clone()))
         .route(
@@ -342,6 +344,53 @@ async fn check_node_role(State(state): State<ApiState>, Path((id, role)): Path<(
     }
     if !state.app.send_to(node, protocol::ServerMsg::CheckRole { role_id: role }).await {
         return Err((StatusCode::CONFLICT, "节点离线，无法检测".to_string()));
+    }
+    Ok(StatusCode::ACCEPTED)
+}
+
+// ---------------------------------------------------------------- 本机应用环境检查（选应用 → 检查本机 → 取模型）
+
+fn parse_source(text: &str) -> Option<ModelSource> {
+    serde_json::from_value(serde_json::Value::String(text.to_string())).ok()
+}
+
+#[derive(Serialize)]
+struct AppView {
+    source: ModelSource,
+    /// 检查过没有；没检查过时其余字段是占位
+    scanned: bool,
+    #[serde(flatten)]
+    scan: Option<protocol::AppScan>,
+}
+
+#[derive(Serialize)]
+struct NodeAppsView {
+    online: bool,
+    apps: Vec<AppView>,
+}
+
+/// 四个应用各一项（没检查过的 `scanned = false`）。节点离线时只告诉 `online = false`，不返回上一次的结果（可能已过期）。
+async fn node_apps(State(state): State<ApiState>, Path(id): Path<String>, headers: axum::http::HeaderMap) -> Result<impl IntoResponse, ApiError> {
+    let node = require_owned(&state, &headers, &id).await?;
+    let online = state.app.node_connected(node).await;
+    let scans = if online { state.app.app_scans(node) } else { Default::default() };
+    let apps = [ModelSource::ClaudeCli, ModelSource::CodexExec, ModelSource::Agy, ModelSource::DeepSeek]
+        .into_iter()
+        .map(|source| match scans.get(&source) {
+            Some(scan) => AppView { source, scanned: true, scan: Some(scan.clone()) },
+            None => AppView { source, scanned: false, scan: None },
+        })
+        .collect();
+    Ok(([(header::CACHE_CONTROL, "no-store")], Json(NodeAppsView { online, apps })))
+}
+
+/// 让节点检查本机有没有这个应用、怎么登录的、有哪些模型。只跑本地命令，不调模型、不花额度，所以不要审核口令，
+/// 但仍要个人令牌且节点是自己的。
+async fn scan_node_app(State(state): State<ApiState>, Path((id, source)): Path<(String, String)>, headers: axum::http::HeaderMap) -> Result<StatusCode, ApiError> {
+    let node = require_owned(&state, &headers, &id).await?;
+    let source = parse_source(&source).ok_or((StatusCode::NOT_FOUND, "没有这个应用".to_string()))?;
+    if !state.app.send_to(node, protocol::ServerMsg::ScanApp { source }).await {
+        return Err((StatusCode::CONFLICT, "节点离线，无法检查本机环境".to_string()));
     }
     Ok(StatusCode::ACCEPTED)
 }
@@ -925,6 +974,7 @@ mod evidence_tests {
                 review_auth: reviews::ReviewAuth::new(None),
                 conns: Default::default(),
                 roles: Default::default(),
+                apps: Default::default(),
             })),
             Paths {
                 models: PathBuf::new(),

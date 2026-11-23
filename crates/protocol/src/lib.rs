@@ -90,7 +90,7 @@ pub fn parse<B: DeserializeOwned>(text: &str) -> Result<Parsed<B>, serde_json::E
 // ---------------------------------------------------------------- 公共类型
 
 /// 模型来源。除 `DeepSeek` 外都是本机会员登录，**只有 DeepSeek 允许 API Key**（规则 1）。
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum ModelSource {
     /// `claude` 命令行（本机 Claude 会员登录）
@@ -194,6 +194,48 @@ impl std::fmt::Debug for RoleSet {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SetRoles {
     pub roles: Vec<RoleSet>,
+}
+
+/// 应用在本机的登录情况。只有「个人账号 / 会员登录」算通过（规则 1）。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AppLogin {
+    Ok,
+    NotLoggedIn,
+    /// 登录了但不是会员 / 个人账号（API Key、应用默认凭据、企业网关等），平台不接受
+    WrongAuth,
+    /// 这个应用没有「登录」的概念（DeepSeek 用 API Key）
+    NotApplicable,
+}
+
+/// 应用里的一个模型。`efforts` 为空表示没有单独的推理强度档位（强度已写进模型名，如 agy）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AppModel {
+    pub id: String,
+    pub display: String,
+    pub efforts: Vec<String>,
+    pub default_effort: Option<String>,
+}
+
+/// 一次本机环境检查的结果：装没装、版本、怎么登录的、有哪些模型。只跑本地命令，不调模型、不花额度。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AppScan {
+    pub source: ModelSource,
+    pub installed: bool,
+    pub version: Option<String>,
+    pub login: AppLogin,
+    /// 登录检查的说明（已脱敏，不含账号信息）
+    pub login_detail: String,
+    pub models: Vec<AppModel>,
+    /// 模型列表的来源说明：从应用取到的，还是别名建议、需要手填
+    pub models_note: String,
+    /// RFC3339 时间
+    pub scanned_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AppsReport {
+    pub apps: Vec<AppScan>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -442,6 +484,8 @@ pub enum NodeMsg {
     Ack { ack_id: Uuid },
     /// 角色摘要：连上后、配置变更后、检测完成后上报。服务端只在内存里缓存，不落库
     RolesReport(RolesReport),
+    /// 本机应用环境检查的结果（响应 `scan_app`）。服务端只在内存里缓存
+    AppsReport(AppsReport),
 }
 
 impl NodeMsg {
@@ -543,6 +587,8 @@ pub enum ServerMsg {
     SetRoles(SetRoles),
     /// 让节点真调一次模型，检测这个角色能不能用
     CheckRole { role_id: String },
+    /// 检查本机有没有这个应用、怎么登录的、有哪些模型（只跑本地命令，不调模型）
+    ScanApp { source: ModelSource },
 }
 
 #[cfg(test)]
@@ -783,5 +829,23 @@ mod tests {
         assert!(!shown.contains("sk-绝不能出现"), "Debug 输出泄露了 Key：{shown}");
         let all = format!("{:?}", ServerMsg::SetRoles(SetRoles { roles: vec![set] }));
         assert!(!all.contains("sk-绝不能出现"), "消息的 Debug 输出泄露了 Key：{all}");
+    }
+
+    #[test]
+    fn 应用检查消息往返() {
+        roundtrip(ServerMsg::ScanApp { source: ModelSource::Agy });
+        let scan = AppScan {
+            source: ModelSource::CodexExec,
+            installed: true,
+            version: Some("codex-cli 0.1".into()),
+            login: AppLogin::Ok,
+            login_detail: "已用 ChatGPT 登录".into(),
+            models: vec![AppModel { id: "m".into(), display: "M".into(), efforts: vec!["low".into(), "high".into()], default_effort: Some("low".into()) }],
+            models_note: "来自 codex debug models".into(),
+            scanned_at: "2026-11-23T00:00:00Z".into(),
+        };
+        roundtrip(NodeMsg::AppsReport(AppsReport { apps: vec![scan] }));
+        let text = serde_json::to_string(&AppLogin::WrongAuth).unwrap();
+        assert_eq!(text, "\"wrong_auth\"");
     }
 }

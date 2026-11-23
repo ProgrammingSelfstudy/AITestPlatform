@@ -48,6 +48,7 @@ name = "agent"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
+ "chrono",
  "device",
  "libc",
  "mcp-device",

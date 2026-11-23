@@ -81,6 +81,8 @@ struct Inner {
     conns: Mutex<HashMap<Uuid, Conn>>,
     /// 各节点最近上报的角色摘要（不含 Key）。只在内存里：节点重连会重新上报，不落库。
     roles: std::sync::Mutex<HashMap<Uuid, protocol::RolesReport>>,
+    /// 各节点最近一次本机应用环境检查的结果（按来源保存最新一条）。只在内存里。
+    apps: std::sync::Mutex<HashMap<Uuid, HashMap<protocol::ModelSource, protocol::AppScan>>>,
 }
 
 #[derive(Clone)]
@@ -140,6 +142,7 @@ impl AppState {
             review_auth: reviews::ReviewAuth::from_env(),
             conns: Mutex::new(HashMap::new()),
             roles: Default::default(),
+            apps: Default::default(),
         })))
     }
 
@@ -276,6 +279,17 @@ impl AppState {
         self.0.roles.lock().unwrap().get(&node_id).cloned()
     }
 
+    /// 节点最近一次对各应用的环境检查结果。
+    pub fn app_scans(&self, node_id: Uuid) -> HashMap<protocol::ModelSource, protocol::AppScan> {
+        self.0.apps.lock().unwrap().get(&node_id).cloned().unwrap_or_default()
+    }
+
+    /// 仅测试：直接放一条应用检查结果。
+    #[cfg(test)]
+    pub(crate) fn set_app_scan_for_test(&self, node_id: Uuid, scan: protocol::AppScan) {
+        self.0.apps.lock().unwrap().entry(node_id).or_default().insert(scan.source, scan);
+    }
+
     /// 仅测试：直接放一份节点的角色摘要（真实情况由节点经 WebSocket 上报）。
     #[cfg(test)]
     pub(crate) fn set_roles_report_for_test(&self, node_id: Uuid, report: protocol::RolesReport) {
@@ -410,6 +424,14 @@ impl AppState {
             }
             NodeMsg::NeedHuman(n) => {
                 tracing::warn!(%node_id, run_id = %n.run_id, kind = ?n.kind, "run 需要人工：{}", n.reason);
+                Ok(())
+            }
+            NodeMsg::AppsReport(report) => {
+                let mut all = self.0.apps.lock().unwrap();
+                let node = all.entry(node_id).or_default();
+                for scan in report.apps {
+                    node.insert(scan.source, scan);
+                }
                 Ok(())
             }
             NodeMsg::RolesReport(report) => {
@@ -795,6 +817,7 @@ mod credential_auth_tests {
             review_auth: reviews::ReviewAuth::new(None),
             conns: Mutex::new(HashMap::new()),
             roles: Default::default(),
+            apps: Default::default(),
         }));
         let lease = Uuid::new_v4().to_string();
         for (authorization, status) in [

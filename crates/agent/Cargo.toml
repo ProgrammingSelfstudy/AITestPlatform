@@ -6,6 +6,7 @@ publish.workspace = true
 
 [dependencies]
 base64 = "0.22.1"
+chrono = "0.4.45"
 libc = "0.2.191"
 mcp-device = { path = "../mcp-device" }
 protocol = { version = "0.1.0", path = "../protocol" }

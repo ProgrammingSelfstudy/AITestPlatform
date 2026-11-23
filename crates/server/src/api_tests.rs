@@ -65,6 +65,7 @@ fn lazy_state() -> AppState {
         review_auth: reviews::ReviewAuth::new(None),
         conns: tokio::sync::Mutex::new(HashMap::new()),
         roles: Default::default(),
+        apps: Default::default(),
     }))
 }
 
@@ -892,6 +893,40 @@ async fn 评审员没跑成时用例全部转待人工确认() {
         assert_eq!(status, "needs_human", "评审员没跑成不能当通过");
         assert!(note.contains("没有跑成") && note.contains("没有配置判定员角色"), "{note}");
     }
+}
+
+#[tokio::test]
+async fn 应用环境检查接口_需要令牌_只能查自己的节点_离线不返回结果() {
+    let world = World::new().await;
+    let apps = format!("/api/nodes/{}/apps", world.node);
+    // 没令牌 401
+    assert_eq!(request(&world.app, Method::GET, &apps, &[], "").await.0, StatusCode::UNAUTHORIZED);
+    // 放一条检查结果：节点没有 WebSocket 连接（离线），不返回上一次的（可能过期的）结果，但四个应用都在
+    world.state.set_app_scan_for_test(world.node, protocol::AppScan {
+        source: ModelSource::Agy, installed: true, version: Some("1.0".into()), login: protocol::AppLogin::Ok,
+        login_detail: "已用个人账号登录".into(),
+        models: vec![protocol::AppModel { id: "gemini-x".into(), display: "Gemini X".into(), efforts: vec![], default_effort: None }],
+        models_note: "来自 agy models".into(), scanned_at: "2026-11-23T00:00:00Z".into(),
+    });
+    let (status, headers, bytes) = request(&world.app, Method::GET, &apps, &user_headers(USER_TOKEN), "").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers[header::CACHE_CONTROL], "no-store");
+    let view = json_body(&bytes);
+    assert_eq!(view["online"], false);
+    let sources: Vec<&str> = view["apps"].as_array().unwrap().iter().map(|a| a["source"].as_str().unwrap()).collect();
+    assert_eq!(sources, ["claude_cli", "codex_exec", "agy", "deepseek"]);
+    assert!(view["apps"].as_array().unwrap().iter().all(|a| a["scanned"] == false), "离线时不返回上一次的结果");
+    // 触发检查：不认识的应用 404；离线 409；别人的节点 403
+    let scan = |source: &str, token: &'static str| {
+        let mut h = review_headers(REVIEW_TOKEN);
+        h.push(("x-user-token", token));
+        let (app, path) = (world.app.clone(), format!("{apps}/{source}/scan"));
+        async move { request(&app, Method::POST, &path, &h, "{}").await.0 }
+    };
+    assert_eq!(scan("不存在的应用", USER_TOKEN).await, StatusCode::NOT_FOUND);
+    assert_eq!(scan("agy", USER_TOKEN).await, StatusCode::CONFLICT);
+    sqlx::query("insert into users (name, token_hash) values ('应用检查的另一个人', $1)").bind(crate::secret_hash("u_apps-other")).execute(world.state.pool()).await.unwrap();
+    assert_eq!(scan("agy", "u_apps-other").await, StatusCode::FORBIDDEN);
 }
 
 struct World {

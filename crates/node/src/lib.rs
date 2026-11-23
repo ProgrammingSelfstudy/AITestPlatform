@@ -488,6 +488,14 @@ async fn session<D: Devices, E: RunExecutor>(cfg: &NodeConfig, devices: &D, runn
                                 });
                             }
                         }
+                        ServerMsg::ScanApp { source } => {
+                            // 只跑本地命令（版本、登录状态、模型列表），不调模型；在后台跑，不堵住这条连接
+                            let tx = role_tx.clone();
+                            tokio::spawn(async move {
+                                let scan = agent::apps::scan(source).await;
+                                let _ = tx.send(NodeMsg::AppsReport(protocol::AppsReport { apps: vec![scan] }));
+                            });
+                        }
                         ServerMsg::Ping | ServerMsg::Welcome(_) => {}
                         // 人工处理结果、画面订阅还没接入：明确记一笔，不能假装收到了
                         other => tracing::warn!("这类消息还不处理，已忽略：{other:?}"),
