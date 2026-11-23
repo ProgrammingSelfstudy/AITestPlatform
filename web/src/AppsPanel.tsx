@@ -55,6 +55,8 @@ export interface AppsPanelProps {
   existingRoles: RoleView[];
   busy: boolean;
   onCreateRoles: (roles: RoleInput[]) => void;
+  /** 有值表示还不能用（没选节点、没填个人令牌等）：卡片照常显示但点不了，并显示这句原因；不会发任何请求 */
+  lockedReason?: string;
 }
 
 interface ScanState {
@@ -67,7 +69,7 @@ interface ScanState {
 
 const SCAN_TIMEOUT_MS = 30_000;
 
-export default function AppsPanel({ nodeId, userToken, online, existingRoles, busy, onCreateRoles }: AppsPanelProps) {
+export default function AppsPanel({ nodeId, userToken, online, existingRoles, busy, onCreateRoles, lockedReason }: AppsPanelProps) {
   const [selected, setSelected] = useState<string | null>(null);
   const [scan, setScan] = useState<ScanState | null>(null);
 
@@ -75,13 +77,15 @@ export default function AppsPanel({ nodeId, userToken, online, existingRoles, bu
   const lastRef = useRef<{ key: string; value: NodeApps } | null>(null);
   const load = useCallback(
     async (signal: AbortSignal) => {
+      // 锁定时不请求：还没有节点或令牌
+      if (lockedReason) return { online: false, apps: [] } satisfies NodeApps;
       const next = await fetchNodeApps(nodeId, userToken, signal);
       const key = JSON.stringify(next);
       if (lastRef.current?.key === key) return lastRef.current.value;
       lastRef.current = { key, value: next };
       return next;
     },
-    [nodeId, userToken],
+    [nodeId, userToken, lockedReason],
   );
   const { data, error, reload } = usePolling(load, 1000);
 
@@ -105,7 +109,7 @@ export default function AppsPanel({ nodeId, userToken, online, existingRoles, bu
   );
 
   function choose(meta: AppMeta) {
-    if (meta.source === "deepseek" || !online) return;
+    if (meta.source === "deepseek" || !online || lockedReason) return;
     setSelected(meta.source);
     startScan(meta.source);
   }
@@ -129,12 +133,16 @@ export default function AppsPanel({ nodeId, userToken, online, existingRoles, bu
       </header>
 
       {error && <div className="apps-banner is-bad" role="alert">读取应用检查结果失败：{error}</div>}
-      {!online && <div className="apps-banner is-warn">节点离线，无法检查本机环境。节点恢复在线后再试。</div>}
+      {lockedReason ? (
+        <div className="apps-banner is-warn" role="status">{lockedReason}</div>
+      ) : (
+        !online && <div className="apps-banner is-warn">节点离线，无法检查本机环境。节点恢复在线后再试。</div>
+      )}
 
       <div className="apps-cards">
         {APPS.map((meta) => {
           const status = statusOf(meta, viewOf(meta.source));
-          const disabled = meta.source === "deepseek" || !online;
+          const disabled = meta.source === "deepseek" || !online || Boolean(lockedReason);
           return (
             <button
               key={meta.source}
@@ -156,7 +164,7 @@ export default function AppsPanel({ nodeId, userToken, online, existingRoles, bu
         })}
       </div>
 
-      {selectedMeta && (
+      {selectedMeta && !lockedReason && (
         <AppDetail
           key={selectedMeta.source}
           meta={selectedMeta}

@@ -1041,6 +1041,23 @@ export default function RolesPage() {
         </div>
       )}
 
+      {/* 选应用 → 检查本机环境 → 选模型创建角色。一进页面就显示；还不能用时卡片照常显示但点不了，并说明原因 */}
+      <AppsPanel
+        nodeId={selectedNodeId}
+        userToken={trimmedToken}
+        online={!isNodeOffline}
+        existingRoles={serverRoles}
+        busy={busy}
+        onCreateRoles={handleCreateFromApp}
+        lockedReason={
+          !selectedNodeId
+            ? "先在上面选一个在线节点，才能检查本机环境"
+            : !trimmedToken
+              ? "先在上面填入个人令牌（用来确认这个节点是你的），才能检查本机环境"
+              : undefined
+        }
+      />
+
       {/* 门禁态：未选节点 / 未填个人令牌 / 节点离线 / 首次加载中 */}
       {!selectedNodeId ? (
         <section className="roles-gate-card" aria-label="等待选择在线节点">
@@ -1074,16 +1091,6 @@ export default function RolesPage() {
         </section>
       ) : rolesError && !loadedForNode ? null : (
         /* 主体左右两栏：左 28% 角色实体卡 / 右 72% 管线 + 统计 + 编辑 + 检测日志 */
-        <>
-        {/* 选应用 → 检查本机环境 → 选模型创建角色：创建的角色和现有角色一起整体提交 */}
-        <AppsPanel
-          nodeId={selectedNodeId}
-          userToken={trimmedToken}
-          online={!isNodeOffline}
-          existingRoles={serverRoles}
-          busy={busy}
-          onCreateRoles={handleCreateFromApp}
-        />
         <div className="roles-workspace">
           {/* 左栏：角色实体卡列表 */}
           <aside className="roles-sidebar" aria-label="角色列表">
@@ -1704,7 +1711,6 @@ export default function RolesPage() {
             </section>
           </main>
         </div>
-        </>
       )}
 
       {/* 删除角色二次确认弹窗 */}

@@ -52,6 +52,11 @@ test("没填个人令牌时不请求角色", async () => {
   render(<RolesPage />);
   await screen.findByText(/请输入个人令牌/);
   expect(fetchMock.mock.calls.some(([input]) => String(input).includes("/roles"))).toBe(false);
+  // 「选应用」面板一进页面就能看到：四张卡片照常显示，只是点不了，并说明为什么；也不会发检查请求
+  for (const name of ["Claude", "Codex", "Gemini", "DeepSeek"]) expect(screen.getByText(name)).toBeInTheDocument();
+  expect(screen.getAllByText(/先在上面填入个人令牌/).length).toBeGreaterThan(0);
+  await userEvent.setup().click(screen.getByText("Codex").closest("button")!);
+  expect(fetchMock.mock.calls.some(([input]) => String(input).includes("/apps"))).toBe(false);
 });
 
 test("每个检测状态都有文字，失败原因原样显示，Key 永远不出现", { timeout: 20000 }, async () => {
