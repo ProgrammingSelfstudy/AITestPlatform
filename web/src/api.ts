@@ -152,14 +152,19 @@ export interface CaseSummary {
   blocked_reason: string | null;
 }
 
-interface ModelGroup {
+/** 一个角色 = 某个岗位（执行员 / 判定员）可选的一个来源和它的模型。新增角色或模型只改服务端配置。 */
+export interface ModelRole {
+  id: string;
+  slot: "executor" | "judge";
+  name: string;
+  source: string;
   default: { model: string; effort: string | null };
+  /** efforts 为空表示该模型没有单独的推理强度档位（强度已写进模型名） */
   models: { model: string; efforts: string[] }[];
 }
 
 export interface Models {
-  executor: ModelGroup;
-  judge: ModelGroup;
+  roles: ModelRole[];
 }
 
 export type ScriptStatus = "candidate" | "self_check_passed" | "approved" | "rejected" | "retired";
@@ -220,8 +225,8 @@ export interface NewTask {
   project: string;
   node_id: string;
   case_codes: string[];
-  executor: { model: string; effort: string };
-  judge: { model: string };
+  executor: { role: string; model: string; effort?: string };
+  judge: { role: string; model: string };
 }
 
 async function request(path: string, options: RequestInit): Promise<Response> {

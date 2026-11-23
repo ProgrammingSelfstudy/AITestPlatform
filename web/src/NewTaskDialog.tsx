@@ -1,6 +1,6 @@
 import { Alert, Form, Input, Modal, Select, Skeleton } from "antd";
 import { useEffect, useRef, useState } from "react";
-import { createTask, fetchCases, fetchModels, fetchNodes } from "./api";
+import { createTask, fetchCases, fetchModels, fetchNodes, type ModelRole, type Models } from "./api";
 import { readReviewToken, rememberReviewToken, writeTokenAction } from "./reviewLogic";
 import ReviewTokenDialog from "./ReviewTokenDialog";
 import { LoadError } from "./runUi";
@@ -14,11 +14,15 @@ async function loadChoices(signal: AbortSignal) {
   return { cases, models };
 }
 
+const rolesOf = (models: Models | undefined, slot: ModelRole["slot"]) => models?.roles.filter((r) => r.slot === slot) ?? [];
+
 interface Fields {
   node: string;
   cases: string[];
+  executorRole: string;
   executor: string;
-  effort: string;
+  effort?: string;
+  judgeRole: string;
   judge: string;
   userToken: string;
 }
@@ -36,22 +40,41 @@ export default function NewTaskDialog({ onClose }: { onClose: () => void }) {
   const node = Form.useWatch("node", form);
   const hasOnlineNodes = nodes?.some((candidate) => candidate.online);
   const nodeUnavailable = Boolean(node && nodes && !nodes.some((candidate) => candidate.node_id === node && candidate.online));
-  const efforts = data?.models.executor.models.find((m) => m.model === model)?.efforts ?? [];
+  const executorRoleId = Form.useWatch("executorRole", form);
+  const judgeRoleId = Form.useWatch("judgeRole", form);
+  const executorRoles = rolesOf(data?.models, "executor");
+  const judgeRoles = rolesOf(data?.models, "judge");
+  const executorRole = executorRoles.find((r) => r.id === executorRoleId);
+  const judgeRole = judgeRoles.find((r) => r.id === judgeRoleId);
+  const efforts = executorRole?.models.find((m) => m.model === model)?.efforts ?? [];
 
+  // 配置加载后填默认：每个岗位的第一个角色和它的默认模型。只在首次加载时填，轮询刷新不覆盖用户已选的值
   useEffect(() => {
     if (!data) return;
-    const { executor, judge } = data.models;
+    const executor = rolesOf(data.models, "executor")[0];
+    const judge = rolesOf(data.models, "judge")[0];
+    if (form.getFieldValue("executorRole")) return;
     form.setFieldsValue({
-      executor: executor.default.model,
-      effort: executor.default.effort ?? undefined,
-      judge: judge.default.model,
+      executorRole: executor?.id,
+      executor: executor?.default.model,
+      effort: executor?.default.effort ?? undefined,
+      judgeRole: judge?.id,
+      judge: judge?.default.model,
     });
   }, [data, form]);
 
+  function changeExecutorRole(id: string) {
+    const role = executorRoles.find((r) => r.id === id);
+    form.setFieldsValue({ executor: role?.default.model, effort: role?.default.effort ?? undefined });
+  }
+
+  function changeJudgeRole(id: string) {
+    form.setFieldValue("judge", judgeRoles.find((r) => r.id === id)?.default.model);
+  }
+
   function changeModel(model: string) {
-    const executor = data?.models.executor;
-    const available = executor?.models.find((m) => m.model === model)?.efforts ?? [];
-    const preferred = executor?.default.effort;
+    const available = executorRole?.models.find((m) => m.model === model)?.efforts ?? [];
+    const preferred = executorRole?.default.effort;
     form.setFieldValue("effort", preferred && available.includes(preferred) ? preferred : available[0]);
   }
 
@@ -78,8 +101,8 @@ export default function NewTaskDialog({ onClose }: { onClose: () => void }) {
         project,
         node_id: fields.node,
         case_codes: fields.cases,
-        executor: { model: fields.executor, effort: fields.effort },
-        judge: { model: fields.judge },
+        executor: { role: fields.executorRole, model: fields.executor, ...(fields.effort ? { effort: fields.effort } : {}) },
+        judge: { role: fields.judgeRole, model: fields.judge },
       }, token, fields.userToken.trim());
       window.location.hash = `/tasks/${task.task_id}`;
       onClose();
@@ -137,16 +160,25 @@ export default function NewTaskDialog({ onClose }: { onClose: () => void }) {
                 }))}
               />
             </Form.Item>
+            {/* 同一岗位只配了一个角色时不显示角色下拉，但表单里仍带着角色 id */}
+            <Form.Item name="executorRole" label="执行员角色" hidden={executorRoles.length < 2}>
+              <Select onChange={changeExecutorRole} options={executorRoles.map((r) => ({ value: r.id, label: r.name }))} />
+            </Form.Item>
             <div className="model-fields">
               <Form.Item name="executor" label="执行员模型" rules={[{ required: true, message: "请选择执行员模型" }]}>
-                <Select onChange={changeModel} options={data.models.executor.models.map((m) => ({ value: m.model, label: m.model }))} />
+                <Select onChange={changeModel} options={executorRole?.models.map((m) => ({ value: m.model, label: m.model })) ?? []} />
               </Form.Item>
-              <Form.Item name="effort" label="推理强度" rules={[{ required: true, message: "请选择推理强度" }]}>
-                <Select options={efforts.map((effort) => ({ value: effort, label: effort }))} />
-              </Form.Item>
+              {efforts.length > 0 && (
+                <Form.Item name="effort" label="推理强度" rules={[{ required: true, message: "请选择推理强度" }]}>
+                  <Select options={efforts.map((effort) => ({ value: effort, label: effort }))} />
+                </Form.Item>
+              )}
             </div>
+            <Form.Item name="judgeRole" label="判定员角色" hidden={judgeRoles.length < 2}>
+              <Select onChange={changeJudgeRole} options={judgeRoles.map((r) => ({ value: r.id, label: r.name }))} />
+            </Form.Item>
             <Form.Item name="judge" label="判定员模型" rules={[{ required: true, message: "请选择判定员模型" }]}>
-              <Select options={data.models.judge.models.map((m) => ({ value: m.model, label: m.model }))} />
+              <Select options={judgeRole?.models.map((m) => ({ value: m.model, label: m.model })) ?? []} />
             </Form.Item>
             <Form.Item
               name="userToken" label="个人令牌" extra="用来确认所选节点属于你。只在本次请求中使用，不会保存。"

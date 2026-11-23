@@ -100,6 +100,7 @@ pub enum ModelSource {
     /// `agy` 命令行（本机 Gemini 个人账号登录）
     Agy,
     /// DeepSeek API（唯一允许 API Key 的来源，Key 只在发起人自己的节点本机）
+    #[serde(rename = "deepseek")]
     DeepSeek,
 }
 

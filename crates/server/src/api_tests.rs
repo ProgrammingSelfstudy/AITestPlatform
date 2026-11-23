@@ -19,16 +19,17 @@ use crate::test_support::test_state;
 use crate::{Config, Inner, app_with_paths};
 
 const MODELS: &str = r#"{
-  "executor": {
-    "source": "codex_exec",
-    "default": {"model":"测试执行模型", "effort":"max"},
-    "models": [{"model":"测试执行模型", "efforts":["high","max"]}, {"model":"另一执行模型", "efforts":["low"]}]
-  },
-  "judge": {
-    "source": "claude_cli",
-    "default": {"model":"测试判定模型","effort":null},
-    "models": [{"model":"测试判定模型","efforts":[]}]
-  }
+  "roles": [
+    {"id":"executor-codex","slot":"executor","name":"执行员 · Codex","source":"codex_exec",
+     "default":{"model":"测试执行模型","effort":"max"},
+     "models":[{"model":"测试执行模型","efforts":["high","max"]},{"model":"另一执行模型","efforts":["low"]}]},
+    {"id":"judge-claude","slot":"judge","name":"判定员 · Claude","source":"claude_cli",
+     "default":{"model":"测试判定模型","effort":null},
+     "models":[{"model":"测试判定模型","efforts":[]}]},
+    {"id":"judge-agy","slot":"judge","name":"判定员 · Gemini","source":"agy",
+     "default":{"model":"测试Gemini模型","effort":null},
+     "models":[{"model":"测试Gemini模型","efforts":[]}]}
+  ]
 }"#;
 const TOKEN: &str = "test-node-token";
 const USER_TOKEN: &str = "u_synthetic-user-token-for-tests";
@@ -383,7 +384,12 @@ async fn models_原样返回每次重读并拒绝坏配置() {
     std::fs::write(&temp.paths.models, &changed).unwrap();
     let (_, _, body) = request(&app, Method::GET, "/api/models", &[], "").await;
     assert_eq!(text(&body), changed);
-    for broken in ["{", "{}"] {
+    // 坏配置：不是 JSON、缺 roles、没有判定员岗位、重复 id、还没有运行器的来源（deepseek）、默认值不在列表里
+    let no_judge = r#"{"roles":[{"id":"e","slot":"executor","name":"x","source":"codex_exec","default":{"model":"m","effort":"high"},"models":[{"model":"m","efforts":["high"]}]}]}"#;
+    let dup = MODELS.replace("judge-agy", "judge-claude");
+    let deepseek = MODELS.replace("\"source\":\"agy\"", "\"source\":\"deepseek\"");
+    let bad_default = MODELS.replace("\"model\":\"测试Gemini模型\",\"effort\":null", "\"model\":\"不存在\",\"effort\":null");
+    for broken in ["{", "{}", no_judge, dup.as_str(), deepseek.as_str(), bad_default.as_str()] {
         std::fs::write(&temp.paths.models, broken).unwrap();
         let (status, _, body) = request(&app, Method::GET, "/api/models", &[], "").await;
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
@@ -407,6 +413,31 @@ async fn 创建任务拒绝未配置的模型和强度() {
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(text(&bytes).contains(message));
     }
+}
+
+#[tokio::test]
+async fn 创建任务按角色选来源_不写角色用岗位第一个() {
+    let temp = TempPaths::with_config();
+    let app = temp.app(with_token(lazy_state(), Some(REVIEW_TOKEN)));
+    let good = payload(Uuid::new_v4(), &["TC-04"]);
+    // 选了 Gemini 角色但模型是 Claude 角色的：该角色下没有这个模型
+    let mut body = good.clone();
+    body["judge"]["role"] = json!("judge-agy");
+    let (status, _, bytes) = browser_post(&app, "/api/tasks", body).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(text(&bytes).contains("判定员模型"));
+    // 不存在的角色
+    let mut body = good.clone();
+    body["judge"]["role"] = json!("judge-nope");
+    let (status, _, bytes) = browser_post(&app, "/api/tasks", body).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(text(&bytes).contains("判定员角色"));
+    // 没有档位的模型不能带强度
+    let mut body = good;
+    body["judge"]["role"] = json!("judge-agy");
+    body["judge"]["model"] = json!("测试Gemini模型");
+    let (status, _, _) = browser_post(&app, "/api/tasks", body).await;
+    assert_ne!(status, StatusCode::BAD_REQUEST, "角色和模型匹配时校验应通过（后面的节点属主校验另有结果）");
 }
 
 struct World {

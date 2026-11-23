@@ -9,7 +9,7 @@ AI 测试平台：执行节点连着 Android 真机，AI 执行员按用例步�
 ## 2. 硬性约束
 
 1. 技术栈固定：React 19 + TypeScript + Vite + Ant Design 6。不引入别的 UI 库，图表或图标另需库须先说明理由。
-2. **不改后端接口，不改 `web/src/api.ts` 里的类型和函数签名**（可以新增前端辅助函数）。所有数据来自现有接口：`/api/nodes`、`/api/models`、`/api/projects/*`（用例列表）、`/api/tasks`、`/api/tasks/:id`、`/api/runs/:id`、`/api/runs/:id/reviews`、`/api/reviews/stats`、`/api/reviews/export`。
+2. **不改后端接口，不改 `web/src/api.ts` 里的类型和函数签名**（例外：`/api/models` 和创建任务的请求体已改成按角色选择，见 `docs/落地记录.md` 的「角色与模型配置」一节）（可以新增前端辅助函数）。所有数据来自现有接口：`/api/nodes`、`/api/models`、`/api/projects/*`（用例列表）、`/api/tasks`、`/api/tasks/:id`、`/api/runs/:id`、`/api/runs/:id/reviews`、`/api/reviews/stats`、`/api/reviews/export`。
 3. 路由保持 hash 路由：`#/nodes`、`#/tasks`、`#/tasks/:id`、`#/runs/:id`，其他地址显示「找不到这个页面」。
 4. **没有登录页**。写操作（发起、取消、提交审核）用现有的口令弹窗：口令只放在 `x-review-token` 请求头，**不得进 URL、日志、`localStorage` 明文展示**。
 5. **界面文案全部中文**，代码注释中文。

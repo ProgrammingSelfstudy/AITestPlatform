@@ -165,14 +165,26 @@ pub(crate) async fn browser_write_guard(request: Request, next: Next, lan: bool)
     next.run(request).await
 }
 
+/// 模型配置：`roles` 列表，每项是「某个岗位（执行员 / 判定员）可选的一个来源和它的模型」。
+/// 新增角色或模型只改配置文件，不改代码。
 #[derive(Deserialize)]
 struct Models {
-    executor: ModelGroup,
-    judge: ModelGroup,
+    roles: Vec<Role>,
+}
+
+#[derive(Deserialize, PartialEq, Eq, Clone, Copy, Debug)]
+#[serde(rename_all = "snake_case")]
+enum Slot {
+    Executor,
+    Judge,
 }
 
 #[derive(Deserialize)]
-struct ModelGroup {
+struct Role {
+    id: String,
+    slot: Slot,
+    #[allow(dead_code)]
+    name: String,
     source: ModelSource,
     default: ModelDefault,
     models: Vec<ModelOption>,
@@ -190,33 +202,42 @@ struct ModelOption {
     efforts: Vec<String>,
 }
 
-impl ModelGroup {
+impl Role {
     fn find(&self, name: &str) -> Option<&ModelOption> {
         self.models.iter().find(|m| m.model == name)
+    }
+
+    /// 目前节点真正能跑的来源组合；还没有运行器的来源不让进配置，免得页面上能选、实际跑不了。
+    fn source_supported(&self) -> bool {
+        match self.slot {
+            Slot::Executor => self.source == ModelSource::CodexExec,
+            Slot::Judge => matches!(self.source, ModelSource::ClaudeCli | ModelSource::Agy),
+        }
+    }
+
+    fn valid(&self) -> bool {
+        !self.id.trim().is_empty()
+            && self.source_supported()
+            && !self.models.is_empty()
+            && self.models.iter().all(|m| !m.model.trim().is_empty() && m.efforts.iter().all(|e| !e.trim().is_empty()))
+            && self.find(&self.default.model).is_some_and(|m| match &self.default.effort {
+                Some(e) => m.efforts.contains(e),
+                None => m.efforts.is_empty(),
+            })
     }
 }
 
 impl Models {
     fn valid(&self) -> bool {
-        self.executor.source == ModelSource::CodexExec
-            && self.judge.source == ModelSource::ClaudeCli
-            && self.executor.models.iter().all(|m| {
-                !m.model.trim().is_empty()
-                    && !m.efforts.is_empty()
-                    && m.efforts.iter().all(|e| !e.trim().is_empty())
-            })
-            && self.judge.models.iter().all(|m| !m.model.trim().is_empty())
-            && self
-                .executor
-                .find(&self.executor.default.model)
-                .is_some_and(|m| {
-                    self.executor
-                        .default
-                        .effort
-                        .as_ref()
-                        .is_some_and(|e| m.efforts.contains(e))
-                })
-            && self.judge.find(&self.judge.default.model).is_some()
+        let unique = self.roles.iter().enumerate().all(|(i, r)| self.roles[..i].iter().all(|o| o.id != r.id));
+        unique
+            && self.roles.iter().all(Role::valid)
+            && [Slot::Executor, Slot::Judge].iter().all(|slot| self.roles.iter().any(|r| r.slot == *slot))
+    }
+
+    /// 请求没写角色时用该岗位的第一个角色。
+    fn pick(&self, slot: Slot, role: Option<&str>) -> Option<&Role> {
+        self.roles.iter().find(|r| r.slot == slot && role.is_none_or(|id| r.id == id))
     }
 }
 
@@ -259,12 +280,14 @@ struct CreateRequest {
 
 #[derive(Deserialize)]
 struct ExecutorChoice {
+    role: Option<String>,
     model: String,
-    effort: String,
+    effort: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct JudgeChoice {
+    role: Option<String>,
     model: String,
 }
 
@@ -295,14 +318,24 @@ async fn create_task(
         return Err((StatusCode::UNAUTHORIZED, "需要有效的个人令牌才能发起任务".to_string()));
     }
     let (_, models) = read_models(&state.paths.models).await?;
-    let executor = models
-        .executor
+    let executor_role = models
+        .pick(Slot::Executor, request.executor.role.as_deref())
+        .ok_or_else(|| bad_request("执行员角色不在配置列表中"))?;
+    let executor = executor_role
         .find(&request.executor.model)
         .ok_or_else(|| bad_request("执行员模型不在配置列表中"))?;
-    if !executor.efforts.contains(&request.executor.effort) {
+    // 有强度档位的模型必须选其中之一；没有档位的（强度已写进模型名）不能带强度。
+    let effort_ok = match &request.executor.effort {
+        Some(e) => executor.efforts.contains(e),
+        None => executor.efforts.is_empty(),
+    };
+    if !effort_ok {
         return Err(bad_request("该执行员模型不支持所选推理强度"));
     }
-    if models.judge.find(&request.judge.model).is_none() {
+    let judge_role = models
+        .pick(Slot::Judge, request.judge.role.as_deref())
+        .ok_or_else(|| bad_request("判定员角色不在配置列表中"))?;
+    if judge_role.find(&request.judge.model).is_none() {
         return Err(bad_request("判定员模型不在配置列表中"));
     }
     let user = crate::users::user_by_token(state.app.pool(), token)
@@ -318,12 +351,12 @@ async fn create_task(
         node_id: request.node_id,
         case_codes: request.case_codes,
         executor: RoleModel {
-            source: ModelSource::CodexExec,
+            source: executor_role.source,
             model: Some(request.executor.model),
-            effort: Some(request.executor.effort),
+            effort: request.executor.effort,
         },
         judge: RoleModel {
-            source: ModelSource::ClaudeCli,
+            source: judge_role.source,
             model: Some(request.judge.model),
             effort: None,
         },
