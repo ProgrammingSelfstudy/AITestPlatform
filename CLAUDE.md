@@ -39,4 +39,5 @@ cargo build --workspace
 cargo test --workspace
 cargo run -p server
 cargo run -p node
+cd web && pnpm test    # 前端测试（vitest + jsdom）
 ```

@@ -232,12 +232,15 @@ async function request(path: string, options: RequestInit): Promise<Response> {
     throw new Error("无法连接平台服务端");
   }
   if (!response.ok) {
-    const failure = options.method === "POST" ? writeTokenFailure(response.status) : null;
+    const body = await response.text().catch(() => "");
+    // 口令校验失败（403/429）服务端不带正文；带正文的 403 是别的原因（例如不是自己的节点），
+    // 要显示那个原因，不能冒充成口令问题，更不能因此清掉用户输对的口令
+    const failure = options.method === "POST" && !body ? writeTokenFailure(response.status) : null;
     if (failure) {
       if (failure.clearToken) rememberReviewToken("");
       throw new Error(failure.message);
     }
-    throw new Error((await response.text()) || `服务端返回 ${response.status}`);
+    throw new Error(body || `服务端返回 ${response.status}`);
   }
   return response;
 }

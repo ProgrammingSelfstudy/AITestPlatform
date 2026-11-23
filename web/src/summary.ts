@@ -14,6 +14,6 @@ export function parseSummary(text: string): VerdictCounts {
 }
 
 /** 自评与 Judge 结论不一致：只有 Judge 已完成且双方都有结论才算 */
-export function hasDisagreement(run: RunView) {
+export function hasDisagreement(run: Pick<RunView, "judge_status" | "executor_result" | "final_result">) {
   return run.judge_status === "completed" && !!run.executor_result && !!run.final_result && run.executor_result !== run.final_result;
 }
