@@ -434,6 +434,7 @@
   border-color: var(--roles-judge-border);
 }
 
+.roles-slot-planner,
 .roles-slot-case_writer {
   color: var(--roles-judge-fg);
   background: var(--roles-judge-bg);
@@ -613,6 +614,7 @@
   background: var(--roles-judge-bg);
 }
 
+.roles-card-icon.is-planner,
 .roles-card-icon.is-case_writer {
   color: var(--roles-judge-fg);
   border-color: var(--roles-judge-border);

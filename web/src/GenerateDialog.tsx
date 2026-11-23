@@ -143,7 +143,7 @@ function RoleStatusBadge({ status }: { status: CheckStatus }) {
 
 const onceLoaded = () => false;
 
-export default function GenerateDialog({ onClose }: { onClose: () => void }) {
+export default function GenerateDialog({ onClose, initialModule }: { onClose: () => void; initialModule?: string }) {
   // 模块选项（加载一次）
   const loadModulesOnce = useCallback((signal: AbortSignal) => fetchModules(project, signal), []);
   const { data: existingModules } = usePolling<ModuleView[]>(loadModulesOnce, REFRESH_MS, onceLoaded);
@@ -167,7 +167,8 @@ export default function GenerateDialog({ onClose }: { onClose: () => void }) {
   );
 
   // 表单状态（「我是谁」只记名字，在本浏览器记 30 天）
-  const [moduleName, setModuleName] = useState("");
+  // 从管理员的提议进来时，模块名预填好；其余（链接、截图）仍要人自己补
+  const [moduleName, setModuleName] = useState(initialModule ?? "");
   const [doc, setDoc] = useState("");
   const [docUploadNote, setDocUploadNote] = useState<string | null>(null);
   const [links, setLinks] = useState<string[]>([""]);

@@ -3,6 +3,7 @@ import zhCN from "antd/locale/zh_CN";
 import { useEffect, useState } from "react";
 import NodesPage from "./NodesPage";
 import ScriptsPage from "./ScriptsPage";
+import AdminPage from "./AdminPage";
 import RolesPage from "./RolesPage";
 import ModulesPage from "./ModulesPage";
 import ModuleDetailPage from "./ModuleDetailPage";
@@ -11,7 +12,7 @@ import { TaskPage, TasksPage } from "./TasksPage";
 import "./styles.css";
 
 type Mode = "light" | "dark";
-type Route = { page: "nodes" | "tasks" | "scripts" | "roles" | "modules" | "missing" } | { page: "task" | "run" | "module"; id: string };
+type Route = { page: "nodes" | "tasks" | "scripts" | "roles" | "modules" | "admin" | "missing" } | { page: "task" | "run" | "module"; id: string };
 
 function readRoute(): Route {
   const hash = window.location.hash;
@@ -20,6 +21,7 @@ function readRoute(): Route {
   if (hash === "#/scripts") return { page: "scripts" };
   if (hash === "#/roles") return { page: "roles" };
   if (hash === "#/modules") return { page: "modules" };
+  if (hash === "#/admin") return { page: "admin" };
   const moduleMatch = /^#\/modules\/([a-z0-9-]+)$/i.exec(hash);
   if (moduleMatch) return { page: "module", id: moduleMatch[1] };
   const match = /^#\/(tasks|runs)\/([a-z0-9-]+)$/i.exec(hash);
@@ -44,6 +46,7 @@ const BREADCRUMB: Record<Route["page"], string> = {
   scripts: "回归脚本",
   roles: "角色与模型",
   modules: "模块",
+  admin: "管理员",
   module: "模块详情",
   task: "任务详情",
   run: "运行详情",
@@ -125,7 +128,8 @@ function Shell({ mode, onToggle }: { mode: Mode; onToggle: () => void }) {
   const scripts = route.page === "scripts";
   const roles = route.page === "roles";
   const modules = route.page === "modules" || route.page === "module";
-  const tasks = !nodes && !scripts && !roles && !modules && route.page !== "missing";
+  const admin = route.page === "admin";
+  const tasks = !nodes && !scripts && !roles && !modules && !admin && route.page !== "missing";
 
   return (
     <div className="app-shell">
@@ -145,6 +149,12 @@ function Shell({ mode, onToggle }: { mode: Mode; onToggle: () => void }) {
                 <line x1="6" y1="17" x2="6.01" y2="17" />
               </svg>
               <span>节点与设备</span>
+            </a>
+            <a href="#/admin" aria-current={admin ? "page" : undefined}>
+              <svg className="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
+                <path d="M21 15a2 2 0 0 1-2 2H8l-5 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
+              </svg>
+              <span>管理员</span>
             </a>
             <a href="#/modules" aria-current={modules ? "page" : undefined}>
               <svg className="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
@@ -225,6 +235,7 @@ function Shell({ mode, onToggle }: { mode: Mode; onToggle: () => void }) {
           {route.page === "scripts" && <ScriptsPage />}
           {route.page === "roles" && <RolesPage />}
           {route.page === "modules" && <ModulesPage />}
+          {route.page === "admin" && <AdminPage />}
           {route.page === "module" && <ModuleDetailPage key={route.id} id={route.id} />}
           {route.page === "task" && <TaskPage key={route.id} id={route.id} />}
           {route.page === "run" && <RunPage key={route.id} id={route.id} />}

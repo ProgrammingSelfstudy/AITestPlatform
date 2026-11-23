@@ -227,7 +227,7 @@ export interface CasegenInput {
 /** 一个角色 = 某个岗位（执行员 / 判定员）可选的一个来源和它的模型。新增角色或模型只改服务端配置。 */
 export interface ModelRole {
   id: string;
-  slot: "executor" | "judge" | "case_writer";
+  slot: "executor" | "judge" | "case_writer" | "planner";
   name: string;
   source: string;
   default: { model: string; effort: string | null };
@@ -549,3 +549,53 @@ export async function scanNodeApp(nodeId: string, source: string, userName: stri
 
 /** 登记过的名字（节点启动带 NODE_USER_NAME 时登记），给「我是谁」做提示。名字不是机密。 */
 export const fetchUsers = (signal?: AbortSignal) => get<string[]>("/api/users", signal);
+
+// ---------------------------------------------------------------- 管理员：只提议，你点确认才执行
+
+export type ProposalStatus = "pending" | "confirmed" | "dismissed" | "failed";
+
+/** 管理员的一条提议。kind 只有三种：create_module 新建模块 / generate_cases 生成用例（要你补 UI 链接和截图）/ run_tests 对已批准的用例发起测试。 */
+export interface AdminProposal {
+  id: string;
+  kind: "create_module" | "generate_cases" | "run_tests";
+  args: { name?: string; module?: string; case_codes?: string[] };
+  why: string;
+  status: ProposalStatus;
+  /** 执行结果或失败原因，原样显示 */
+  result: string;
+}
+
+export interface AdminMessage {
+  id: string;
+  author: "user" | "admin";
+  text: string;
+  /** 管理员没回答成功（没有角色、额度用完、超时…），text 是原因 */
+  is_error: boolean;
+  created_at: string;
+  proposals: AdminProposal[];
+}
+
+export interface AdminChat {
+  /** 正在等管理员回答 */
+  pending: { ask_id: string; since: string } | null;
+  messages: AdminMessage[];
+}
+
+export const fetchAdminChat = (userName: string, signal?: AbortSignal) =>
+  request("/api/admin/chat", { signal, headers: userHeaders(userName) }).then((r) => r.json() as Promise<AdminChat>);
+
+/** 对管理员说一句话。要审核口令；回答由你自己节点上的管理员角色生成，用的是你自己的额度。 */
+export async function sendAdminMessage(message: string, token: string, userName: string): Promise<void> {
+  await post("/api/admin/messages", { message }, token, userHeaders(userName));
+}
+
+/** 确认一条提议：服务端重新核对后用你的身份、在你的节点上执行。返回结果说明和下一步（打开预填的表单、或任务编号）。 */
+export async function confirmProposal(id: string, token: string, userName: string): Promise<{ result: string; next: { open_generate?: { module: string }; task_id?: string } | null }> {
+  const response = await post(`/api/admin/proposals/${encodeURIComponent(id)}/confirm`, {}, token, userHeaders(userName));
+  return response.json();
+}
+
+/** 忽略一条提议，不执行任何东西。 */
+export async function dismissProposal(id: string, userName: string): Promise<void> {
+  await post(`/api/admin/proposals/${encodeURIComponent(id)}/dismiss`, {}, "", userHeaders(userName));
+}

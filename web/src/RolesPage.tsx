@@ -45,6 +45,7 @@ const SLOT_LABEL: Record<ModelRole["slot"], string> = {
   executor: "执行员",
   judge: "判定员",
   case_writer: "测试用例",
+  planner: "管理员",
 };
 
 interface ModelRowField {
@@ -87,9 +88,9 @@ function isAbnormalStatus(status: CheckStatus): boolean {
 }
 
 function allowedSlotsForSource(source: string): ModelRole["slot"][] {
-  if (source === "codex_exec") return ["executor", "case_writer"];
-  if (source === "claude_cli") return ["judge", "case_writer"];
-  if (source === "agy") return ["judge"];
+  if (source === "codex_exec") return ["executor", "case_writer", "planner"];
+  if (source === "claude_cli") return ["judge", "case_writer", "planner"];
+  if (source === "agy") return ["judge", "planner"];
   return ["executor", "judge"];
 }
 
@@ -1483,6 +1484,11 @@ export default function RolesPage() {
                                 value: "case_writer",
                                 label: "测试用例",
                                 disabled: !allowedSlots.includes("case_writer"),
+                              },
+                              {
+                                value: "planner",
+                                label: "管理员",
+                                disabled: !allowedSlots.includes("planner"),
                               },
                             ]}
                           />

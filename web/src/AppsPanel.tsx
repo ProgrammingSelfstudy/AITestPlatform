@@ -25,17 +25,18 @@ interface AppMeta {
 }
 
 const APPS: AppMeta[] = [
-  { source: "claude_cli", name: "Claude", tagline: "Claude Code 命令行 · 会员登录", slots: ["judge", "case_writer"], install: "安装 Claude Code 后在终端运行 claude auth login，用会员账号登录" },
-  { source: "codex_exec", name: "Codex", tagline: "Codex CLI · ChatGPT 登录", slots: ["executor", "case_writer"], install: "安装 Codex CLI 后在终端运行 codex login，用 ChatGPT 账号登录" },
-  { source: "agy", name: "Gemini", tagline: "Antigravity CLI · 个人账号登录", slots: ["judge"], install: "安装 Antigravity CLI 后在终端运行 agy，用个人 Google 账号登录" },
+  { source: "claude_cli", name: "Claude", tagline: "Claude Code 命令行 · 会员登录", slots: ["judge", "case_writer", "planner"], install: "安装 Claude Code 后在终端运行 claude auth login，用会员账号登录" },
+  { source: "codex_exec", name: "Codex", tagline: "Codex CLI · ChatGPT 登录", slots: ["executor", "case_writer", "planner"], install: "安装 Codex CLI 后在终端运行 codex login，用 ChatGPT 账号登录" },
+  { source: "agy", name: "Gemini", tagline: "Antigravity CLI · 个人账号登录", slots: ["judge", "planner"], install: "安装 Antigravity CLI 后在终端运行 agy，用个人 Google 账号登录" },
   { source: "deepseek", name: "DeepSeek", tagline: "DeepSeek · API Key", slots: [], install: "" },
 ];
 
-const SLOT_LABEL: Record<Slot, string> = { executor: "执行员", judge: "判定员", case_writer: "测试用例" };
+const SLOT_LABEL: Record<Slot, string> = { executor: "执行员", judge: "判定员", case_writer: "测试用例", planner: "管理员" };
 const SLOT_HINT: Record<Slot, string> = {
   executor: "操作手机，按用例一步步跑",
   judge: "独立评审每条预期，也兼评审生成的用例",
   case_writer: "根据需求文档和 UI 截图生成用例",
+  planner: "读需求和各模块现状，和你聊天并提议下一步；只提议，你点确认才会派任务",
 };
 
 type Tone = "ok" | "warn" | "bad" | "muted";
