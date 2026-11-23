@@ -79,6 +79,7 @@ struct Inner {
     pool: PgPool,
     accounts: Option<accounts::AccountPool>,
     review_auth: reviews::ReviewAuth,
+    password_auth: users::PasswordAuth,
     /// 每个节点当前有效的连接（连接 id + 发件箱）。同一节点重连时，旧连接的收尾不能把新连接标成离线。
     /// 只在本进程内有效（单实例）；多实例部署时要换成共享的租约。
     conns: Mutex<HashMap<Uuid, Conn>>,
@@ -145,6 +146,7 @@ impl AppState {
             pool,
             accounts,
             review_auth: reviews::ReviewAuth::from_env(),
+            password_auth: Default::default(),
             conns: Mutex::new(HashMap::new()),
             roles: Default::default(),
             apps: Default::default(),
@@ -846,6 +848,7 @@ mod credential_auth_tests {
             pool: PgPoolOptions::new().connect_lazy_with(PgConnectOptions::new()),
             accounts: None,
             review_auth: reviews::ReviewAuth::new(None),
+            password_auth: Default::default(),
             conns: Mutex::new(HashMap::new()),
             roles: Default::default(),
             apps: Default::default(),

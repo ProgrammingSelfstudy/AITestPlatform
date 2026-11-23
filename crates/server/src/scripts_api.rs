@@ -15,7 +15,7 @@ use serde::Deserialize;
 use sqlx::Row;
 use uuid::Uuid;
 
-use crate::api::ApiState;
+use crate::api::{ApiState, require_browser_user};
 use crate::regress_requests::{self, RequestError};
 use crate::scripts::{self, NewScript, ScriptError, ScriptRecord};
 use crate::triage::{self, TriageError};
@@ -429,11 +429,9 @@ pub(crate) struct RegressRequest {
     node_id: Uuid,
 }
 
-/// 校验个人令牌，并确认节点属于这个人：回归占用的是节点的手机，只能发到自己的节点（规则 9）。
+/// 回归只能用发起人自己的节点和手机（规则 9），所以需要确认发起人和节点属主。
 async fn require_owner(state: &ApiState, headers: &axum::http::HeaderMap, node_id: Uuid) -> Result<(), Failure> {
-    let Some(user) = crate::users::browser_user(state.app.pool(), headers).await.map_err(|e| internal(&e))? else {
-        return Err(fail(StatusCode::UNAUTHORIZED, crate::users::NEED_NAME_MESSAGE));
-    };
+    let user = require_browser_user(state, headers).await?;
     match crate::users::check_node_owner(state.app.pool(), node_id, user).await.map_err(|e| internal(&e))? {
         crate::users::NodeOwner::Owned => Ok(()),
         crate::users::NodeOwner::Missing => Err(fail(StatusCode::NOT_FOUND, "没有这个节点")),

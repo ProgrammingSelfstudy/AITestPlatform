@@ -19,7 +19,7 @@ import ReviewTokenDialog from "./ReviewTokenDialog";
 import { LoadError } from "./runUi";
 import { REFRESH_MS, usePolling } from "./usePolling";
 import IdentityHint from "./IdentityHint";
-import { useRememberedUserName } from "./identity";
+import { NEED_LOGIN_MESSAGE, useRememberedUserName } from "./identity";
 import "./modules.css";
 
 const project = "hafa";
@@ -888,7 +888,10 @@ export default function GenerateDialog({ onClose, initialModule }: { onClose: ()
           <div className="mod-field">
             <div className="mod-field-head">
               <RequiredLabel text="我是谁" />
-              <IdentityHint className="mod-field-meta" expiresAt={nameExpiresAt} onForget={forgetName} onCreated={setUserName} />
+              <IdentityHint className="mod-field-meta" userName={userName} expiresAt={nameExpiresAt}
+                nameProblem={submitError === NEED_LOGIN_MESSAGE ? submitError : rolesLoaded ? rolesState.data?.name_problem : null}
+                onForget={forgetName} onCreated={setUserName}
+                onLogin={() => { setSubmitError(null); setRolesRefreshSeq((n) => n + 1); }} />
             </div>
             <Input
               aria-label="我是谁"
@@ -901,6 +904,7 @@ export default function GenerateDialog({ onClose, initialModule }: { onClose: ()
               onChange={(event) => {
                 setUserName(event.target.value);
                 setErrors((prev) => ({ ...prev, userName: undefined }));
+                if (submitError === NEED_LOGIN_MESSAGE) setSubmitError(null);
               }}
             />
             {errors.userName && <div className="mod-field-error">{errors.userName}</div>}

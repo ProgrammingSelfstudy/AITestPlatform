@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
-use crate::api::ApiState;
+use crate::api::{ApiState, require_browser_user};
 use crate::internal;
 use crate::runs::{self, NewTask};
 
@@ -289,15 +289,8 @@ async fn sweep_stale(pool: &PgPool, pending: &PendingAsks) -> Result<(), sqlx::E
 
 // ---------------------------------------------------------------- HTTP
 
-async fn user_of(state: &ApiState, headers: &HeaderMap) -> Result<Uuid, ApiError> {
-    crate::users::browser_user(state.app.pool(), headers)
-        .await
-        .map_err(|e| internal("校验用户失败", e))?
-        .ok_or((StatusCode::UNAUTHORIZED, crate::users::NEED_NAME_MESSAGE.to_string()))
-}
-
 pub(crate) async fn api_chat(State(state): State<ApiState>, headers: HeaderMap) -> Result<impl IntoResponse, ApiError> {
-    let user = user_of(&state, &headers).await?;
+    let user = require_browser_user(&state, &headers).await?;
     let pool = state.app.pool();
     sweep_stale(pool, state.app.admin_asks()).await.map_err(|e| internal("整理超时提问失败", e))?;
     let messages = load_chat(pool, user).await.map_err(|e| internal("读取对话失败", e))?;
@@ -315,7 +308,7 @@ pub(crate) struct SendInput {
 
 pub(crate) async fn api_send(State(state): State<ApiState>, headers: HeaderMap, body: Result<Json<SendInput>, JsonRejection>) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
     let Json(input) = body.map_err(|_| bad("请求格式无效"))?;
-    let user = user_of(&state, &headers).await?;
+    let user = require_browser_user(&state, &headers).await?;
     let text = input.message.trim();
     if text.is_empty() || text.chars().count() > MAX_MESSAGE_CHARS {
         return Err(bad(format!("消息不能为空，也不超过 {MAX_MESSAGE_CHARS} 个字")));
@@ -361,7 +354,7 @@ pub(crate) async fn api_send(State(state): State<ApiState>, headers: HeaderMap, 
 
 /// 不花额度、不动任何东西的忽略。只能是提议的主人，且还是待确认的。
 pub(crate) async fn api_dismiss(State(state): State<ApiState>, Path(id): Path<String>, headers: HeaderMap) -> Result<StatusCode, ApiError> {
-    let user = user_of(&state, &headers).await?;
+    let user = require_browser_user(&state, &headers).await?;
     let id: Uuid = id.parse().map_err(|_| (StatusCode::NOT_FOUND, "没有这条提议".to_string()))?;
     let done = sqlx::query("update admin_proposals set status = 'dismissed', decided_at = now() where id = $1 and user_id = $2 and status = 'pending'")
         .bind(id)
@@ -377,7 +370,7 @@ pub(crate) async fn api_dismiss(State(state): State<ApiState>, Path(id): Path<St
 
 /// 确认提议：重新核对一遍，然后**用你的身份、在你的节点上**执行。
 pub(crate) async fn api_confirm(State(state): State<ApiState>, Path(id): Path<String>, headers: HeaderMap) -> Result<Json<serde_json::Value>, ApiError> {
-    let user = user_of(&state, &headers).await?;
+    let user = require_browser_user(&state, &headers).await?;
     let id: Uuid = id.parse().map_err(|_| (StatusCode::NOT_FOUND, "没有这条提议".to_string()))?;
     let pool = state.app.pool();
     // 先抢占：只有一次点击能把 pending 变成 confirmed，连点两次不会派两遍

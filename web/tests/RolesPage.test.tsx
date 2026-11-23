@@ -1,7 +1,8 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import type { NodeView, RoleView } from "../src/api";
+import { NEED_LOGIN_MESSAGE, readUserToken } from "../src/identity";
 import { rememberReviewToken } from "../src/reviewLogic";
 import RolesPage from "../src/RolesPage";
 
@@ -79,6 +80,50 @@ test("填的是别人的名字：能看，但不能改（节点是别人的，�
   expect((await screen.findAllByText("角色-a")).length).toBeGreaterThan(0);
   expect((await screen.findAllByText(/这是别人的节点/)).length).toBeGreaterThan(0);
   expect(screen.getByRole("button", { name: /检\s*测/ })).toBeDisabled();
+});
+
+test("服务端提示先登录时可输入密码，登录后刷新权限，清除时注销", async () => {
+  const password = crypto.randomUUID();
+  const token = "ab".repeat(32);
+  const roles = [role("a", "executor", "codex_exec", "ok", null)];
+  fetchMock.mockImplementation(async (path, init) => {
+    if (path === "/api/nodes") return Response.json(nodes);
+    if (path === "/api/login") {
+      const body = JSON.parse(String(init?.body));
+      return body.name === OWNER && body.password === password
+        ? Response.json({ name: OWNER, token })
+        : new Response("名字或密码不对", { status: 403 });
+    }
+    if (path === "/api/logout") return new Response(null, { status: 204 });
+    const owner = nameOf(init) === OWNER;
+    const loggedIn = owner && new Headers(init?.headers).get("x-user-token") === token;
+    const viewer = { online: true, mine: owner ? loggedIn : null, name_problem: owner && !loggedIn ? NEED_LOGIN_MESSAGE : null };
+    if (path === `/api/nodes/${NODE}/roles`) return Response.json({ ...viewer, roles });
+    return Response.json({ ...viewer, apps: [] });
+  });
+
+  const user = await openPage();
+  expect((await screen.findAllByText("角色-a")).length).toBeGreaterThan(0);
+  expect(screen.getByRole("button", { name: /检\s*测/ })).toBeDisabled();
+  await user.click(await screen.findByRole("button", { name: "登录" }));
+  const dialog = within(await screen.findByRole("dialog", { name: "登录" }));
+  expect(dialog.getByText(`名字 ${OWNER}`)).toBeInTheDocument();
+  const input = dialog.getByLabelText("密码");
+  const login = dialog.getByRole("button", { name: /^登\s*录$/ });
+  await user.type(input, crypto.randomUUID());
+  await user.click(login);
+  expect(await dialog.findByRole("alert")).toHaveTextContent("名字或密码不对");
+  expect(input).toHaveValue("");
+
+  await user.type(input, password);
+  await user.click(login);
+  await waitFor(() => expect(screen.getByRole("button", { name: /检\s*测/ })).toBeEnabled());
+  expect(readUserToken(OWNER) === token).toBe(true);
+  await user.click(screen.getByRole("button", { name: "清除" }));
+  expect(readUserToken(OWNER)).toBe("");
+  const logout = fetchMock.mock.calls.find(([path]) => path === "/api/logout");
+  expect(logout?.[1]?.method).toBe("POST");
+  expect(new Headers(logout?.[1]?.headers).get("x-user-token") === token).toBe(true);
 });
 
 test("每个检测状态都有文字，失败原因原样显示，Key 永远不出现", { timeout: 20000 }, async () => {

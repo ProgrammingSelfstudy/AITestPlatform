@@ -19,7 +19,7 @@ import {
 import { readReviewToken, rememberReviewToken, writeTokenAction } from "./reviewLogic";
 import AppsPanel from "./AppsPanel";
 import IdentityHint from "./IdentityHint";
-import { useRememberedUserName } from "./identity";
+import { NEED_LOGIN_MESSAGE, useRememberedUserName } from "./identity";
 import ReviewTokenDialog from "./ReviewTokenDialog";
 import { formatDate, LoadError } from "./runUi";
 import { REFRESH_MS, usePolling } from "./usePolling";
@@ -75,7 +75,7 @@ interface SourceOption {
 
 type RolesPollState =
   | { status: "idle" }
-  | { status: "loaded"; nodeId: string; payload: NodeRoles };
+  | { status: "loaded"; nodeId: string; userName: string; payload: NodeRoles };
 
 const IDLE_POLL: RolesPollState = { status: "idle" };
 
@@ -321,7 +321,7 @@ export default function RolesPage() {
       ) {
         return rolesCacheRef.current.value;
       }
-      const value: RolesPollState = { status: "loaded", nodeId: selectedNodeId, payload };
+      const value: RolesPollState = { status: "loaded", nodeId: selectedNodeId, userName: trimmedName, payload };
       rolesCacheRef.current = { key, sig, value };
       return value;
     },
@@ -349,8 +349,9 @@ export default function RolesPage() {
     [loadedForNode, rolesPoll],
   );
   const isInitialLoading = canQueryRoles && !loadedForNode && !rolesError && !isNodeOffline;
-  // 只有节点主人能改、能检测（花他自己的额度）；其他人只读。名字不是机密，靠自觉
-  const mine = loadedForNode ? rolesPoll.payload.mine : null;
+  // 名字变动时等这个名字的结果再判断是否是节点主人。
+  const viewer = loadedForNode && rolesPoll.userName === trimmedName ? rolesPoll.payload : null;
+  const mine = viewer?.mine ?? null;
   const canAct = Boolean(trimmedName) && mine === true && !isNodeOffline;
   const readOnlyReason: string | undefined = !selectedNodeId
     ? "先在上面选一个在线节点"
@@ -358,8 +359,8 @@ export default function RolesPage() {
       ? undefined
       : !trimmedName
         ? "你现在是只读：在上面填「我是谁」（你的名字）后，才能检查本机环境、创建和修改角色（只能改自己的节点）"
-        : loadedForNode && mine === false
-          ? (rolesPoll.payload.name_problem ?? "这是别人的节点：你能看，但只能修改和使用自己的节点（用的是各人自己的额度）")
+        : viewer?.mine === false
+          ? (viewer.name_problem ?? "这是别人的节点：你能看，但只能修改和使用自己的节点（用的是各人自己的额度）")
           : undefined;
   const readOnly = !canAct;
 
@@ -1020,7 +1021,9 @@ export default function RolesPage() {
           <div className="roles-control-field">
             <label className="roles-control-label" htmlFor="roles-user-name">
               <span>我是谁</span>
-              <IdentityHint className="roles-control-hint" expiresAt={nameExpiresAt} onForget={forgetName} onCreated={setUserName} />
+              <IdentityHint className="roles-control-hint" userName={userName} expiresAt={nameExpiresAt}
+                nameProblem={actionError === NEED_LOGIN_MESSAGE ? actionError : viewer?.name_problem}
+                onForget={forgetName} onCreated={setUserName} onLogin={() => { setActionError(null); reloadRoles(); }} />
             </label>
             <Input
               id="roles-user-name"
@@ -1030,7 +1033,10 @@ export default function RolesPage() {
               maxLength={40}
               disabled={busy}
               value={userName}
-              onChange={(event) => setUserName(event.target.value)}
+              onChange={(event) => {
+                setUserName(event.target.value);
+                if (actionError === NEED_LOGIN_MESSAGE) setActionError(null);
+              }}
               placeholder="你的名字（不填也能看，只是不能改）"
             />
           </div>

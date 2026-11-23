@@ -1,4 +1,5 @@
-import { useRememberedUserName } from "./identity";
+import IdentityHint from "./IdentityHint";
+import { NEED_LOGIN_MESSAGE, useRememberedUserName } from "./identity";
 import { Button, Empty, Input, Modal, Segmented, Select, Skeleton, Space, Table, Typography } from "antd";
 import type { ColumnsType } from "antd/es/table";
 import { useCallback, useMemo, useState } from "react";
@@ -175,7 +176,7 @@ export default function ScriptsPage() {
   const [actionError, setActionError] = useState<string | null>(null);
   const [regress, setRegress] = useState<RegressPending | null>(null);
   const [regressNode, setRegressNode] = useState<string | undefined>();
-  const { name: userName, setName: setUserName } = useRememberedUserName();
+  const { name: userName, setName: setUserName, expiresAt: nameExpiresAt, forget: forgetName } = useRememberedUserName();
   const [regressToken, setRegressToken] = useState(false);
   const [statusFilter, setStatusFilter] = useState<StatusFilter>("all");
   const [viewFilter, setViewFilter] = useState<ViewFilter>("all");
@@ -694,7 +695,12 @@ export default function ScriptsPage() {
               })) ?? []} />
           )}
           <Input aria-label="我是谁" autoComplete="off" maxLength={40} placeholder="我是谁（你的名字，用来确认节点是你的）"
-            value={userName} onChange={(event) => setUserName(event.target.value)} />
+            value={userName} onChange={(event) => {
+              setUserName(event.target.value);
+              if (actionError === NEED_LOGIN_MESSAGE) setActionError(null);
+            }} />
+          <IdentityHint userName={userName} expiresAt={nameExpiresAt} nameProblem={actionError} onForget={forgetName}
+            onLogin={() => setActionError(null)} />
           {actionError && <div><Typography.Text type="danger">{actionError}</Typography.Text></div>}
         </Modal>
       )}

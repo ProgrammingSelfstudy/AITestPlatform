@@ -453,7 +453,7 @@ interface DecisionModalState {
 }
 
 export default function ModuleDetailPage({ id }: { id: string }) {
-  // 「我是谁」只记名字，在本浏览器记 30 天
+  // 「我是谁」在本浏览器记 30 天。
   const { name: userName, setName: setUserName, expiresAt: nameExpiresAt, forget: forgetName } = useRememberedUserName();
   const trimmedName = userName.trim();
 
@@ -808,7 +808,8 @@ export default function ModuleDetailPage({ id }: { id: string }) {
         />
       </div>
       <div className="mod-token-note">
-        <IdentityHint expiresAt={nameExpiresAt} onForget={forgetName} onCreated={setUserName} />{" "}
+        <IdentityHint userName={userName} expiresAt={nameExpiresAt} nameProblem={actionError} onForget={forgetName}
+          onCreated={setUserName} onLogin={() => setActionError(null)} />{" "}
         数据大家都能看；批准或拒绝用例只有发起这个模块生成请求的人能做。
       </div>
     </div>

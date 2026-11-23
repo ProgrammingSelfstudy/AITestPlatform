@@ -1,6 +1,7 @@
 // 与平台 API 的公开字段对应。
 
 import { rememberReviewToken, writeTokenFailure } from "./reviewLogic";
+import { cleanName, forgetUserToken, readUserToken, rememberUserToken } from "./identity";
 
 export type DeviceStatus = "idle" | "busy" | "offline";
 
@@ -442,8 +443,15 @@ export function evidenceUrl(run: RunDetail, name: string): string | undefined {
 // ---------------------------------------------------------------- 角色与模型配置（每个节点各自一份，只能操作自己的节点）
 
 const rolesPath = (nodeId: string) => `/api/nodes/${encodeURIComponent(nodeId)}/roles`;
-/** 「我是谁」放在请求头里。名字不是机密；中文不能直接放进 HTTP 头，所以百分号编码（服务端会还原）。没填就不带。 */
-const userHeaders = (userName: string): Record<string, string> => (userName.trim() ? { "x-user-name": encodeURIComponent(userName.trim()) } : {});
+/** 「我是谁」用百分号编码传名字。已登录时一并带上该名字的会话令牌。 */
+function userHeaders(userName: string): Record<string, string> {
+  const name = cleanName(userName);
+  if (!name) return {};
+  const headers: Record<string, string> = { "x-user-name": encodeURIComponent(name) };
+  const token = readUserToken(name);
+  if (token) headers["x-user-token"] = token;
+  return headers;
+}
 
 export async function fetchNodeRoles(nodeId: string, userName: string, signal?: AbortSignal): Promise<NodeRoles> {
   const response = await request(rolesPath(nodeId), { signal, headers: userHeaders(userName) });
@@ -557,12 +565,29 @@ export async function scanNodeApp(nodeId: string, source: string, userName: stri
 
 // ---------------------------------------------------------------- 谁在用
 
-/** 登记过的名字（节点启动带 NODE_USER_NAME 时登记），给「我是谁」做提示。名字不是机密。 */
 /** 创建名字：名字没被占就登记成功；密码服务端只存哈希。不需要复核口令。 */
 export async function createUser(name: string, password: string, claimNode?: string): Promise<string> {
   const response = await post("/api/users", { name, password, ...(claimNode ? { claim_node: claimNode } : {}) }, "");
-  return ((await response.json()) as { name: string }).name;
+  const result = await response.json().catch(() => null) as { name?: unknown } | null;
+  if (typeof result?.name !== "string" || !result.name) throw new Error("创建名字的响应格式无效");
+  return result.name;
 }
+
+export async function loginUser(name: string, password: string): Promise<string> {
+  const response = await post("/api/login", { name, password }, "");
+  const result = await response.json().catch(() => null) as { name?: unknown; token?: unknown } | null;
+  if (result?.name !== cleanName(name) || typeof result.token !== "string" || !result.token) throw new Error("登录响应格式无效");
+  rememberUserToken(result.name, result.token);
+  return result.name;
+}
+
+export async function logoutUser(name: string): Promise<void> {
+  const headers = userHeaders(name);
+  forgetUserToken(name);
+  if (headers["x-user-token"]) await post("/api/logout", {}, "", headers);
+}
+
+/** 登记过的名字，给「我是谁」做提示。 */
 export const fetchUsers = (signal?: AbortSignal) => get<string[]>("/api/users", signal);
 
 // ---------------------------------------------------------------- 管理员：只提议，你点确认才执行

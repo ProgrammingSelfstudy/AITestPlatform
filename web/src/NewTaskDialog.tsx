@@ -5,7 +5,7 @@ import { readReviewToken, rememberReviewToken, writeTokenAction } from "./review
 import ReviewTokenDialog from "./ReviewTokenDialog";
 import { LoadError } from "./runUi";
 import IdentityHint from "./IdentityHint";
-import { forgetUserName, readUserName, rememberUserName, userNameExpiry } from "./identity";
+import { forgetUserName, NEED_LOGIN_MESSAGE, readUserName, rememberUserName, userNameExpiry } from "./identity";
 import { REFRESH_MS, usePolling } from "./usePolling";
 
 const project = "hafa";
@@ -48,6 +48,7 @@ export default function NewTaskDialog({ onClose, initialCases }: { onClose: () =
   const busy = submitting || pendingFields !== null;
   const model = Form.useWatch("executor", form);
   const node = Form.useWatch("node", form);
+  const userName = Form.useWatch("userName", form) ?? "";
   const hasOnlineNodes = nodes?.some((candidate) => candidate.online);
   const nodeUnavailable = Boolean(node && nodes && !nodes.some((candidate) => candidate.node_id === node && candidate.online));
   const executorRoleId = Form.useWatch("executorRole", form);
@@ -194,10 +195,15 @@ export default function NewTaskDialog({ onClose, initialCases }: { onClose: () =
               <Select options={judgeRole?.models.map((m) => ({ value: m.model, label: m.model })) ?? []} />
             </Form.Item>
             <Form.Item
-              name="userName" label="我是谁" extra={<span>填你的名字，用来确认所选节点是你的（只能用自己的节点，花自己的额度）。<IdentityHint expiresAt={userNameExpiry()} onForget={() => { forgetUserName(); form.setFieldValue("userName", ""); }} onCreated={(n) => form.setFieldValue("userName", n)} /></span>}
+              name="userName" label="我是谁" extra={<span>填你的名字，用来确认所选节点是你的（只能用自己的节点，花自己的额度）。<IdentityHint
+                userName={userName} expiresAt={userNameExpiry()} nameProblem={submitError}
+                onForget={() => { forgetUserName(); form.setFieldValue("userName", ""); setSubmitError(null); }}
+                onCreated={(n) => form.setFieldValue("userName", n)} onLogin={() => setSubmitError(null)} /></span>}
               rules={[{ required: true, whitespace: true, message: "请填「我是谁」（你的名字）" }]}
             >
-              <Input autoComplete="off" maxLength={40} />
+              <Input autoComplete="off" maxLength={40} onChange={() => {
+                if (submitError === NEED_LOGIN_MESSAGE) setSubmitError(null);
+              }} />
             </Form.Item>
           </>
         )}

@@ -18,6 +18,7 @@ use sqlx::Row;
 use uuid::Uuid;
 
 use crate::runs::{self, NewTask, RunError, RunStatus, RunView, TaskCreated};
+use crate::users::{self, BrowserUser, PasswordCheck};
 use crate::{AppState, evidence_sign, files, internal, reviews};
 
 type ApiError = (StatusCode, String);
@@ -67,6 +68,8 @@ pub(crate) fn routes(app: AppState, paths: Paths) -> Router {
         .route("/api/casegen-requests/{id}/result", put(crate::modules::api_finish).layer(axum::extract::DefaultBodyLimit::max(2 * 1024 * 1024)))
         .route("/api/nodes/{id}/roles", post(set_node_roles).route_layer(authorize_write.clone()).get(node_roles))
         .route("/api/users", get(list_users).post(create_user))
+        .route("/api/login", post(login))
+        .route("/api/logout", post(logout))
         .route("/api/admin/chat", get(crate::admin::api_chat))
         .route("/api/admin/messages", post(crate::admin::api_send).route_layer(authorize_write.clone()))
         .route("/api/admin/proposals/{id}/confirm", post(crate::admin::api_confirm).route_layer(authorize_write.clone()))
@@ -274,13 +277,19 @@ async fn models(State(state): State<ApiState>) -> Result<impl IntoResponse, ApiE
 
 // ---------------------------------------------------------------- 节点的角色与模型配置（每个节点各自一份）
 
-/// 「改动或花额度」的操作（保存角色、检测、检查本机应用）：名字对得上某个登记过的人，且节点属于他。
+pub(crate) async fn require_browser_user(state: &ApiState, headers: &HeaderMap) -> Result<Uuid, ApiError> {
+    users::browser_user(state.app.pool(), headers)
+        .await
+        .map_err(|e| internal("校验用户失败", e))?
+        .require()
+        .map_err(|message| (StatusCode::UNAUTHORIZED, message.into()))
+}
+
+/// 保存角色、检测和检查本机应用都需要确认发起人和节点属主。
 /// 别人的节点、没有属主的节点一律 403，不存在 404。**只读的查看不走这里**——数据是公开的，谁都能看，只是不能用别人的额度。
 async fn require_owned(state: &ApiState, headers: &axum::http::HeaderMap, id: &str) -> Result<Uuid, ApiError> {
     let node: Uuid = id.parse().map_err(|_| (StatusCode::NOT_FOUND, "没有这个节点".to_string()))?;
-    let Some(user) = crate::users::browser_user(state.app.pool(), headers).await.map_err(|e| internal("校验用户失败", e))? else {
-        return Err((StatusCode::UNAUTHORIZED, format!("{}（修改角色配置或检测要先说明你是谁；只是查看不需要）", crate::users::NEED_NAME_MESSAGE)));
-    };
+    let user = require_browser_user(state, headers).await?;
     match crate::users::check_node_owner(state.app.pool(), node, user).await.map_err(|e| internal("校验节点属主失败", e))? {
         crate::users::NodeOwner::Owned => Ok(node),
         crate::users::NodeOwner::Missing => Err((StatusCode::NOT_FOUND, "没有这个节点".to_string())),
@@ -289,23 +298,21 @@ async fn require_owned(state: &ApiState, headers: &axum::http::HeaderMap, id: &s
 }
 
 /// 只读查看用：节点要存在；顺便告诉前端「这个节点是不是你的」，好决定哪些按钮可用。
-/// 没带令牌 `mine = null`；带了但不是主人、令牌不对或绑定了别的浏览器 `mine = false` 并说明原因。
+/// 没填名字时 `mine = null`。名字未登记或需要登录时 `mine = false`，并返回提示。
 async fn viewer(state: &ApiState, headers: &axum::http::HeaderMap, id: &str) -> Result<(Uuid, Viewer), ApiError> {
     let node: Uuid = id.parse().map_err(|_| (StatusCode::NOT_FOUND, "没有这个节点".to_string()))?;
     let exists = state.app.node_exists(node).await.map_err(|e| internal("查询节点失败", e))?;
     if !exists {
         return Err((StatusCode::NOT_FOUND, "没有这个节点".to_string()));
     }
-    // 没填名字：只读。填了名字：看这个节点是不是他的；名字没登记过（没有任何节点用它启动）也说明白
-    let Some(name) = crate::users::name_from_headers(headers) else {
-        return Ok((node, Viewer { mine: None, name_problem: None }));
-    };
-    let viewer = match crate::users::user_by_name(state.app.pool(), &name).await.map_err(|e| internal("校验用户失败", e))? {
-        Some(user) => {
+    let viewer = match users::browser_user(state.app.pool(), headers).await.map_err(|e| internal("校验用户失败", e))? {
+        BrowserUser::Identified(user) => {
             let owned = matches!(crate::users::check_node_owner(state.app.pool(), node, user).await.map_err(|e| internal("校验节点属主失败", e))?, crate::users::NodeOwner::Owned);
             Viewer { mine: Some(owned), name_problem: None }
         }
-        None => Viewer { mine: Some(false), name_problem: Some(format!("「{name}」还没有登记：没有任何节点是用这个名字（NODE_USER_NAME）启动的")) },
+        BrowserUser::Unspecified => Viewer { mine: None, name_problem: None },
+        BrowserUser::Unregistered(name) => Viewer { mine: Some(false), name_problem: Some(format!("「{name}」还没有登记：没有任何节点是用这个名字（NODE_USER_NAME）启动的")) },
+        BrowserUser::LoginRequired => Viewer { mine: Some(false), name_problem: Some(users::NEED_LOGIN_MESSAGE.into()) },
     };
     Ok((node, viewer))
 }
@@ -372,7 +379,7 @@ async fn init_node_roles(State(state): State<ApiState>, Path(id): Path<String>, 
     push_roles(&state, node, roles).await
 }
 
-/// 解除节点绑定：只有这个节点的主人（名字对得上）能解除。解除后节点没有主人，任何人可以认领。
+/// 解除节点绑定：只有这个节点的主人能解除。解除后节点没有主人，任何人可以认领。
 /// 注意：节点若仍用原来的 `NODE_USER_NAME` 启动，重新连上来会再绑回去。
 async fn release_node(State(state): State<ApiState>, Path(id): Path<String>, headers: axum::http::HeaderMap) -> Result<StatusCode, ApiError> {
     let node = require_owned(&state, &headers, &id).await?;
@@ -385,21 +392,36 @@ async fn clear_owner(state: &ApiState, node: Uuid) -> Result<StatusCode, ApiErro
 }
 
 #[derive(Deserialize)]
-struct AdminLogin {
+struct Credentials {
     name: String,
     password: String,
 }
 
+fn credential_error(message: &str) -> ApiError {
+    tracing::error!("{message}");
+    (StatusCode::INTERNAL_SERVER_ERROR, message.into())
+}
+
+fn password_locked() -> ApiError {
+    (StatusCode::TOO_MANY_REQUESTS, "密码尝试次数过多，请等待 5 分钟后再试".into())
+}
+
 /// 管理员强制解除：用管理员账号（名字 + 密码）验证，不要求是节点主人，节点离线也行。
-async fn force_release_node(State(state): State<ApiState>, Path(id): Path<String>, Json(body): Json<AdminLogin>) -> Result<StatusCode, ApiError> {
-    if !crate::users::verify_admin(state.app.pool(), body.name.trim(), &body.password).await.map_err(|e| internal("校验管理员失败", e))? {
-        return Err((StatusCode::FORBIDDEN, "管理员账号或密码不对".to_string()));
+async fn force_release_node(State(state): State<ApiState>, Path(id): Path<String>, body: Result<Json<Credentials>, JsonRejection>) -> Result<StatusCode, ApiError> {
+    let Json(body) = body.map_err(|e| (e.status(), "管理员账号或密码格式无效".into()))?;
+    let name = body.name.trim();
+    let checked = state.app.0.password_auth.check(state.app.pool(), name, body.password, true)
+        .await.map_err(|_| credential_error("校验管理员失败"))?;
+    match checked {
+        PasswordCheck::Matched(_) => {}
+        PasswordCheck::Rejected => return Err((StatusCode::FORBIDDEN, "管理员账号或密码不对".into())),
+        PasswordCheck::Locked => return Err(password_locked()),
     }
     let node: Uuid = id.parse().map_err(|_| (StatusCode::NOT_FOUND, "没有这个节点".to_string()))?;
     if !state.app.node_exists(node).await.map_err(|e| internal("查询节点失败", e))? {
         return Err((StatusCode::NOT_FOUND, "没有这个节点".to_string()));
     }
-    tracing::warn!("管理员 {} 强制解除节点 {node} 的绑定", body.name.trim());
+    tracing::warn!("管理员 {name} 强制解除节点 {node} 的绑定");
     clear_owner(&state, node).await
 }
 
@@ -414,7 +436,7 @@ async fn check_node_role(State(state): State<ApiState>, Path((id, role)): Path<(
     Ok(StatusCode::ACCEPTED)
 }
 
-// ---------------------------------------------------------------- 创建个人令牌
+// ---------------------------------------------------------------- 登记名字和浏览器会话
 
 /// 所有登记过的名字（节点启动带 `NODE_USER_NAME` 时登记），给页面「我是谁」做提示。名字不是机密。
 async fn list_users(State(state): State<ApiState>) -> Result<impl IntoResponse, ApiError> {
@@ -432,7 +454,8 @@ struct NewUser {
 }
 
 /// 页面上创建名字：输入名字和密码，名字没被占就登记成功。密码只存哈希，不回显、不进日志。
-async fn create_user(State(state): State<ApiState>, Json(body): Json<NewUser>) -> Result<impl IntoResponse, ApiError> {
+async fn create_user(State(state): State<ApiState>, body: Result<Json<NewUser>, JsonRejection>) -> Result<impl IntoResponse, ApiError> {
+    let Json(body) = body.map_err(|e| (e.status(), "创建名字的请求格式无效".into()))?;
     let Some(name) = crate::users::clean_name(&body.name) else {
         return Err((StatusCode::BAD_REQUEST, "名字要 1 到 40 个字，不能有换行等控制字符".to_string()));
     };
@@ -440,14 +463,31 @@ async fn create_user(State(state): State<ApiState>, Json(body): Json<NewUser>) -
     if !(crate::users::MIN_PASSWORD_CHARS..=crate::users::MAX_PASSWORD_CHARS).contains(&chars) {
         return Err((StatusCode::BAD_REQUEST, format!("密码要 {} 到 {} 个字符", crate::users::MIN_PASSWORD_CHARS, crate::users::MAX_PASSWORD_CHARS)));
     }
-    match crate::users::register_with_password(state.app.pool(), &name, &body.password, body.claim_node).await.map_err(|e| {
-        tracing::error!("创建名字失败：{e}");
-        (StatusCode::INTERNAL_SERVER_ERROR, "创建名字失败".to_string())
-    })? {
+    match users::register_with_password(state.app.pool(), &name, &body.password, body.claim_node).await.map_err(|_| credential_error("创建名字失败"))? {
         crate::users::Register::Created => Ok((StatusCode::CREATED, Json(serde_json::json!({ "name": name })))),
         crate::users::Register::Taken => Err((StatusCode::CONFLICT, format!("「{name}」已经有人用了，换一个名字"))),
         crate::users::Register::NodeUnavailable => Err((StatusCode::CONFLICT, "这个节点不存在，或已经有主人了；名字没有创建，请换一个节点或不选节点".to_string())),
     }
+}
+
+async fn login(State(state): State<ApiState>, body: Result<Json<Credentials>, JsonRejection>) -> Result<impl IntoResponse, ApiError> {
+    let rejected = || (StatusCode::FORBIDDEN, "名字或密码不对".into());
+    let Json(body) = body.map_err(|_| rejected())?;
+    let name = users::clean_name(&body.name).ok_or_else(rejected)?;
+    let checked = state.app.0.password_auth.check(state.app.pool(), &name, body.password, false)
+        .await.map_err(|_| credential_error("校验密码失败"))?;
+    let user = match checked {
+        PasswordCheck::Matched(user) => user,
+        PasswordCheck::Rejected => return Err(rejected()),
+        PasswordCheck::Locked => return Err(password_locked()),
+    };
+    let token = users::start_session(state.app.pool(), user).await.map_err(|_| credential_error("创建会话失败"))?;
+    Ok(([(header::CACHE_CONTROL, "no-store")], Json(serde_json::json!({ "name": name, "token": token }))))
+}
+
+async fn logout(State(state): State<ApiState>, headers: HeaderMap) -> Result<StatusCode, ApiError> {
+    users::end_session(state.app.pool(), &headers).await.map_err(|_| credential_error("注销会话失败"))?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 // ---------------------------------------------------------------- 本机应用环境检查（选应用 → 检查本机 → 取模型）
@@ -535,11 +575,9 @@ fn run_error(error: RunError, action: &str) -> ApiError {
     (status, error.to_string())
 }
 
-/// 校验个人令牌有效、所选节点属于该用户（规则 9：只能用自己的节点）。节点不存在放行，交给后面的校验。
+/// 校验发起人和节点属主（规则 9：只能用自己的节点）。节点不存在时交给后面的校验。
 pub(crate) async fn owner_check(state: &ApiState, headers: &axum::http::HeaderMap, node: Uuid) -> Result<Uuid, ApiError> {
-    let Some(user) = crate::users::browser_user(state.app.pool(), headers).await.map_err(|e| internal("校验发起人失败", e))? else {
-        return Err((StatusCode::UNAUTHORIZED, crate::users::NEED_NAME_MESSAGE.to_string()));
-    };
+    let user = require_browser_user(state, headers).await?;
     match crate::users::check_node_owner(state.app.pool(), node, user).await.map_err(|e| internal("校验节点属主失败", e))? {
         crate::users::NodeOwner::NotYours => Err((StatusCode::FORBIDDEN, "只能使用自己的节点发起任务（数据大家都能看、都能跑，但用的是各人自己的额度）".to_string())),
         crate::users::NodeOwner::Owned | crate::users::NodeOwner::Missing => Ok(user),
@@ -551,7 +589,7 @@ async fn create_task(
     headers: axum::http::HeaderMap,
     body: Result<Json<CreateRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<TaskCreated>), ApiError> {
-    // 发起人身份：只记名字（靠自觉）。任务只能发到发起人自己的节点（规则 9）
+    // 任务只能发到发起人自己的节点（规则 9）。
     let Json(request) =
         body.map_err(|_| bad_request("任务参数格式无效，请检查项目、节点、用例、模型和推理强度"))?;
     if crate::users::name_from_headers(&headers).is_none() {
@@ -1074,6 +1112,7 @@ mod evidence_tests {
                 pool,
                 accounts: None,
                 review_auth: reviews::ReviewAuth::new(None),
+                password_auth: Default::default(),
                 conns: Default::default(),
                 roles: Default::default(),
                 apps: Default::default(),

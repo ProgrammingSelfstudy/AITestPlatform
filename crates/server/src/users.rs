@@ -1,9 +1,16 @@
-//! 发起人身份：个人令牌。库里只存 SHA-256 摘要，明文令牌只在创建时显示一次。
+//! 有密码的名字使用浏览器会话。节点登记的无密码名字沿用名字识别。
 
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use argon2::{
+    Argon2, PasswordHash,
+    password_hash::{PasswordHasher, PasswordVerifier},
+};
+use axum::http::HeaderMap;
 use sqlx::PgPool;
 use uuid::Uuid;
-
-use axum::http::HeaderMap;
 
 use crate::{new_node_secret, secret_hash};
 
@@ -50,7 +57,7 @@ pub async fn check_node_owner(pool: &PgPool, node: Uuid, user: Uuid) -> Result<N
     })
 }
 
-// ---------------------------------------------------------------- 身份：只记名字（靠自觉）
+// ---------------------------------------------------------------- 浏览器身份
 
 /// 名字：去首尾空白，1 到 40 个字，不能有控制字符。名字不是机密，只用来标明「谁在跑」和「这是谁的节点」。
 pub fn clean_name(raw: &str) -> Option<String> {
@@ -83,7 +90,7 @@ pub fn name_from_headers(headers: &HeaderMap) -> Option<String> {
     clean_name(&percent_decode(raw)?)
 }
 
-/// 登记一个名字（已有就返回原来的）。节点启动带 `NODE_USER_NAME` 连上来时调用；用户不能靠别的路径凭空出现。
+/// 节点带 `NODE_USER_NAME` 连上来时登记名字，已有记录时沿用原来的身份和密码设置。
 pub(crate) async fn ensure_user<'e>(db: impl sqlx::PgExecutor<'e>, name: &str) -> Result<Uuid, sqlx::Error> {
     sqlx::query_scalar("insert into users (name) values ($1) on conflict (name) do update set name = excluded.name returning id")
         .bind(name)
@@ -91,13 +98,65 @@ pub(crate) async fn ensure_user<'e>(db: impl sqlx::PgExecutor<'e>, name: &str) -
         .await
 }
 
-/// 浏览器请求的发起人：名字对得上某个已登记用户就是他，否则 `None`（没填、没登记）。
-/// **不是认证**：名字人人可填，这里只是「谁在跑」的标识，靠大家自觉；用别人的额度没有技术上的拦截。
-pub async fn browser_user(pool: &PgPool, headers: &HeaderMap) -> Result<Option<Uuid>, sqlx::Error> {
-    match name_from_headers(headers) {
-        Some(name) => user_by_name(pool, &name).await,
-        None => Ok(None),
+pub enum BrowserUser {
+    Unspecified,
+    Unregistered(String),
+    LoginRequired,
+    Identified(Uuid),
+}
+
+impl BrowserUser {
+    pub(crate) fn require(self) -> Result<Uuid, &'static str> {
+        match self {
+            Self::Identified(user) => Ok(user),
+            Self::LoginRequired => Err(NEED_LOGIN_MESSAGE),
+            Self::Unspecified | Self::Unregistered(_) => Err(NEED_NAME_MESSAGE),
+        }
     }
+}
+
+fn token_hash_from_headers(headers: &HeaderMap) -> Option<String> {
+    let mut values = headers.get_all("x-user-token").iter();
+    let token = values.next()?.to_str().ok()?;
+    (!token.is_empty() && values.next().is_none()).then(|| secret_hash(token))
+}
+
+/// 解析浏览器请求的发起人。有密码的名字需要属于这个用户的有效会话，无密码的名字按登记记录识别。
+pub async fn browser_user(pool: &PgPool, headers: &HeaderMap) -> Result<BrowserUser, sqlx::Error> {
+    let Some(name) = name_from_headers(headers) else { return Ok(BrowserUser::Unspecified) };
+    let row: Option<(Uuid, bool)> = sqlx::query_as(
+        "select id, password_hash is null or exists (
+             select 1 from user_sessions where token_hash = $2 and user_id = users.id and expires_at > now()
+         ) from users where name = $1",
+    )
+    .bind(&name)
+    .bind(token_hash_from_headers(headers))
+    .fetch_optional(pool)
+    .await?;
+    Ok(match row {
+        Some((user, true)) => BrowserUser::Identified(user),
+        Some((_, false)) => BrowserUser::LoginRequired,
+        None => BrowserUser::Unregistered(name),
+    })
+}
+
+pub(crate) async fn start_session(pool: &PgPool, user: Uuid) -> anyhow::Result<String> {
+    let mut random = [0; 32];
+    getrandom::fill(&mut random).map_err(|_| anyhow::anyhow!("生成会话令牌失败"))?;
+    let token = hex::encode(random);
+    sqlx::query("insert into user_sessions (token_hash, user_id, expires_at) values ($1, $2, now() + interval '720 hours')")
+        .bind(secret_hash(&token))
+        .bind(user)
+        .execute(pool)
+        .await?;
+    Ok(token)
+}
+
+pub(crate) async fn end_session(pool: &PgPool, headers: &HeaderMap) -> Result<(), sqlx::Error> {
+    if let Some(hash) = token_hash_from_headers(headers) {
+        sqlx::query("delete from user_sessions where token_hash = $1").bind(hash).execute(pool).await?;
+    }
+    Ok(())
 }
 
 /// 测试用：登记一个名字（集成测试在 server 之外，访问不到 `pub(crate)` 的 [`ensure_user`]）。
@@ -121,7 +180,6 @@ pub const MAX_PASSWORD_CHARS: usize = 128;
 /// 页面上创建名字：名字合格、密码长度合格，名字没被占才登记，密码只存 argon2 哈希。
 /// `claim_node`：顺便认领一个还没有主人的节点（同一个事务：认领不成，名字也不创建）。
 pub async fn register_with_password(pool: &PgPool, name: &str, password: &str, claim_node: Option<Uuid>) -> anyhow::Result<Register> {
-    use argon2::{password_hash::PasswordHasher, Argon2};
     let password = password.to_string();
     // argon2 吃 CPU，放到阻塞线程里算，别卡住异步运行时
     let hash = tokio::task::spawn_blocking(move || Argon2::default().hash_password(password.as_bytes()).map(|h| h.to_string()))
@@ -149,18 +207,86 @@ pub async fn register_with_password(pool: &PgPool, name: &str, password: &str, c
     Ok(Register::Created)
 }
 
-/// 校验管理员账号：名字存在、是管理员、密码对得上才返回 true。任何一步不对都是同样的 false（不透露是哪一步）。
-pub async fn verify_admin(pool: &PgPool, name: &str, password: &str) -> Result<bool, sqlx::Error> {
-    use argon2::{password_hash::PasswordVerifier, Argon2, PasswordHash};
-    let hash: Option<String> = sqlx::query_scalar("select password_hash from users where name = $1 and is_admin and password_hash is not null")
+const FAILURE_LIMIT: u8 = 5;
+const LOCK_TIME: Duration = Duration::from_secs(5 * 60);
+
+pub(crate) enum PasswordCheck {
+    Matched(Uuid),
+    Rejected,
+    Locked,
+}
+
+#[derive(Default)]
+struct PasswordFailures {
+    count: u8,
+    locked_until: Option<Instant>,
+}
+
+impl PasswordFailures {
+    fn locked(&mut self, now: Instant) -> bool {
+        if let Some(until) = self.locked_until {
+            if now < until {
+                return true;
+            }
+            *self = Self::default();
+        }
+        false
+    }
+
+    fn record_failure(&mut self, now: Instant) {
+        self.count += 1;
+        if self.count == FAILURE_LIMIT {
+            self.locked_until = Some(now + LOCK_TIME);
+        }
+    }
+}
+
+/// 登录和管理员密码校验共用计数。同一个名字串行验证，其他名字各自处理。
+#[derive(Default)]
+pub(crate) struct PasswordAuth {
+    failures: Mutex<HashMap<String, Arc<tokio::sync::Mutex<PasswordFailures>>>>,
+}
+
+impl PasswordAuth {
+    pub(crate) async fn check(&self, pool: &PgPool, name: &str, password: String, require_admin: bool) -> anyhow::Result<PasswordCheck> {
+        // 管理员名字可能由运维直接入库，计数键用定长摘要。
+        let key = secret_hash(name);
+        let attempts = Arc::clone(self.failures.lock().unwrap().entry(key.clone()).or_default());
+        let mut failures = attempts.lock().await;
+        if failures.locked(Instant::now()) {
+            return Ok(PasswordCheck::Locked);
+        }
+        let candidate: Option<(Uuid, String)> = sqlx::query_as(
+            "select id, password_hash from users where name = $1 and password_hash is not null and (not $2 or is_admin)",
+        )
         .bind(name)
+        .bind(require_admin)
         .fetch_optional(pool)
         .await?;
-    let Some(hash) = hash else { return Ok(false) };
-    let password = password.to_string();
-    Ok(tokio::task::spawn_blocking(move || PasswordHash::new(&hash).is_ok_and(|parsed| Argon2::default().verify_password(password.as_bytes(), &parsed).is_ok()))
-        .await
-        .unwrap_or(false))
+        let user = tokio::task::spawn_blocking(move || match candidate {
+            Some((user, hash)) => PasswordHash::new(&hash)
+                .is_ok_and(|parsed| Argon2::default().verify_password(password.as_bytes(), &parsed).is_ok())
+                .then_some(user),
+            None => {
+                // 无可用密码时也做一次哈希，避免从校验耗时直接区分名字和密码错误。
+                let _ = Argon2::default().hash_password(password.as_bytes());
+                None
+            }
+        })
+        .await?;
+        if let Some(user) = user {
+            *failures = PasswordFailures::default();
+            let mut by_name = self.failures.lock().unwrap();
+            // 有排队请求时继续共用同一把锁。
+            if Arc::strong_count(&attempts) == 2 {
+                by_name.remove(&key);
+            }
+            Ok(PasswordCheck::Matched(user))
+        } else {
+            failures.record_failure(Instant::now());
+            Ok(PasswordCheck::Rejected)
+        }
+    }
 }
 
 pub async fn list_names(pool: &PgPool) -> Result<Vec<String>, sqlx::Error> {
@@ -168,6 +294,21 @@ pub async fn list_names(pool: &PgPool) -> Result<Vec<String>, sqlx::Error> {
 }
 
 pub const NEED_NAME_MESSAGE: &str = "先在页面顶部填「我是谁」（你的名字，和你启动节点时设的 NODE_USER_NAME 一致）";
+pub(crate) const NEED_LOGIN_MESSAGE: &str = "这个名字设了密码，请先登录";
+
+#[cfg(test)]
+#[test]
+fn 密码失败五次后锁五分钟_期间的请求不延长锁定() {
+    let now = Instant::now();
+    let mut failures = PasswordFailures::default();
+    for _ in 0..FAILURE_LIMIT {
+        assert!(!failures.locked(now));
+        failures.record_failure(now);
+    }
+    assert!(failures.locked(now + LOCK_TIME - Duration::from_secs(1)));
+    assert!(!failures.locked(now + LOCK_TIME));
+    assert_eq!(failures.count, 0);
+}
 
 #[cfg(test)]
 mod name_tests {

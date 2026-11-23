@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { cancelRegression, decideScript, fetchNodeRoles, requestRegression } from "../src/api";
+import { forgetUserToken, rememberUserToken, USER_NAME_TTL_MS } from "../src/identity";
 import { readReviewToken, rememberReviewToken } from "../src/reviewLogic";
 
 const fetchMock = vi.fn<typeof fetch>();
@@ -93,4 +94,42 @@ test("「我是谁」放在请求头里：中文做百分号编码，没填就�
   expect(calls[0].get("x-user-name")).toBe("%E5%B0%8F%E6%98%8E");
   expect(calls[1].get("x-user-name")).toBeNull();
   vi.unstubAllGlobals();
+});
+
+test("读写请求只给对应名字附带有效会话令牌", async () => {
+  const token = "ab".repeat(32);
+  rememberUserToken("小明", token);
+  rememberUserToken("旧名字", token, Date.now() - USER_NAME_TTL_MS);
+
+  respond(200, "{}");
+  await fetchNodeRoles("n1", "\u0085 小明 ");
+  expect(lastCall().headers.get("x-user-name")).toBe(encodeURIComponent("小明"));
+  expect(lastCall().headers.get("x-user-token") === token).toBe(true);
+
+  respond(201, '{"id":"r1"}');
+  await requestRegression("s", "n", "", "小明");
+  expect(lastCall().headers.get("x-user-token") === token).toBe(true);
+
+  for (const name of ["小红", "旧名字", ""]) {
+    respond(200, "{}");
+    await fetchNodeRoles("n1", name);
+    expect(lastCall().headers.has("x-user-token")).toBe(false);
+  }
+});
+
+test("浏览器禁用存储时，当前页面仍能使用和清除会话", async () => {
+  const name = "小明";
+  const token = "ab".repeat(32);
+  vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => { throw new Error("存储被禁用"); });
+  try {
+    rememberUserToken(name, token);
+    respond(200, "{}");
+    await fetchNodeRoles("n1", name);
+    expect(lastCall().headers.get("x-user-token") === token).toBe(true);
+  } finally {
+    forgetUserToken(name);
+  }
+  respond(200, "{}");
+  await fetchNodeRoles("n1", name);
+  expect(lastCall().headers.has("x-user-token")).toBe(false);
 });

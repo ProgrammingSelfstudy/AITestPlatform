@@ -17,6 +17,7 @@ base64 = "0.22.1"
 chrono = "0.4.45"
 dotenvy = "0.15.7"
 futures-util = "0.3.34"
+getrandom = "0.4.3"
 hex = "0.4.3"
 protocol = { version = "0.1.0", path = "../protocol" }
 serde = { version = "1.0.229", features = ["derive"] }

@@ -20,6 +20,7 @@ use uuid::Uuid;
 
 use crate::api::ApiState;
 use crate::internal;
+use crate::users::{self, BrowserUser};
 
 pub const MAX_DOC_CHARS: usize = 200_000;
 pub const MAX_LINKS: usize = 5;
@@ -854,18 +855,21 @@ pub(crate) async fn api_module_cases(State(state): State<ApiState>, Path(id): Pa
     module_cases(state.app.pool(), id).await.map(Json).map_err(|e| api_error(e, "查询模块用例失败"))
 }
 
-/// 人的决定：必须是发起这个模块生成请求的人（按名字），只能处理生成的用例，且还没批准过。
-async fn decider(state: &ApiState, headers: &HeaderMap, module_id: Uuid) -> Res<Uuid> {
-    let Some(user) = crate::users::browser_user(state.app.pool(), headers).await? else {
-        return Err(ModuleError::Forbidden(crate::users::NEED_NAME_MESSAGE.into()));
+/// 发起模块生成请求的人可以对尚未批准的生成用例作出决定。
+async fn decider(state: &ApiState, headers: &HeaderMap, module_id: Uuid) -> Result<Uuid, ApiError> {
+    let user = match users::browser_user(state.app.pool(), headers).await.map_err(|e| internal("校验确认人失败", e))? {
+        BrowserUser::Identified(user) => user,
+        BrowserUser::LoginRequired => return Err((StatusCode::UNAUTHORIZED, users::NEED_LOGIN_MESSAGE.into())),
+        _ => return Err((StatusCode::FORBIDDEN, users::NEED_NAME_MESSAGE.into())),
     };
     let requested: bool = sqlx::query_scalar("select exists(select 1 from casegen_requests where module_id = $1 and requested_by = $2)")
         .bind(module_id)
         .bind(user)
         .fetch_one(state.app.pool())
-        .await?;
+        .await
+        .map_err(|e| internal("校验确认人失败", e))?;
     if !requested {
-        return Err(ModuleError::Forbidden("只有发起这个模块生成请求的人能确认或拒绝它的用例".into()));
+        return Err((StatusCode::FORBIDDEN, "只有发起这个模块生成请求的人能确认或拒绝它的用例".into()));
     }
     Ok(user)
 }
@@ -893,7 +897,7 @@ pub(crate) async fn api_decide(
         "reject" => "rejected",
         _ => return Err((StatusCode::BAD_REQUEST, "decision 只能是 approve 或 reject".to_string())),
     };
-    let user = decider(&state, &headers, module_id).await.map_err(|e| api_error(e, "校验确认人失败"))?;
+    let user = decider(&state, &headers, module_id).await?;
     let note = clip_note(&input.note);
     let pool = state.app.pool();
     let current: Option<String> = sqlx::query_scalar("select review_status from test_cases where module_id = $1 and code = $2 and origin = 'generated'")
@@ -931,7 +935,7 @@ pub(crate) async fn api_decide(
 /// 一键批准评审员认为没问题的（`reviewed_ok`）。需要人确认的（`needs_human`）不在内，必须逐条处理。
 pub(crate) async fn api_approve_reviewed(State(state): State<ApiState>, Path(id): Path<String>, headers: HeaderMap) -> Result<Json<serde_json::Value>, ApiError> {
     let module_id: Uuid = id.parse().map_err(|_| (StatusCode::NOT_FOUND, "没有这个模块".to_string()))?;
-    let user = decider(&state, &headers, module_id).await.map_err(|e| api_error(e, "校验确认人失败"))?;
+    let user = decider(&state, &headers, module_id).await?;
     let result = sqlx::query("update test_cases set review_status = 'approved', reviewed_by_user = $2, reviewed_at = now() where module_id = $1 and origin = 'generated' and review_status = 'reviewed_ok'")
         .bind(module_id)
         .bind(user)

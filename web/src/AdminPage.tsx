@@ -134,7 +134,8 @@ export default function AdminPage() {
       <div className="adm-who">
         <label htmlFor="adm-name">我是谁</label>
         <Input id="adm-name" aria-label="我是谁" autoComplete="off" allowClear maxLength={40} value={userName} onChange={(e) => setUserName(e.target.value)} placeholder="你的名字（和启动节点时设的 NODE_USER_NAME 一致）" />
-        <IdentityHint expiresAt={expiresAt} onForget={forget} onCreated={setUserName} className="adm-who-hint" />
+        <IdentityHint userName={userName} expiresAt={expiresAt} nameProblem={loadError} onForget={forget}
+          onCreated={setUserName} onLogin={() => { setError(null); reload(); }} className="adm-who-hint" />
       </div>
 
       {!trimmedName && <Alert type="info" showIcon title="先填「我是谁」" description="对话是各人自己的；回答由你自己节点上的管理员角色生成，用你自己的额度。你的节点要先在「角色与模型」页配一个「管理员」角色并检测通过。" />}

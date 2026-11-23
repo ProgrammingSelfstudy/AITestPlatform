@@ -64,6 +64,7 @@ fn lazy_state() -> AppState {
             .unwrap(),
         accounts: None,
         review_auth: reviews::ReviewAuth::new(None),
+        password_auth: Default::default(),
         conns: tokio::sync::Mutex::new(HashMap::new()),
         roles: Default::default(),
         apps: Default::default(),
@@ -2241,6 +2242,162 @@ async fn 创建名字时认领节点_只能认领没主人的_认领不成名字
     assert_eq!(status, StatusCode::CREATED);
     let owner: String = sqlx::query_scalar("select u.name from nodes n join users u on u.id = n.owner_user_id where n.id = $1").bind(free).fetch_one(state.pool()).await.unwrap();
     assert_eq!(owner, "小明");
+}
+
+async fn post_credentials(app: &Router, path: &str, name: &str, password: &str) -> (StatusCode, HeaderMap, Bytes) {
+    request(app, Method::POST, path, &WRITE_HEADERS, json!({ "name": name, "password": password }).to_string()).await
+}
+
+async fn login_token(app: &Router, name: &str, password: &str) -> String {
+    let (status, _, body) = post_credentials(app, "/api/login", name, password).await;
+    assert_eq!(status, StatusCode::OK);
+    json_body(&body)["token"].as_str().unwrap().to_owned()
+}
+
+fn session_headers<'a>(name: &'a str, token: Option<&'a str>) -> Vec<(&'static str, &'a str)> {
+    let mut headers = review_headers(REVIEW_TOKEN);
+    headers.push(("x-user-name", name));
+    if let Some(token) = token {
+        headers.push(("x-user-token", token));
+    }
+    headers
+}
+
+#[tokio::test]
+async fn 页面名字登录_失败提示一致_会话只存摘要且有效三十天() {
+    let temp = TempPaths::with_config();
+    let state = test_state(config()).await;
+    let app = temp.app(state.clone());
+    let password = Uuid::new_v4().to_string();
+    let wrong = Uuid::new_v4().to_string();
+    assert_eq!(post_credentials(&app, "/api/users", "测试用户", &password).await.0, StatusCode::CREATED);
+    users::ensure_user(state.pool(), "节点用户").await.unwrap();
+
+    for (name, attempted) in [("不存在", &password), ("节点用户", &password), ("测试用户", &wrong)] {
+        let (status, _, body) = post_credentials(&app, "/api/login", name, attempted).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(text(&body) == "名字或密码不对");
+    }
+
+    let (status, headers, body) = post_credentials(&app, "/api/login", " 测试用户 ", &password).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers[header::CACHE_CONTROL], "no-store");
+    let body = json_body(&body);
+    assert!(body["name"] == "测试用户" && body.as_object().unwrap().len() == 2);
+    let token = body["token"].as_str().unwrap();
+    assert!(token.len() == 64 && token.bytes().all(|b| b.is_ascii_hexdigit()));
+    let (name, stored, active, thirty_days): (String, String, bool, bool) = sqlx::query_as(
+        "select u.name, s.token_hash, s.expires_at > now(), s.expires_at = s.created_at + interval '720 hours'
+         from user_sessions s join users u on u.id = s.user_id",
+    ).fetch_one(state.pool()).await.unwrap();
+    assert_eq!(name, "测试用户");
+    assert!(stored != token && stored == crate::secret_hash(token));
+    assert!(active && thirty_days);
+    assert!(login_token(&app, "测试用户", &password).await != token);
+}
+
+#[tokio::test]
+async fn 登录和管理员强制解除_失败按名字累计_五次后锁定_成功重置() {
+    let temp = TempPaths::with_config();
+    let state = test_state(config()).await;
+    let app = temp.app(state.clone());
+    let password = Uuid::new_v4().to_string();
+    let wrong = Uuid::new_v4().to_string();
+    for name in ["root", "other"] {
+        assert_eq!(post_credentials(&app, "/api/users", name, &password).await.0, StatusCode::CREATED);
+    }
+    sqlx::query("update users set is_admin = true where name = 'root'").execute(state.pool()).await.unwrap();
+    let force = format!("/api/nodes/{}/force-release", Uuid::new_v4());
+
+    assert_eq!(post_credentials(&app, "/api/login", "root", &wrong).await.0, StatusCode::FORBIDDEN);
+    assert_eq!(post_credentials(&app, &force, "root", &password).await.0, StatusCode::NOT_FOUND, "密码验证通过后才查节点");
+    for path in ["/api/login", &force, &force, "/api/login", &force] {
+        assert_eq!(post_credentials(&app, path, " root ", &wrong).await.0, StatusCode::FORBIDDEN);
+    }
+    for path in ["/api/login", &force] {
+        let (status, _, body) = post_credentials(&app, path, "root", &password).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert!(text(&body).contains("5 分钟"));
+    }
+    assert_eq!(post_credentials(&app, "/api/login", "other", &password).await.0, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn 浏览器发起人_有密码须带同名会话_公开查看和无密码名字照常() {
+    let temp = TempPaths::with_config();
+    let state = with_token(test_state(config()).await, Some(REVIEW_TOKEN));
+    let app = temp.app(state.clone());
+    let (node, legacy_node) = (Uuid::new_v4(), Uuid::new_v4());
+    let legacy_user = users::ensure_user(state.pool(), "node-user").await.unwrap();
+    for (id, owner) in [(node, None), (legacy_node, Some(legacy_user))] {
+        sqlx::query("insert into nodes (id, caps, owner_user_id) values ($1, '{}', $2)")
+            .bind(id).bind(owner).execute(state.pool()).await.unwrap();
+    }
+    let password = Uuid::new_v4().to_string();
+    let signup = json!({ "name": "测试用户", "password": password, "claim_node": node });
+    assert_eq!(request(&app, Method::POST, "/api/users", &WRITE_HEADERS, signup.to_string()).await.0, StatusCode::CREATED);
+    assert_eq!(post_credentials(&app, "/api/users", "other", &password).await.0, StatusCode::CREATED);
+    let token = login_token(&app, "测试用户", &password).await;
+    let other_token = login_token(&app, "other", &password).await;
+    let no_session = session_headers(USER_NAME, None);
+    let owner_session = session_headers(USER_NAME, Some(&token));
+    let release = format!("/api/nodes/{node}/release");
+
+    let roles = format!("/api/nodes/{node}/roles");
+    let (status, _, body) = request(&app, Method::GET, &roles, &no_session, "").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json_body(&body), json!({ "online": false, "roles": [], "mine": false, "name_problem": users::NEED_LOGIN_MESSAGE }));
+    let (status, _, body) = request(&app, Method::GET, &roles, &owner_session, "").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json_body(&body)["mine"], true);
+
+    for (path, body) in [
+        (release.clone(), "{}".into()),
+        (CREATE_ROUTE.into(), payload(node, &["TC-04"]).to_string()),
+        (format!("/api/modules/{}/approve-reviewed", Uuid::new_v4()), "{}".into()),
+        (format!("/api/scripts/{}/regress", Uuid::new_v4()), json!({ "node_id": node }).to_string()),
+        ("/api/admin/messages".into(), json!({ "message": "你好" }).to_string()),
+    ] {
+        let (status, _, body) = request(&app, Method::POST, &path, &no_session, body).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{path}");
+        assert!(text(&body) == users::NEED_LOGIN_MESSAGE);
+    }
+    let (status, _, body) = request(&app, Method::POST, &release, &session_headers(USER_NAME, Some(&other_token)), "{}").await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert!(text(&body) == users::NEED_LOGIN_MESSAGE);
+    assert_eq!(request(&app, Method::POST, &release, &owner_session, "{}").await.0, StatusCode::NO_CONTENT);
+
+    let legacy_release = format!("/api/nodes/{legacy_node}/release");
+    assert_eq!(request(&app, Method::POST, &legacy_release, &session_headers("node-user", None), "{}").await.0, StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
+async fn 会话注销和过期后都不能再用() {
+    let temp = TempPaths::with_config();
+    let state = test_state(config()).await;
+    let app = temp.app(state.clone());
+    let name = "browser-user";
+    let password = Uuid::new_v4().to_string();
+    assert_eq!(post_credentials(&app, "/api/users", name, &password).await.0, StatusCode::CREATED);
+    let token = login_token(&app, name, &password).await;
+    let another = login_token(&app, name, &password).await;
+    let signed_in = session_headers(name, Some(&token));
+    let other_session = session_headers(name, Some(&another));
+    assert_eq!(request(&app, Method::GET, "/api/admin/chat", &signed_in, "").await.0, StatusCode::OK);
+    for _ in 0..2 {
+        assert_eq!(request(&app, Method::POST, "/api/logout", &signed_in, "{}").await.0, StatusCode::NO_CONTENT);
+    }
+    let (status, _, body) = request(&app, Method::GET, "/api/admin/chat", &signed_in, "").await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert!(text(&body) == users::NEED_LOGIN_MESSAGE);
+    assert_eq!(request(&app, Method::GET, "/api/admin/chat", &other_session, "").await.0, StatusCode::OK);
+
+    sqlx::query("update user_sessions set expires_at = now() - interval '1 second' where token_hash = $1")
+        .bind(crate::secret_hash(&another)).execute(state.pool()).await.unwrap();
+    let dismiss = format!("/api/admin/proposals/{}/dismiss", Uuid::new_v4());
+    let (status, _, body) = request(&app, Method::POST, &dismiss, &other_session, "{}").await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert!(text(&body) == users::NEED_LOGIN_MESSAGE);
 }
 
 #[tokio::test]

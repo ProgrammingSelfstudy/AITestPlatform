@@ -2259,6 +2259,7 @@ dependencies = [
  "chrono",
  "dotenvy",
  "futures-util",
+ "getrandom 0.4.3",
  "hex",
  "protocol",
  "reqwest",
