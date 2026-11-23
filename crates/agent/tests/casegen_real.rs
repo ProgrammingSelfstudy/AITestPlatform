@@ -35,3 +35,43 @@ async fn claude_看图生成用例() {
 async fn codex_看图生成用例() {
     run(ModelSource::CodexExec, "gpt-6.2-astra").await;
 }
+
+fn brief(code: &str, title: &str, steps: &[&str], expected: &[&str]) -> casegen::CaseBrief {
+    casegen::CaseBrief {
+        code: code.into(),
+        title: title.into(),
+        preconditions: vec![],
+        steps: steps.iter().map(|s| s.to_string()).collect(),
+        expected: expected.iter().map(|s| s.to_string()).collect(),
+    }
+}
+
+/// 复核：第一条完全来自文档，第二条编造了文档里没有的「长按分享」功能。只断言输出能解析、每条都有结论，
+/// 并打印评审员的判断供人看（模型的判断质量不在这里断言）。
+async fn review_run(source: ModelSource, model: &str) {
+    let cases = [
+        brief("A1", "点击红色提示块弹出详情", &["点击左上角红色提示块"], &["弹出标题为「提示详情」的对话框"]),
+        brief("A2", "长按提示块分享给好友", &["长按左上角红色提示块"], &["弹出分享面板，可以选择好友发送"]),
+    ];
+    let out = casegen::review(source, Some(model.into()), None, DOC, &cases).await;
+    println!("{source:?}（{:.0} 秒）：失败={:?}\n{}\n", out.wall_s, out.failure, out.text);
+    assert!(out.failure.is_none(), "{source:?} 失败：{:?}", out.failure);
+    let reviews = casegen::parse_reviews(&out.text).expect("输出应是合法的复核 JSON");
+    for code in ["A1", "A2"] {
+        let r = reviews.iter().find(|r| r.code == code).unwrap_or_else(|| panic!("没有给 {code} 结论"));
+        assert!(matches!(r.verdict.as_str(), "ok" | "needs_human"), "{code} 的结论不认识：{}", r.verdict);
+        println!("{code} → {}：{}", r.verdict, r.reason);
+    }
+}
+
+#[tokio::test]
+#[ignore]
+async fn claude_复核用例() {
+    review_run(ModelSource::ClaudeCli, "claude-opus-5-5").await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn agy_复核用例() {
+    review_run(ModelSource::Agy, "gemini-4-neon-high").await;
+}

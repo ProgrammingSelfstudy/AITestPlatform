@@ -774,6 +774,121 @@ async fn 生成请求按节点上报的测试用例角色校验() {
     assert_eq!(stored.as_deref(), Some("w-ok"));
 }
 
+/// 建一个模块并让节点生成两条草稿用例，返回（模块 id、请求 id、两条用例编号）。
+async fn generated_module(world: &World, module: &str) -> (Uuid, Uuid, Vec<String>) {
+    let node_headers = vec![("authorization", format!("Bearer {TOKEN}")), ("x-node-id", world.node.to_string()), ("content-type", "application/json".to_string())];
+    let send = |method: Method, path: String, body: String| {
+        let (app, headers) = (world.app.clone(), node_headers.clone());
+        async move {
+            let borrowed: Vec<(&str, &str)> = headers.iter().map(|(k, v)| (*k, v.as_str())).collect();
+            request(&app, method, &path, &borrowed, body).await
+        }
+    };
+    let (status, _, bytes) = browser_post(&world.app, "/api/projects/hafa/casegen-requests", casegen_body(world.node, module)).await;
+    assert_eq!(status, StatusCode::CREATED, "{}", text(&bytes));
+    let created = json_body(&bytes);
+    let request_id: Uuid = created["request_id"].as_str().unwrap().parse().unwrap();
+    let module_id: Uuid = created["module_id"].as_str().unwrap().parse().unwrap();
+    assert_eq!(send(Method::PUT, "/api/node/casegen-requests/claim".into(), String::new()).await.0, StatusCode::OK);
+    let two = "id: G1\ntitle: 进入语聊房\nsteps:\n  - 点击入口\nexpected:\n  - 出现语聊房\n---\nid: G2\ntitle: 退出语聊房\nsteps:\n  - 点击退出\nexpected:\n  - 回到首页\n";
+    let (status, _, bytes) = send(Method::PUT, format!("/api/casegen-requests/{request_id}/result"), json!({"ok": true, "detail": "", "cases_text": two}).to_string()).await;
+    assert_eq!(status, StatusCode::OK, "{}", text(&bytes));
+    let done = json_body(&bytes);
+    // 回报成功时把用例摘要给节点，评审员据此复核
+    assert_eq!(done["cases"].as_array().unwrap().len(), 2);
+    assert_eq!(done["cases"][0]["expected"], json!(["出现语聊房"]));
+    let codes = done["codes"].as_array().unwrap().iter().map(|c| c.as_str().unwrap().to_string()).collect();
+    (module_id, request_id, codes)
+}
+
+fn node_put(world: &World, node: Uuid, path: String, body: Value) -> impl std::future::Future<Output = (StatusCode, HeaderMap, Bytes)> {
+    let app = world.app.clone();
+    async move {
+        let headers = [("authorization", format!("Bearer {TOKEN}")), ("x-node-id", node.to_string()), ("content-type", "application/json".to_string())];
+        let borrowed: Vec<(&str, &str)> = headers.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        request(&app, Method::PUT, &path, &borrowed, body.to_string()).await
+    }
+}
+
+async fn status_of_case(world: &World, code: &str) -> (String, String) {
+    sqlx::query_as("select review_status, review_note from test_cases where code = $1").bind(code).fetch_one(world.state.pool()).await.unwrap()
+}
+
+#[tokio::test]
+async fn 评审员的意见只是意见_要人确认才能执行() {
+    let world = World::new().await;
+    let (module, request_id, codes) = generated_module(&world, "语聊房").await;
+    let review_path = format!("/api/casegen-requests/{request_id}/review");
+    // 别的节点不能代报
+    let other = Uuid::new_v4();
+    sqlx::query("insert into nodes (id, caps, online) values ($1,'{}',true)").bind(other).execute(world.state.pool()).await.unwrap();
+    assert_eq!(node_put(&world, other, review_path.clone(), json!({"ok": true, "detail": "", "reviews": []})).await.0, StatusCode::CONFLICT);
+    // 评审员：第一条没问题，第二条有疑问；结论不认识的和没给结论的都转待人工确认
+    let (status, _, bytes) = node_put(&world, world.node, review_path.clone(), json!({
+        "ok": true, "detail": "评审员 Claude 复核完成",
+        "reviews": [{"code": codes[0], "verdict": "ok", "reason": "文档第 2 段能对上"}, {"code": codes[1], "verdict": "needs_human", "reason": "文档没写退出后回哪个页面"}],
+    })).await;
+    assert_eq!(status, StatusCode::OK, "{}", text(&bytes));
+    assert_eq!(status_of_case(&world, &codes[0]).await, ("reviewed_ok".into(), "文档第 2 段能对上".into()));
+    assert_eq!(status_of_case(&world, &codes[1]).await.0, "needs_human");
+    // 评审员说没问题也不能直接执行：还不是 approved
+    let (status, _, bytes) = browser_post(&world.app, "/api/tasks", payload(world.node, &[&codes[0]])).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(text(&bytes).contains("reviewed_ok"), "{}", text(&bytes));
+    // 再报一次不会改已经复核过的（只更新仍是草稿的）
+    node_put(&world, world.node, review_path, json!({"ok": false, "detail": "x", "reviews": []})).await;
+    assert_eq!(status_of_case(&world, &codes[0]).await.0, "reviewed_ok");
+    // 人的决定：个人令牌必须是发起这个模块生成请求的人
+    sqlx::query("insert into users (name, token_hash) values ('不相干的人', $1)").bind(crate::secret_hash("u_unrelated")).execute(world.state.pool()).await.unwrap();
+    let decide = |code: &str, token: &'static str, body: Value| {
+        let mut h = review_headers(REVIEW_TOKEN);
+        h.push(("x-user-token", token));
+        let (app, path) = (world.app.clone(), format!("/api/modules/{module}/cases/{code}/decision"));
+        async move { request(&app, Method::POST, &path, &h, body.to_string()).await }
+    };
+    assert_eq!(decide(&codes[0], "u_unrelated", json!({"decision": "approve"})).await.0, StatusCode::FORBIDDEN);
+    assert_eq!(decide(&codes[0], "u_不存在", json!({"decision": "approve"})).await.0, StatusCode::FORBIDDEN);
+    assert_eq!(decide(&codes[0], USER_TOKEN, json!({"decision": "maybe"})).await.0, StatusCode::BAD_REQUEST);
+    // 评审员有疑问的用例，批准要写备注
+    let (status, _, bytes) = decide(&codes[1], USER_TOKEN, json!({"decision": "approve"})).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(text(&bytes).contains("备注"));
+    assert_eq!(decide(&codes[1], USER_TOKEN, json!({"decision": "approve", "note": "退出后回首页是产品口头确认的"})).await.0, StatusCode::NO_CONTENT);
+    let (status, note) = status_of_case(&world, &codes[1]).await;
+    assert_eq!(status, "approved");
+    assert!(note.contains("文档没写退出后回哪个页面") && note.contains("产品口头确认"), "评审员的疑问和人的备注都要留痕：{note}");
+    // 一键批准只批「评审员认为没问题」的
+    let mut h = review_headers(REVIEW_TOKEN);
+    h.push(("x-user-token", USER_TOKEN));
+    let (status, _, bytes) = request(&world.app, Method::POST, &format!("/api/modules/{module}/approve-reviewed"), &h, "{}").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json_body(&bytes)["approved"], 1);
+    assert_eq!(status_of_case(&world, &codes[0]).await.0, "approved");
+    // 批准后才能执行；拒绝的不能
+    let (status, _, bytes) = browser_post(&world.app, "/api/tasks", payload(world.node, &[&codes[0], &codes[1]])).await;
+    assert_eq!(status, StatusCode::CREATED, "{}", text(&bytes));
+    assert_eq!(decide(&codes[1], USER_TOKEN, json!({"decision": "reject", "note": "不要了"})).await.0, StatusCode::NO_CONTENT);
+    let (status, _, _) = browser_post(&world.app, "/api/tasks", payload(world.node, &[&codes[1]])).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    // 模块的用例列表带复核状态和备注
+    let (_, _, bytes) = request(&world.app, Method::GET, &format!("/api/modules/{module}/cases"), &[], "").await;
+    let list = json_body(&bytes);
+    assert_eq!((list[0]["review_status"].as_str(), list[1]["review_status"].as_str()), (Some("approved"), Some("rejected")));
+}
+
+#[tokio::test]
+async fn 评审员没跑成时用例全部转待人工确认() {
+    let world = World::new().await;
+    let (_, request_id, codes) = generated_module(&world, "个人主页").await;
+    let (status, _, _) = node_put(&world, world.node, format!("/api/casegen-requests/{request_id}/review"), json!({"ok": false, "detail": "这个节点没有配置判定员角色", "reviews": []})).await;
+    assert_eq!(status, StatusCode::OK);
+    for code in &codes {
+        let (status, note) = status_of_case(&world, code).await;
+        assert_eq!(status, "needs_human", "评审员没跑成不能当通过");
+        assert!(note.contains("没有跑成") && note.contains("没有配置判定员角色"), "{note}");
+    }
+}
+
 struct World {
     temp: TempPaths,
     app: Router,

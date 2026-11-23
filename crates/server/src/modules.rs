@@ -37,6 +37,8 @@ pub enum ModuleError {
     NotFound(String),
     #[error("{0}")]
     Conflict(String),
+    #[error("{0}")]
+    Forbidden(String),
     #[error(transparent)]
     Db(#[from] sqlx::Error),
 }
@@ -361,6 +363,7 @@ fn api_error(e: ModuleError, action: &str) -> ApiError {
         ModuleError::Invalid(m) => (StatusCode::BAD_REQUEST, m),
         ModuleError::NotFound(m) => (StatusCode::NOT_FOUND, m),
         ModuleError::Conflict(m) => (StatusCode::CONFLICT, m),
+        ModuleError::Forbidden(m) => (StatusCode::FORBIDDEN, m),
         ModuleError::Db(e) => internal(action, e),
     }
 }
@@ -449,6 +452,7 @@ pub struct Claimed {
     pub ui_links: Vec<String>,
     pub screenshots: Vec<ClaimedShot>,
     pub writer_role: Option<String>,
+    pub reviewer_role: Option<String>,
 }
 
 pub async fn claim(pool: &PgPool, node_id: Uuid) -> Res<Option<Claimed>> {
@@ -462,7 +466,7 @@ pub async fn claim(pool: &PgPool, node_id: Uuid) -> Res<Option<Claimed>> {
     .execute(&mut *tx)
     .await?;
     let Some(row) = sqlx::query(
-        "select r.id, r.ui_links, r.writer_role, m.name as module, p.name as project, d.content
+        "select r.id, r.ui_links, r.writer_role, r.reviewer_role, m.name as module, p.name as project, d.content
          from casegen_requests r
          join modules m on m.id = r.module_id join projects p on p.id = r.project_id join project_docs d on d.id = r.doc_id
          where r.node_id = $1 and r.status = 'queued' order by r.requested_at limit 1 for update of r skip locked",
@@ -496,6 +500,7 @@ pub async fn claim(pool: &PgPool, node_id: Uuid) -> Res<Option<Claimed>> {
             })
             .collect(),
         writer_role: row.get("writer_role"),
+        reviewer_role: row.get("reviewer_role"),
     }))
 }
 
@@ -567,10 +572,21 @@ pub struct FinishInput {
     pub cases_text: Option<String>,
 }
 
+/// 回报成功后给节点的用例摘要，节点据此让评审员复核。
+#[derive(Debug, Serialize)]
+pub struct CaseBrief {
+    pub code: String,
+    pub title: String,
+    pub preconditions: Vec<String>,
+    pub steps: Vec<String>,
+    pub expected: Vec<String>,
+}
+
 pub struct Finished {
     pub status: &'static str,
     pub detail: String,
     pub codes: Vec<String>,
+    pub cases: Vec<CaseBrief>,
 }
 
 /// 回报结果：只有领走它的节点、且仍在运行中才能回报。成功时用例以 `draft` 入库（不能执行，要先复核和人工确认）。
@@ -590,11 +606,11 @@ pub async fn finish(pool: &PgPool, node_id: Uuid, id: Uuid, input: &FinishInput)
         return Err(ModuleError::Conflict("这个生成请求已经不在运行中".into()));
     }
     let detail: String = input.detail.chars().take(1800).collect();
-    let (status, detail, codes) = if !input.ok {
-        ("failed", detail, vec![])
+    let (status, detail, codes, briefs) = if !input.ok {
+        ("failed", detail, vec![], vec![])
     } else {
         match parse_generated(id, input.cases_text.as_deref().unwrap_or("")) {
-            Err(why) => ("failed", format!("生成的用例没有通过校验，整批没有入库：{}", why.chars().take(1700).collect::<String>()), vec![]),
+            Err(why) => ("failed", format!("生成的用例没有通过校验，整批没有入库：{}", why.chars().take(1700).collect::<String>()), vec![], vec![]),
             Ok(cases) => {
                 let project_id: Uuid = row.get("project_id");
                 let module_id: Uuid = row.get("module_id");
@@ -619,7 +635,17 @@ pub async fn finish(pool: &PgPool, node_id: Uuid, id: Uuid, input: &FinishInput)
                     .await?;
                 }
                 let codes: Vec<String> = cases.iter().map(|c| c.code.clone()).collect();
-                ("finished", format!("生成了 {} 条用例（草稿，待复核）", codes.len()), codes)
+                let briefs = cases
+                    .iter()
+                    .map(|c| CaseBrief {
+                        code: c.code.clone(),
+                        title: c.title.clone(),
+                        preconditions: c.preconditions.clone(),
+                        steps: c.steps.clone(),
+                        expected: c.expected.iter().map(|e| e.text.clone()).collect(),
+                    })
+                    .collect();
+                ("finished", format!("生成了 {} 条用例（草稿，待复核）", codes.len()), codes, briefs)
             }
         }
     };
@@ -630,7 +656,7 @@ pub async fn finish(pool: &PgPool, node_id: Uuid, id: Uuid, input: &FinishInput)
         .execute(&mut *tx)
         .await?;
     tx.commit().await?;
-    Ok(Finished { status, detail, codes })
+    Ok(Finished { status, detail, codes, cases: briefs })
 }
 
 pub(crate) async fn api_claim(State(state): State<ApiState>, headers: HeaderMap) -> Result<axum::response::Response, ApiError> {
@@ -652,7 +678,231 @@ pub(crate) async fn api_finish(
     let id: Uuid = id.parse().map_err(|_| (StatusCode::NOT_FOUND, "没有这个生成请求".to_string()))?;
     let Json(input) = body.map_err(|_| (StatusCode::BAD_REQUEST, "请求格式不对，或内容太大".to_string()))?;
     let done = finish(state.app.pool(), node_id, id, &input).await.map_err(|e| api_error(e, "回报生成结果失败"))?;
-    Ok(Json(serde_json::json!({ "status": done.status, "detail": done.detail, "codes": done.codes })))
+    Ok(Json(serde_json::json!({ "status": done.status, "detail": done.detail, "codes": done.codes, "cases": done.cases })))
+}
+
+// ---------------------------------------------------------------- 复核：评审员给意见，人来确认
+
+pub const MAX_NOTE_CHARS: usize = 600;
+
+#[derive(Debug, Deserialize)]
+pub struct ReviewItem {
+    pub code: String,
+    /// `ok`：评审员认为文档里能找到依据、预期可判定；`needs_human`：有疑问或无法判断
+    pub verdict: String,
+    #[serde(default)]
+    pub reason: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewInput {
+    /// 评审员是否跑完了。没跑成（没有评审员角色、额度用完、输出不是合法 JSON）时为 false，用例一律转待人工确认
+    pub ok: bool,
+    pub detail: String,
+    #[serde(default)]
+    pub reviews: Vec<ReviewItem>,
+}
+
+pub struct Reviewed {
+    pub reviewed_ok: Vec<String>,
+    pub needs_human: Vec<String>,
+}
+
+fn clip_note(text: &str) -> String {
+    text.trim().chars().take(MAX_NOTE_CHARS).collect()
+}
+
+/// 节点回报评审员的意见：只更新**这次请求生成的、仍是草稿**的用例。
+/// **评审员的通过只是意见（`reviewed_ok`），不会让用例能执行**，要人确认（规则 5：不强行通过）；
+/// 没给出结论的、结论不认识的、评审员没跑成的，一律 `needs_human`。
+pub async fn review(pool: &PgPool, node_id: Uuid, id: Uuid, input: &ReviewInput) -> Res<Reviewed> {
+    let mut tx = pool.begin().await?;
+    let row = sqlx::query("select node_id, status, project_id, module_id from casegen_requests where id = $1 for update")
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| ModuleError::NotFound("没有这个生成请求".into()))?;
+    if row.get::<Uuid, _>("node_id") != node_id {
+        return Err(ModuleError::Conflict("这个生成请求不是你的节点领走的".into()));
+    }
+    if row.get::<String, _>("status") != "finished" {
+        return Err(ModuleError::Conflict("这个生成请求没有生成成功，没有可复核的用例".into()));
+    }
+    let project_id: Uuid = row.get("project_id");
+    let module_id: Uuid = row.get("module_id");
+    let short = &id.simple().to_string()[..6];
+    let like = format!("GEN-{short}-%");
+    let codes: Vec<String> = sqlx::query_scalar("select code from test_cases where project_id = $1 and module_id = $2 and origin = 'generated' and review_status = 'draft' and code like $3 order by code")
+        .bind(project_id)
+        .bind(module_id)
+        .bind(&like)
+        .fetch_all(&mut *tx)
+        .await?;
+    let mut out = Reviewed { reviewed_ok: vec![], needs_human: vec![] };
+    for code in &codes {
+        let item = input.reviews.iter().find(|r| &r.code == code);
+        let (status, note) = match (input.ok, item) {
+            (false, _) => ("needs_human", format!("评审员没有跑成，需要人工确认：{}", clip_note(&input.detail))),
+            (true, None) => ("needs_human", "评审员没有给出这条用例的结论，需要人工确认".to_string()),
+            (true, Some(r)) if r.verdict == "ok" => ("reviewed_ok", clip_note(&r.reason)),
+            (true, Some(r)) if r.verdict == "needs_human" => ("needs_human", clip_note(&r.reason)),
+            (true, Some(_)) => ("needs_human", "评审员给出的结论无法识别，需要人工确认".to_string()),
+        };
+        sqlx::query("update test_cases set review_status = $3, review_note = $4, reviewed_at = now() where project_id = $1 and code = $2")
+            .bind(project_id)
+            .bind(code)
+            .bind(status)
+            .bind(&note)
+            .execute(&mut *tx)
+            .await?;
+        if status == "reviewed_ok" { out.reviewed_ok.push(code.clone()) } else { out.needs_human.push(code.clone()) }
+    }
+    let detail: String = input.detail.chars().take(1800).collect();
+    sqlx::query("update casegen_requests set review_detail = $2 where id = $1").bind(id).bind(detail).execute(&mut *tx).await?;
+    tx.commit().await?;
+    Ok(out)
+}
+
+pub(crate) async fn api_review(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    body: Result<Json<ReviewInput>, JsonRejection>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let node_id = crate::node_identity(&state.app, &headers).await.map_err(|status| (status, String::new()))?;
+    let id: Uuid = id.parse().map_err(|_| (StatusCode::NOT_FOUND, "没有这个生成请求".to_string()))?;
+    let Json(input) = body.map_err(|_| (StatusCode::BAD_REQUEST, "请求格式不对，或内容太大".to_string()))?;
+    let done = review(state.app.pool(), node_id, id, &input).await.map_err(|e| api_error(e, "回报复核意见失败"))?;
+    Ok(Json(serde_json::json!({ "reviewed_ok": done.reviewed_ok, "needs_human": done.needs_human })))
+}
+
+#[derive(Debug, Serialize)]
+pub struct ModuleCase {
+    pub code: String,
+    pub title: String,
+    pub origin: String,
+    pub review_status: String,
+    pub review_note: String,
+    pub steps: Vec<String>,
+    pub expected: Vec<String>,
+}
+
+pub async fn module_cases(pool: &PgPool, module_id: Uuid) -> Res<Vec<ModuleCase>> {
+    let exists: bool = sqlx::query_scalar("select exists(select 1 from modules where id = $1)").bind(module_id).fetch_one(pool).await?;
+    if !exists {
+        return Err(ModuleError::NotFound("没有这个模块".into()));
+    }
+    let rows = sqlx::query("select code, title, origin, review_status, review_note, steps, expected from test_cases where module_id = $1 order by code")
+        .bind(module_id)
+        .fetch_all(pool)
+        .await?;
+    let strings = |v: serde_json::Value| -> Vec<String> { v.as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_owned)).collect()).unwrap_or_default() };
+    Ok(rows
+        .iter()
+        .map(|r| ModuleCase {
+            code: r.get("code"),
+            title: r.get("title"),
+            origin: r.get("origin"),
+            review_status: r.get("review_status"),
+            review_note: r.get("review_note"),
+            steps: strings(r.get("steps")),
+            expected: r.get::<serde_json::Value, _>("expected").as_array().map(|a| a.iter().filter_map(|e| e["text"].as_str().map(str::to_owned)).collect()).unwrap_or_default(),
+        })
+        .collect())
+}
+
+pub(crate) async fn api_module_cases(State(state): State<ApiState>, Path(id): Path<String>) -> Result<Json<Vec<ModuleCase>>, ApiError> {
+    let id: Uuid = id.parse().map_err(|_| (StatusCode::NOT_FOUND, "没有这个模块".to_string()))?;
+    module_cases(state.app.pool(), id).await.map(Json).map_err(|e| api_error(e, "查询模块用例失败"))
+}
+
+/// 人的决定：必须是发起这个模块生成请求的人（个人令牌），只能处理生成的用例，且还没批准过。
+async fn decider(state: &ApiState, headers: &HeaderMap, module_id: Uuid) -> Res<Uuid> {
+    let token = headers.get("x-user-token").and_then(|h| h.to_str().ok()).unwrap_or_default();
+    let user = crate::users::user_by_token(state.app.pool(), token)
+        .await?
+        .ok_or_else(|| ModuleError::Forbidden("需要有效的个人令牌才能确认或拒绝用例".into()))?;
+    let requested: bool = sqlx::query_scalar("select exists(select 1 from casegen_requests where module_id = $1 and requested_by = $2)")
+        .bind(module_id)
+        .bind(user)
+        .fetch_one(state.app.pool())
+        .await?;
+    if !requested {
+        return Err(ModuleError::Forbidden("只有发起这个模块生成请求的人能确认或拒绝它的用例".into()));
+    }
+    Ok(user)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DecideInput {
+    /// `approve` 批准（才能执行）/ `reject` 拒绝
+    decision: String,
+    #[serde(default)]
+    note: String,
+}
+
+/// 逐条批准或拒绝。需要人确认的（`needs_human`）也能批准——这是人的决定，评审员的疑问写在备注里留痕。
+pub(crate) async fn api_decide(
+    State(state): State<ApiState>,
+    Path((id, code)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: Result<Json<DecideInput>, JsonRejection>,
+) -> Result<StatusCode, ApiError> {
+    let module_id: Uuid = id.parse().map_err(|_| (StatusCode::NOT_FOUND, "没有这个模块".to_string()))?;
+    let Json(input) = body.map_err(|_| (StatusCode::BAD_REQUEST, "请求格式不对".to_string()))?;
+    let status = match input.decision.as_str() {
+        "approve" => "approved",
+        "reject" => "rejected",
+        _ => return Err((StatusCode::BAD_REQUEST, "decision 只能是 approve 或 reject".to_string())),
+    };
+    let user = decider(&state, &headers, module_id).await.map_err(|e| api_error(e, "校验确认人失败"))?;
+    let note = clip_note(&input.note);
+    let pool = state.app.pool();
+    let current: Option<String> = sqlx::query_scalar("select review_status from test_cases where module_id = $1 and code = $2 and origin = 'generated'")
+        .bind(module_id)
+        .bind(&code)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| internal("查询用例失败", e))?;
+    let Some(current) = current else { return Err((StatusCode::NOT_FOUND, "这个模块里没有这条生成的用例".to_string())) };
+    if current == "approved" && status == "approved" {
+        return Ok(StatusCode::NO_CONTENT);
+    }
+    // 评审员说有疑问的用例，人批准时要写一句理由，留痕
+    if current == "needs_human" && status == "approved" && note.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "评审员对这条用例有疑问，批准时请写一句备注说明为什么可以执行".to_string()));
+    }
+    let append = if note.is_empty() { String::new() } else { format!("（人工备注：{note}）") };
+    sqlx::query(
+        "update test_cases set review_status = $3, reviewed_by_user = $4, reviewed_at = now(),
+                review_note = left(review_note || $5, $6)
+         where module_id = $1 and code = $2 and origin = 'generated'",
+    )
+    .bind(module_id)
+    .bind(&code)
+    .bind(status)
+    .bind(user)
+    .bind(append)
+    .bind(MAX_NOTE_CHARS as i32)
+    .execute(pool)
+    .await
+    .map_err(|e| internal("更新用例失败", e))?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// 一键批准评审员认为没问题的（`reviewed_ok`）。需要人确认的（`needs_human`）不在内，必须逐条处理。
+pub(crate) async fn api_approve_reviewed(State(state): State<ApiState>, Path(id): Path<String>, headers: HeaderMap) -> Result<Json<serde_json::Value>, ApiError> {
+    let module_id: Uuid = id.parse().map_err(|_| (StatusCode::NOT_FOUND, "没有这个模块".to_string()))?;
+    let user = decider(&state, &headers, module_id).await.map_err(|e| api_error(e, "校验确认人失败"))?;
+    let result = sqlx::query("update test_cases set review_status = 'approved', reviewed_by_user = $2, reviewed_at = now() where module_id = $1 and origin = 'generated' and review_status = 'reviewed_ok'")
+        .bind(module_id)
+        .bind(user)
+        .execute(state.app.pool())
+        .await
+        .map_err(|e| internal("批准用例失败", e))?;
+    Ok(Json(serde_json::json!({ "approved": result.rows_affected() })))
 }
 
 #[cfg(test)]

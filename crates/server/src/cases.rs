@@ -256,6 +256,8 @@ pub struct CaseSummary {
     pub status: String,
     pub blocked_reason: Option<String>,
     pub version: i32,
+    /// 生成的用例要先复核和人工确认（approved）才能执行；导入的老用例恒为 approved
+    pub review_status: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -284,6 +286,7 @@ fn summary(r: &sqlx::postgres::PgRow) -> CaseSummary {
         status: r.get("status"),
         blocked_reason: r.get("blocked_reason"),
         version: r.get("version"),
+        review_status: r.get("review_status"),
     }
 }
 
@@ -326,7 +329,7 @@ pub async fn list(pool: &PgPool, project: &str) -> Result<Option<Vec<CaseSummary
         return Ok(None);
     }
     let rows = sqlx::query(
-        "select c.code, c.title, c.level, c.platforms, c.should_fail, c.status, c.blocked_reason, c.version
+        "select c.code, c.title, c.level, c.platforms, c.should_fail, c.status, c.blocked_reason, c.version, c.review_status
          from test_cases c join projects p on p.id = c.project_id where p.name = $1",
     )
     .bind(project)
@@ -339,7 +342,7 @@ pub async fn list(pool: &PgPool, project: &str) -> Result<Option<Vec<CaseSummary
 
 pub async fn detail(pool: &PgPool, project: &str, code: &str) -> Result<Option<CaseDetail>, sqlx::Error> {
     let Some(r) = sqlx::query(
-        "select c.code, c.title, c.level, c.platforms, c.should_fail, c.status, c.blocked_reason, c.version,
+        "select c.code, c.title, c.level, c.platforms, c.should_fail, c.status, c.blocked_reason, c.version, c.review_status,
                 c.note, c.refs, c.preconditions, c.steps, c.expected, c.data
          from test_cases c join projects p on p.id = c.project_id where p.name = $1 and c.code = $2",
     )
