@@ -652,6 +652,33 @@ async fn 模块和生成请求_必填校验_去重_只能用自己的节点() {
     assert_eq!(json_body(&bytes).as_array().unwrap().len(), 2, "重复建同名模块不能多出一个");
 }
 
+#[tokio::test]
+async fn 测试用例岗位只允许能看图的来源() {
+    let world = World::new().await;
+    let path = format!("/api/nodes/{}/roles", world.node);
+    let post = |roles: Value| {
+        let mut headers = review_headers(REVIEW_TOKEN);
+        headers.push(("x-user-token", USER_TOKEN));
+        let (app, path) = (world.app.clone(), path.clone());
+        async move { request(&app, Method::POST, &path, &headers, set_roles_body(roles)).await }
+    };
+    let base = vec![role_json("e", "executor", "codex_exec", "m"), role_json("j", "judge", "agy", "m")];
+    let with = |extra: Value| { let mut v = base.clone(); v.push(extra); json!(v) };
+    // agy 的图片输入还没验证：不能当测试用例角色；deepseek 没有运行器
+    for source in ["agy", "deepseek"] {
+        let (status, _, bytes) = post(with(role_json("w", "case_writer", source, "m"))).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{source}：{}", text(&bytes));
+    }
+    // Claude、Codex 能当：校验通过，只是测试里节点离线所以 409
+    for source in ["claude_cli", "codex_exec"] {
+        let (status, _, bytes) = post(with(role_json("w", "case_writer", source, "m"))).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{source}：{}", text(&bytes));
+    }
+    // 测试用例岗位可以不配（不是必需岗位）
+    let (status, _, _) = post(json!(base)).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+}
+
 struct World {
     temp: TempPaths,
     app: Router,

@@ -19,6 +19,11 @@
       "models": [{ "model": "claude-opus-5-5", "efforts": [] }]
     },
     {
+      "id": "casewriter-claude", "slot": "case_writer", "name": "测试用例 · Claude", "source": "claude_cli",
+      "default": { "model": "claude-opus-5-5", "effort": null },
+      "models": [{ "model": "claude-opus-5-5", "efforts": [] }]
+    },
+    {
       "id": "judge-agy", "slot": "judge", "name": "判定员 · Gemini", "source": "agy",
       "default": { "model": "gemini-4-neon-high", "effort": null },
       "models": [{ "model": "gemini-4-neon-high", "efforts": [] }]

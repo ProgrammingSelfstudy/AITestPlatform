@@ -434,6 +434,12 @@
   border-color: var(--roles-judge-border);
 }
 
+.roles-slot-case_writer {
+  color: var(--roles-judge-fg);
+  background: var(--roles-judge-bg);
+  border-color: var(--roles-judge-border);
+}
+
 .roles-key-pill {
   display: inline-flex;
   align-items: center;
@@ -602,6 +608,12 @@
 }
 
 .roles-card-icon.is-judge {
+  color: var(--roles-judge-fg);
+  border-color: var(--roles-judge-border);
+  background: var(--roles-judge-bg);
+}
+
+.roles-card-icon.is-case_writer {
   color: var(--roles-judge-fg);
   border-color: var(--roles-judge-border);
   background: var(--roles-judge-bg);

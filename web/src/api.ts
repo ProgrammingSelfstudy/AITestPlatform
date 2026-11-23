@@ -155,7 +155,7 @@ export interface CaseSummary {
 /** 一个角色 = 某个岗位（执行员 / 判定员）可选的一个来源和它的模型。新增角色或模型只改服务端配置。 */
 export interface ModelRole {
   id: string;
-  slot: "executor" | "judge";
+  slot: "executor" | "judge" | "case_writer";
   name: string;
   source: string;
   default: { model: string; effort: string | null };

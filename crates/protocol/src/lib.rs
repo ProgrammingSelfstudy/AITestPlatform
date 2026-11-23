@@ -110,6 +110,8 @@ pub enum ModelSource {
 pub enum RoleSlot {
     Executor,
     Judge,
+    /// 测试用例：根据需求文档和 UI 截图生成用例
+    CaseWriter,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

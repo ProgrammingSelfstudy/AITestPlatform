@@ -193,6 +193,8 @@ fn source_supported(role: &RoleConfig) -> bool {
     match role.slot {
         RoleSlot::Executor => role.source == ModelSource::CodexExec,
         RoleSlot::Judge => matches!(role.source, ModelSource::ClaudeCli | ModelSource::Agy),
+        // 要看 UI 截图：Claude（stream-json 图片输入）和 Codex（-i）都实测能看图；agy 的图片输入还没验证，先不开放
+        RoleSlot::CaseWriter => matches!(role.source, ModelSource::ClaudeCli | ModelSource::CodexExec),
     }
 }
 
