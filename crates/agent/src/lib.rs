@@ -6,6 +6,7 @@
 //! 不自动换计费方式；卡住要能被检测并杀掉，不依赖模型自觉。
 
 pub mod agy_cli;
+pub mod casegen;
 pub mod claude_cli;
 pub mod codex_exec;
 pub mod judge;

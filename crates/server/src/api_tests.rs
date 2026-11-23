@@ -679,6 +679,101 @@ async fn 测试用例岗位只允许能看图的来源() {
     assert_eq!(status, StatusCode::CONFLICT);
 }
 
+#[tokio::test]
+async fn 节点领取生成请求并回报_用例入库为草稿且不能执行() {
+    let world = World::new().await;
+    let node_headers = |node: Uuid| vec![("authorization", format!("Bearer {TOKEN}")), ("x-node-id", node.to_string())];
+    let send = |method: Method, path: String, node: Uuid, body: String| {
+        let (app, headers) = (world.app.clone(), node_headers(node));
+        async move {
+            let mut borrowed: Vec<(&str, &str)> = headers.iter().map(|(k, v)| (*k, v.as_str())).collect();
+            borrowed.push(("content-type", "application/json"));
+            request(&app, method, &path, &borrowed, body).await
+        }
+    };
+    let (status, _, bytes) = browser_post(&world.app, "/api/projects/hafa/casegen-requests", casegen_body(world.node, "语聊房")).await;
+    assert_eq!(status, StatusCode::CREATED, "{}", text(&bytes));
+    let id = json_body(&bytes)["request_id"].as_str().unwrap().to_string();
+    // 别的节点领不到这个请求；自己的节点领到：带文档、链接、截图
+    let other = Uuid::new_v4();
+    sqlx::query("insert into nodes (id, caps, online) values ($1,'{}',true)").bind(other).execute(world.state.pool()).await.unwrap();
+    let (status, _, _) = send(Method::PUT, "/api/node/casegen-requests/claim".into(), other, String::new()).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, _, bytes) = send(Method::PUT, "/api/node/casegen-requests/claim".into(), world.node, String::new()).await;
+    assert_eq!(status, StatusCode::OK, "{}", text(&bytes));
+    let claimed = json_body(&bytes);
+    assert_eq!((claimed["id"].as_str(), claimed["module"].as_str(), claimed["project"].as_str()), (Some(id.as_str()), Some("语聊房"), Some("hafa")));
+    assert!(claimed["doc"].as_str().unwrap().contains("语聊房"));
+    assert_eq!(claimed["screenshots"].as_array().unwrap().len(), 1);
+    assert_eq!(claimed["screenshots"][0]["content_type"], "image/png");
+    // 已被领走：再领是空的；别的节点不能回报
+    let (status, _, _) = send(Method::PUT, "/api/node/casegen-requests/claim".into(), world.node, String::new()).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let good = "id: G1\ntitle: 进入语聊房\nlevel: 简单流程\nplatform: [android]\nsteps:\n  - 点击语聊房入口\nexpected:\n  - 出现语聊房页面\n";
+    let body = |ok: bool, text: &str| json!({"ok": ok, "detail": "测试", "cases_text": text}).to_string();
+    let result = format!("/api/casegen-requests/{id}/result");
+    let (status, _, _) = send(Method::PUT, result.clone(), other, body(true, good)).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    // 格式不合格：整批不入库，请求转失败并说明
+    let (status, _, bytes) = send(Method::PUT, result.clone(), world.node, body(true, "id: G1\ntitle: 没步骤\nexpected:\n  - x\n")).await;
+    assert_eq!(status, StatusCode::OK, "{}", text(&bytes));
+    assert_eq!(json_body(&bytes)["status"], "failed");
+    let n: i64 = sqlx::query_scalar("select count(*) from test_cases where origin = 'generated'").fetch_one(world.state.pool()).await.unwrap();
+    assert_eq!(n, 0, "不合格的整批不能入库");
+    // 失败后可以重新提交（失败的请求不再占着「同模块只能一个」）并成功
+    let (status, _, bytes) = browser_post(&world.app, "/api/projects/hafa/casegen-requests", casegen_body(world.node, "语聊房")).await;
+    assert_eq!(status, StatusCode::CREATED, "{}", text(&bytes));
+    let id2 = json_body(&bytes)["request_id"].as_str().unwrap().to_string();
+    let (status, _, _) = send(Method::PUT, "/api/node/casegen-requests/claim".into(), world.node, String::new()).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _, bytes) = send(Method::PUT, format!("/api/casegen-requests/{id2}/result"), world.node, body(true, good)).await;
+    assert_eq!(status, StatusCode::OK, "{}", text(&bytes));
+    let done = json_body(&bytes);
+    assert_eq!(done["status"], "finished");
+    let code = done["codes"][0].as_str().unwrap().to_string();
+    assert!(code.starts_with("GEN-"), "{code}");
+    let row: (String, String, String, bool) = sqlx::query_as("select origin, review_status, status, module_id is not null from test_cases where code = $1").bind(&code).fetch_one(world.state.pool()).await.unwrap();
+    assert_eq!(row, ("generated".into(), "draft".into(), "active".into(), true));
+    // 草稿不能执行：创建任务被拒并说明原因；老用例不受影响
+    let (status, _, bytes) = browser_post(&world.app, "/api/tasks", payload(world.node, &[&code])).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(text(&bytes).contains("还没有通过复核和人工确认"), "{}", text(&bytes));
+    let (status, _, _) = browser_post(&world.app, "/api/tasks", payload(world.node, &["TC-04"])).await;
+    assert_eq!(status, StatusCode::CREATED);
+    // 模块列表能看到草稿数量
+    let (_, _, bytes) = request(&world.app, Method::GET, "/api/projects/hafa/modules", &[], "").await;
+    assert_eq!(json_body(&bytes)[0]["case_count"], 1);
+    assert_eq!(json_body(&bytes)[0]["approved_count"], 0);
+}
+
+#[tokio::test]
+async fn 生成请求按节点上报的测试用例角色校验() {
+    let world = World::new().await;
+    let path = "/api/projects/hafa/casegen-requests";
+    let writer = |id: &str, status| report_role(id, protocol::RoleSlot::CaseWriter, ModelSource::ClaudeCli, "m", &[], None, status);
+    // 节点上报了角色但没有测试用例角色：拒绝并提示去配置
+    world.state.set_roles_report_for_test(world.node, protocol::RolesReport { roles: vec![report_role("e", protocol::RoleSlot::Executor, ModelSource::CodexExec, "m", &["high"], Some("high"), protocol::CheckStatus::Ok)] });
+    let (status, _, bytes) = browser_post(&world.app, path, casegen_body(world.node, "语聊房")).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(text(&bytes).contains("还没有配置「测试用例」角色"), "{}", text(&bytes));
+    // 有但没检测通过：拒绝；指定了没检测通过的角色：拒绝并说明是哪个，不退回别的
+    world.state.set_roles_report_for_test(world.node, protocol::RolesReport { roles: vec![writer("w-bad", protocol::CheckStatus::Failed), writer("w-ok", protocol::CheckStatus::Ok)] });
+    let mut body = casegen_body(world.node, "语聊房");
+    body["writer_role"] = json!("w-bad");
+    let (status, _, bytes) = browser_post(&world.app, path, body).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(text(&bytes).contains("还没有检测通过") && text(&bytes).contains("角色-w-bad"), "{}", text(&bytes));
+    let mut body = casegen_body(world.node, "语聊房");
+    body["writer_role"] = json!("不存在");
+    assert_eq!(browser_post(&world.app, path, body).await.0, StatusCode::BAD_REQUEST);
+    // 不指定：用第一个检测通过的，并记在请求里
+    let (status, _, bytes) = browser_post(&world.app, path, casegen_body(world.node, "语聊房")).await;
+    assert_eq!(status, StatusCode::CREATED, "{}", text(&bytes));
+    let id: Uuid = json_body(&bytes)["request_id"].as_str().unwrap().parse().unwrap();
+    let stored: Option<String> = sqlx::query_scalar("select writer_role from casegen_requests where id = $1").bind(id).fetch_one(world.state.pool()).await.unwrap();
+    assert_eq!(stored.as_deref(), Some("w-ok"));
+}
+
 struct World {
     temp: TempPaths,
     app: Router,

@@ -77,6 +77,11 @@ impl RoleStore {
         }
     }
 
+    /// 当前的角色配置（不含 Key、不含检测结果）。
+    pub fn configs(&self) -> Vec<RoleConfig> {
+        self.state.lock().unwrap().roles.clone()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.state.lock().unwrap().roles.is_empty()
     }

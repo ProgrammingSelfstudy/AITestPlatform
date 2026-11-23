@@ -391,13 +391,32 @@ pub(crate) async fn api_create_request(
     headers: HeaderMap,
     body: Result<Json<CasegenInput>, JsonRejection>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
-    let Json(input) = body.map_err(|_| (StatusCode::BAD_REQUEST, "请求格式无效，或内容太大（截图合计不要超过约 18MB）".to_string()))?;
+    let Json(mut input) = body.map_err(|_| (StatusCode::BAD_REQUEST, "请求格式无效，或内容太大（截图合计不要超过约 18MB）".to_string()))?;
     // 先校验必填和格式，再校验身份和节点属主：缺项的提示不依赖库
     let validated = validate(&input).map_err(|e| api_error(e, "校验失败"))?;
     let token = headers.get("x-user-token").and_then(|h| h.to_str().ok()).unwrap_or_default();
     let user = crate::api::owner_check(&state, token, input.node_id).await?;
     if !state.app.node_exists(input.node_id).await.map_err(|e| internal("查询节点失败", e))? {
         return Err((StatusCode::NOT_FOUND, "没有这个节点".to_string()));
+    }
+    // 节点上报过角色（新版节点）：必须有检测通过的「测试用例」角色。请求没指定就用第一个检测通过的；
+    // 指定了就必须是它，不退回别的。没上报过（旧版节点）不拦，节点领取时会如实报没有角色
+    if let Some(report) = state.app.roles_report(input.node_id) {
+        let writers: Vec<_> = report.roles.iter().filter(|r| r.config.slot == protocol::RoleSlot::CaseWriter).collect();
+        if writers.is_empty() {
+            return Err((StatusCode::BAD_REQUEST, "该节点还没有配置「测试用例」角色，请先在「角色与模型」页配置并检测".to_string()));
+        }
+        let chosen = match input.writer_role.as_deref() {
+            Some(id) => writers.iter().find(|r| r.config.id == id).ok_or((StatusCode::BAD_REQUEST, "所选的测试用例角色不在该节点的配置里".to_string()))?,
+            None => writers
+                .iter()
+                .find(|r| r.check.status == protocol::CheckStatus::Ok)
+                .ok_or((StatusCode::BAD_REQUEST, "该节点的测试用例角色都还没有检测通过，请先在「角色与模型」页检测".to_string()))?,
+        };
+        if chosen.check.status != protocol::CheckStatus::Ok {
+            return Err((StatusCode::BAD_REQUEST, format!("测试用例角色「{}」还没有检测通过（当前：{:?}），请先在「角色与模型」页检测", chosen.config.name, chosen.check.status)));
+        }
+        input.writer_role = Some(chosen.config.id.clone());
     }
     let created = create_request(state.app.pool(), &project, user, &input, &validated).await.map_err(|e| api_error(e, "创建生成请求失败"))?;
     Ok((StatusCode::CREATED, Json(serde_json::json!({ "request_id": created.request_id, "module_id": created.module_id, "doc_id": created.doc_id }))))
@@ -406,6 +425,234 @@ pub(crate) async fn api_create_request(
 pub(crate) async fn api_request_detail(State(state): State<ApiState>, Path(id): Path<String>) -> Result<Json<RequestDetail>, ApiError> {
     let id: Uuid = id.parse().map_err(|_| (StatusCode::NOT_FOUND, "没有这个生成请求".to_string()))?;
     request_detail(state.app.pool(), id).await.map(Json).map_err(|e| api_error(e, "查询生成请求失败"))
+}
+
+// ---------------------------------------------------------------- 节点侧：领取、回报生成结果
+
+/// 领取后超过这么久还没回报，当作节点没有回报。
+pub const CLAIM_TIMEOUT_MINUTES: i32 = 30;
+pub const MAX_CASES: usize = 40;
+
+#[derive(Debug, Serialize)]
+pub struct ClaimedShot {
+    pub content_type: String,
+    pub data_b64: String,
+}
+
+/// 节点领到的生成任务。文档和截图随请求一起给，节点不需要再来取。
+#[derive(Debug, Serialize)]
+pub struct Claimed {
+    pub id: Uuid,
+    pub project: String,
+    pub module: String,
+    pub doc: String,
+    pub ui_links: Vec<String>,
+    pub screenshots: Vec<ClaimedShot>,
+    pub writer_role: Option<String>,
+}
+
+pub async fn claim(pool: &PgPool, node_id: Uuid) -> Res<Option<Claimed>> {
+    let mut tx = pool.begin().await?;
+    // 领走太久没回报的请求转失败，免得一直占着「同模块只能有一个未结束请求」
+    sqlx::query(
+        "update casegen_requests set status = 'failed', detail = '节点没有回报生成结果（超时）', finished_at = now()
+         where status = 'running' and claimed_at < now() - make_interval(mins => $1)",
+    )
+    .bind(CLAIM_TIMEOUT_MINUTES)
+    .execute(&mut *tx)
+    .await?;
+    let Some(row) = sqlx::query(
+        "select r.id, r.ui_links, r.writer_role, m.name as module, p.name as project, d.content
+         from casegen_requests r
+         join modules m on m.id = r.module_id join projects p on p.id = r.project_id join project_docs d on d.id = r.doc_id
+         where r.node_id = $1 and r.status = 'queued' order by r.requested_at limit 1 for update of r skip locked",
+    )
+    .bind(node_id)
+    .fetch_optional(&mut *tx)
+    .await?
+    else {
+        tx.commit().await?;
+        return Ok(None);
+    };
+    let id: Uuid = row.get("id");
+    sqlx::query("update casegen_requests set status = 'running', claimed_at = now() where id = $1").bind(id).execute(&mut *tx).await?;
+    let shots = sqlx::query("select content_type, bytes from casegen_screenshots where request_id = $1 order by seq")
+        .bind(id)
+        .fetch_all(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    let links: serde_json::Value = row.get("ui_links");
+    Ok(Some(Claimed {
+        id,
+        project: row.get("project"),
+        module: row.get("module"),
+        doc: row.get("content"),
+        ui_links: links.as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_owned)).collect()).unwrap_or_default(),
+        screenshots: shots
+            .iter()
+            .map(|s| ClaimedShot {
+                content_type: s.get("content_type"),
+                data_b64: base64::engine::general_purpose::STANDARD.encode(s.get::<Vec<u8>, _>("bytes")),
+            })
+            .collect(),
+        writer_role: row.get("writer_role"),
+    }))
+}
+
+/// 去掉模型可能加的代码围栏，按单独一行的 `---` 切成多个 YAML 文档。
+pub fn split_case_docs(text: &str) -> Vec<String> {
+    let mut docs = vec![String::new()];
+    for line in text.lines() {
+        let trimmed = line.trim_end();
+        if trimmed.trim_start().starts_with("```") {
+            continue;
+        }
+        if trimmed == "---" {
+            docs.push(String::new());
+            continue;
+        }
+        let last = docs.last_mut().expect("至少有一项");
+        last.push_str(trimmed);
+        last.push('\n');
+    }
+    docs.retain(|d| !d.trim().is_empty());
+    docs
+}
+
+/// 解析并校验生成的用例：和导入用例同一套规则（`parse_case`），再加几条对「模型写的」更严的：
+/// 编号由平台分配（不信模型给的，免得覆盖已有用例）、不能是「故意失败」级别、文字里不能有明文密码。
+/// **任何一条不合格整批拒收**，错误里不回显值。
+pub fn parse_generated(request_id: Uuid, text: &str) -> Result<Vec<crate::cases::NewCase>, String> {
+    let docs = split_case_docs(text);
+    if docs.is_empty() {
+        return Err("模型没有输出任何用例".into());
+    }
+    if docs.len() > MAX_CASES {
+        return Err(format!("模型输出了 {} 条用例，超过上限 {MAX_CASES}，整批拒收", docs.len()));
+    }
+    let short = &request_id.simple().to_string()[..6];
+    let mut cases = vec![];
+    let mut errors = vec![];
+    for (i, doc) in docs.iter().enumerate() {
+        let source = format!("第 {} 条用例", i + 1);
+        match crate::cases::parse_case(doc, &source) {
+            Err(e) => errors.push(e),
+            Ok(mut case) => {
+                if case.should_fail {
+                    errors.push(format!("{source}：生成的用例不能是「{}」级别", crate::cases::NEGATIVE_LEVEL));
+                    continue;
+                }
+                let joined = format!("{}\n{}\n{}\n{}\n{}", case.title, case.preconditions.join("\n"), case.steps.join("\n"), case.expected.iter().map(|e| e.text.as_str()).collect::<Vec<_>>().join("\n"), case.note);
+                if plain_password_line(&joined).is_some() {
+                    errors.push(format!("{source}：文字里疑似有明文密码（值未显示），账号密码只能用 {{{{account.xxx}}}} 占位符"));
+                    continue;
+                }
+                case.code = format!("GEN-{short}-{:02}", i + 1);
+                cases.push(case);
+            }
+        }
+    }
+    if errors.is_empty() { Ok(cases) } else { Err(errors.join("；")) }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FinishInput {
+    /// 节点是否拿到了模型的输出
+    pub ok: bool,
+    /// 失败原因，或成功时的说明（已脱敏）
+    pub detail: String,
+    /// 模型输出的用例文本（YAML，多条用 `---` 分隔）
+    #[serde(default)]
+    pub cases_text: Option<String>,
+}
+
+pub struct Finished {
+    pub status: &'static str,
+    pub detail: String,
+    pub codes: Vec<String>,
+}
+
+/// 回报结果：只有领走它的节点、且仍在运行中才能回报。成功时用例以 `draft` 入库（不能执行，要先复核和人工确认）。
+pub async fn finish(pool: &PgPool, node_id: Uuid, id: Uuid, input: &FinishInput) -> Res<Finished> {
+    let mut tx = pool.begin().await?;
+    let row = sqlx::query(
+        "select r.node_id, r.status, r.project_id, r.module_id from casegen_requests r where r.id = $1 for update",
+    )
+    .bind(id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(|| ModuleError::NotFound("没有这个生成请求".into()))?;
+    if row.get::<Uuid, _>("node_id") != node_id {
+        return Err(ModuleError::Conflict("这个生成请求不是你的节点领走的".into()));
+    }
+    if row.get::<String, _>("status") != "running" {
+        return Err(ModuleError::Conflict("这个生成请求已经不在运行中".into()));
+    }
+    let detail: String = input.detail.chars().take(1800).collect();
+    let (status, detail, codes) = if !input.ok {
+        ("failed", detail, vec![])
+    } else {
+        match parse_generated(id, input.cases_text.as_deref().unwrap_or("")) {
+            Err(why) => ("failed", format!("生成的用例没有通过校验，整批没有入库：{}", why.chars().take(1700).collect::<String>()), vec![]),
+            Ok(cases) => {
+                let project_id: Uuid = row.get("project_id");
+                let module_id: Uuid = row.get("module_id");
+                for c in &cases {
+                    sqlx::query(
+                        "insert into test_cases (project_id, code, title, level, platforms, preconditions, steps, expected, data, refs, note, should_fail, status, module_id, origin, review_status)
+                         values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,false,'active',$12,'generated','draft')",
+                    )
+                    .bind(project_id)
+                    .bind(&c.code)
+                    .bind(&c.title)
+                    .bind(&c.level)
+                    .bind(&c.platforms)
+                    .bind(serde_json::json!(c.preconditions))
+                    .bind(serde_json::json!(c.steps))
+                    .bind(serde_json::to_value(&c.expected).expect("可序列化"))
+                    .bind(&c.data)
+                    .bind(serde_json::json!(c.refs))
+                    .bind(&c.note)
+                    .bind(module_id)
+                    .execute(&mut *tx)
+                    .await?;
+                }
+                let codes: Vec<String> = cases.iter().map(|c| c.code.clone()).collect();
+                ("finished", format!("生成了 {} 条用例（草稿，待复核）", codes.len()), codes)
+            }
+        }
+    };
+    sqlx::query("update casegen_requests set status = $2, detail = $3, finished_at = now() where id = $1")
+        .bind(id)
+        .bind(status)
+        .bind(&detail)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(Finished { status, detail, codes })
+}
+
+pub(crate) async fn api_claim(State(state): State<ApiState>, headers: HeaderMap) -> Result<axum::response::Response, ApiError> {
+    use axum::response::IntoResponse;
+    let node_id = crate::node_identity(&state.app, &headers).await.map_err(|status| (status, String::new()))?;
+    match claim(state.app.pool(), node_id).await.map_err(|e| api_error(e, "领取生成请求失败"))? {
+        Some(claimed) => Ok(Json(claimed).into_response()),
+        None => Ok(StatusCode::NO_CONTENT.into_response()),
+    }
+}
+
+pub(crate) async fn api_finish(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    body: Result<Json<FinishInput>, JsonRejection>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let node_id = crate::node_identity(&state.app, &headers).await.map_err(|status| (status, String::new()))?;
+    let id: Uuid = id.parse().map_err(|_| (StatusCode::NOT_FOUND, "没有这个生成请求".to_string()))?;
+    let Json(input) = body.map_err(|_| (StatusCode::BAD_REQUEST, "请求格式不对，或内容太大".to_string()))?;
+    let done = finish(state.app.pool(), node_id, id, &input).await.map_err(|e| api_error(e, "回报生成结果失败"))?;
+    Ok(Json(serde_json::json!({ "status": done.status, "detail": done.detail, "codes": done.codes })))
 }
 
 #[cfg(test)]
@@ -502,5 +749,43 @@ mod tests {
         let mut i = input();
         i.doc = "需".repeat(MAX_DOC_CHARS + 1);
         assert!(message(&i).contains("太长"));
+    }
+
+    const GOOD_CASE: &str = "id: G1\ntitle: 进入语聊房\nlevel: 简单流程\nplatform: [android]\nsteps:\n  - 点击首页的语聊房入口\nexpected:\n  - 出现语聊房页面\n";
+
+    #[test]
+    fn 生成的用例拆分_去围栏_编号由平台分配() {
+        let id = Uuid::parse_str("abcdef12-0000-0000-0000-000000000000").unwrap();
+        let text = format!("```yaml\n{GOOD_CASE}---\n{}\n```\n", GOOD_CASE.replace("G1", "AnyId-7").replace("进入语聊房", "退出语聊房"));
+        let cases = parse_generated(id, &text).unwrap();
+        assert_eq!(cases.iter().map(|c| c.code.as_str()).collect::<Vec<_>>(), ["GEN-abcdef-01", "GEN-abcdef-02"]);
+        assert_eq!(cases[1].title, "退出语聊房");
+        assert!(cases.iter().all(|c| !c.should_fail));
+    }
+
+    #[test]
+    fn 生成的用例任何一条不合格整批拒收_错误不回显密码() {
+        let id = Uuid::new_v4();
+        // 没有预期
+        let bad = "id: G2\ntitle: 没有预期\nsteps:\n  - 点击\nexpected: []\n";
+        let err = parse_generated(id, &format!("{GOOD_CASE}---\n{bad}")).unwrap_err();
+        assert!(err.contains("第 2 条用例") && err.contains("expected"), "{err}");
+        // data 里写了明文账号
+        let plain = "id: G3\ntitle: 登录\nsteps:\n  - 登录\nexpected:\n  - 登录成功\ndata:\n  password: hunter2\n";
+        let err = parse_generated(id, plain).unwrap_err();
+        assert!(!err.contains("hunter2"), "{err}");
+        // 步骤文字里的明文密码
+        let in_steps = "id: G4\ntitle: 登录\nsteps:\n  - 输入密码：hunter2\nexpected:\n  - 登录成功\n";
+        let err = parse_generated(id, in_steps).unwrap_err();
+        assert!(err.contains("明文密码") && !err.contains("hunter2"), "{err}");
+        // 占位符放行
+        let ok = "id: G5\ntitle: 登录\nsteps:\n  - 输入密码：{{account.password}}\nexpected:\n  - 登录成功\n";
+        assert!(parse_generated(id, ok).is_ok());
+        // 不能是「故意失败」级别；空输出；太多
+        let negative = GOOD_CASE.replace("简单流程", "故意失败");
+        assert!(parse_generated(id, &negative).unwrap_err().contains("故意失败"));
+        assert!(parse_generated(id, "  \n").unwrap_err().contains("没有输出"));
+        let many = vec![GOOD_CASE; MAX_CASES + 1].join("---\n");
+        assert!(parse_generated(id, &many).unwrap_err().contains("超过上限"));
     }
 }

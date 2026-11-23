@@ -47,6 +47,7 @@ dependencies = [
 name = "agent"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "device",
  "libc",
  "mcp-device",
@@ -1437,6 +1438,7 @@ dependencies = [
  "agent",
  "anyhow",
  "axum",
+ "base64 0.22.1",
  "chrono",
  "device",
  "futures-util",

@@ -59,6 +59,8 @@ pub(crate) fn routes(app: AppState, paths: Paths) -> Router {
                 .layer(axum::extract::DefaultBodyLimit::max(32 * 1024 * 1024)),
         )
         .route("/api/casegen-requests/{id}", get(crate::modules::api_request_detail))
+        .route("/api/node/casegen-requests/claim", put(crate::modules::api_claim))
+        .route("/api/casegen-requests/{id}/result", put(crate::modules::api_finish).layer(axum::extract::DefaultBodyLimit::max(2 * 1024 * 1024)))
         .route("/api/nodes/{id}/roles", post(set_node_roles).route_layer(authorize_write.clone()).get(node_roles))
         .route("/api/nodes/{id}/roles/init-template", post(init_node_roles).route_layer(authorize_write.clone()))
         .route("/api/nodes/{id}/roles/{role}/check", post(check_node_role).route_layer(authorize_write.clone()))

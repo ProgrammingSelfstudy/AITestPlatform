@@ -3,6 +3,7 @@
 //! 节点**主动连**服务端，不需要公网 IP。P1 起再接任务执行。
 //! 节点令牌从环境变量读取。测试账号凭证只走单独的本机 HTTP 接口，不经过 WebSocket。
 
+pub mod casegen_run;
 pub mod real;
 pub mod roles;
 mod recorder;

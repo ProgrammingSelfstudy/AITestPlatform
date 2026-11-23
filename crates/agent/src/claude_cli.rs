@@ -15,7 +15,7 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use serde::Serialize;
-use serde_json::Value;
+use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::time::Instant;
@@ -56,6 +56,9 @@ pub struct ClaudeOpts {
     pub stall_timeout: Duration,
     /// 整次调用的总时限
     pub total_timeout: Duration,
+    /// 随提示词一起给模型看的图片 `(媒体类型, base64)`。非空时改用 `--input-format stream-json`，
+    /// 图片作为用户消息里的图片块传入，不需要给模型任何读文件的工具
+    pub images: Vec<(String, String)>,
 }
 
 impl Default for ClaudeOpts {
@@ -72,6 +75,7 @@ impl Default for ClaudeOpts {
             cwd: None,
             stall_timeout: Duration::from_secs(120),
             total_timeout: Duration::from_secs(900),
+            images: vec![],
         }
     }
 }
@@ -238,7 +242,27 @@ fn build_args(o: &ClaudeOpts) -> Vec<String> {
     if let Some(p) = &o.mcp_config {
         a.extend(["--mcp-config".into(), p.to_string_lossy().into_owned(), "--strict-mcp-config".into()]);
     }
+    if !o.images.is_empty() {
+        a.extend(["--input-format".into(), "stream-json".into()]);
+    }
     a
+}
+
+/// 带图片的输入：一行 NDJSON 用户消息，图片块在前，文字在后。
+#[doc(hidden)]
+pub fn stream_json_input_for_test(images: &[(String, String)], prompt: &str) -> String {
+    stream_json_input(images, prompt)
+}
+
+fn stream_json_input(images: &[(String, String)], prompt: &str) -> String {
+    let mut content: Vec<Value> = images
+        .iter()
+        .map(|(media_type, data)| json!({"type": "image", "source": {"type": "base64", "media_type": media_type, "data": data}}))
+        .collect();
+    content.push(json!({"type": "text", "text": prompt}));
+    let mut line = json!({"type": "user", "message": {"role": "user", "content": content}}).to_string();
+    line.push('\n');
+    line
 }
 
 fn command(opts: &ClaudeOpts) -> Command {
@@ -328,7 +352,8 @@ async fn run_inner(opts: &ClaudeOpts, prompt: &str, text_only: bool) -> Outcome 
 
     if let Some(mut stdin) = child.stdin.take() {
         // 写完立刻关闭，命令行才会开始处理
-        if let Err(e) = stdin.write_all(prompt.as_bytes()).await {
+        let payload = if opts.images.is_empty() { prompt.to_string() } else { stream_json_input(&opts.images, prompt) };
+        if let Err(e) = stdin.write_all(payload.as_bytes()).await {
             tracing::warn!("写入提示词失败：{e}");
         }
         drop(stdin);

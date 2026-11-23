@@ -166,7 +166,7 @@ pub async fn create_task(pool: &PgPool, t: &NewTask) -> Res<TaskCreated> {
     let mut run_ids = vec![];
     let mut problems = vec![];
     for code in &t.case_codes {
-        let Some(r) = sqlx::query("select id, status, blocked_reason, version from test_cases where project_id = $1 and code = $2").bind(project_id).bind(code).fetch_optional(&mut *tx).await? else {
+        let Some(r) = sqlx::query("select id, status, blocked_reason, version, review_status from test_cases where project_id = $1 and code = $2").bind(project_id).bind(code).fetch_optional(&mut *tx).await? else {
             problems.push(format!("{code} 不存在"));
             continue;
         };
@@ -174,6 +174,12 @@ pub async fn create_task(pool: &PgPool, t: &NewTask) -> Res<TaskCreated> {
         if status != "active" {
             let why: Option<String> = r.get("blocked_reason");
             problems.push(format!("{code} 是 {status} 状态{}", why.map(|w| format!("（{w}）")).unwrap_or_default()));
+            continue;
+        }
+        // 生成的用例要先经评审员复核和人工确认（approved）才能执行；导入的老用例默认 approved
+        let review: String = r.get("review_status");
+        if review != "approved" {
+            problems.push(format!("{code} 还没有通过复核和人工确认（当前：{review}）"));
             continue;
         }
         let case_id: Uuid = r.get("id");

@@ -219,6 +219,28 @@ async fn main() -> anyhow::Result<()> {
     if !allow.is_empty() {
         tracing::info!("设备白名单：{allow:?}");
     }
+    // 用例生成不需要设备：只要连得上平台就接页面发起的生成请求，用本机「测试用例」角色的模型生成
+    {
+        let (ws, state_dir, token) = (cfg.url.clone(), cfg.state_dir.clone(), cfg.token.clone());
+        let allow_insecure = std::env::var("NODE_ALLOW_INSECURE").is_ok_and(|v| v == "1");
+        tokio::spawn(async move {
+            // node_id 要等节点第一次连上服务端才有，所以拿不到时隔几秒重试
+            let (platform, node_id) = loop {
+                let attempt = platform_http(&ws, allow_insecure)
+                    .and_then(|url| node::load_node_id(&state_dir).map(|id| (url, id)).context("还没有 node_id"));
+                match attempt {
+                    Ok(found) => break found,
+                    Err(error) => {
+                        tracing::info!("暂时不能接收用例生成请求，稍后重试：{error:#}");
+                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    }
+                }
+            };
+            node::load_node_secret(&state_dir);
+            tracing::info!("接收页面发起的用例生成请求");
+            node::casegen_run::serve(node::casegen_run::CasegenConfig { platform_http: platform, node_token: token, node_id, state_dir }, std::time::Duration::from_secs(5)).await;
+        });
+    }
     // 配了 HAFA_PYTHON 就具备真实执行能力；否则领到任务只会如实报受阻
     match real_config(&cfg)? {
         Some(rc) => {
