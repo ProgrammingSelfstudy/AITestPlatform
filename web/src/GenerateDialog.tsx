@@ -18,8 +18,8 @@ import { readReviewToken, rememberReviewToken, writeTokenAction } from "./review
 import ReviewTokenDialog from "./ReviewTokenDialog";
 import { LoadError } from "./runUi";
 import { REFRESH_MS, usePolling } from "./usePolling";
-import UserTokenHint from "./UserTokenHint";
-import { useRememberedUserToken } from "./userToken";
+import IdentityHint from "./IdentityHint";
+import { useRememberedUserName } from "./identity";
 import "./modules.css";
 
 const project = "hafa";
@@ -62,7 +62,7 @@ interface ValidationErrors {
   links?: string;
   screenshots?: string;
   node?: string;
-  userToken?: string;
+  userName?: string;
   writerRole?: string;
   reviewerRole?: string;
 }
@@ -166,7 +166,7 @@ export default function GenerateDialog({ onClose }: { onClose: () => void }) {
     [nodes],
   );
 
-  // 表单状态（个人令牌仅存组件内存，不写 localStorage，不回显）
+  // 表单状态（「我是谁」只记名字，在本浏览器记 30 天）
   const [moduleName, setModuleName] = useState("");
   const [doc, setDoc] = useState("");
   const [docUploadNote, setDocUploadNote] = useState<string | null>(null);
@@ -176,10 +176,10 @@ export default function GenerateDialog({ onClose }: { onClose: () => void }) {
   const [dragOver, setDragOver] = useState(false);
 
   const [nodeId, setNodeId] = useState("");
-  const { token: userToken, setToken: setUserToken, expiresAt: tokenExpiresAt, forget: forgetToken } = useRememberedUserToken();
-  const trimmedToken = userToken.trim();
+  const { name: userName, setName: setUserName, expiresAt: nameExpiresAt, forget: forgetName } = useRememberedUserName();
+  const trimmedName = userName.trim();
 
-  // 节点角色拉取（节点 + 令牌都填完后拉一次，也支持手动刷新）
+  // 节点角色拉取（节点 + 名字都填完后拉一次，也支持手动刷新）
   const [rolesState, setRolesState] = useState<{
     loading: boolean;
     error: string | null;
@@ -219,18 +219,18 @@ export default function GenerateDialog({ onClose }: { onClose: () => void }) {
 
   const nodeRolesOffline = Boolean(
     (selectedNodeRecord && !selectedNodeRecord.online) ||
-    (rolesState.data && rolesState.forKey === `${nodeId}\0${trimmedToken}` && !rolesState.data.online),
+    (rolesState.data && rolesState.forKey === `${nodeId}\0${trimmedName}` && !rolesState.data.online),
   );
 
-  // 节点与个人令牌都就绪后，拉取一次节点角色（带轻微防抖，避免输入令牌时每个字符都请求）
+  // 节点与名字都就绪后，拉取一次节点角色（带轻微防抖，避免输入名字时每个字符都请求）
   useEffect(() => {
-    if (!nodeId || !trimmedToken) {
+    if (!nodeId || !trimmedName) {
       setRolesState({ loading: false, error: null, data: null, forKey: "" });
       setWriterRole("");
       setReviewerRole("");
       return;
     }
-    const key = `${nodeId}\0${trimmedToken}`;
+    const key = `${nodeId}\0${trimmedName}`;
     const controller = new AbortController();
     const timer = window.setTimeout(() => {
       setRolesState((prev) => ({
@@ -239,7 +239,7 @@ export default function GenerateDialog({ onClose }: { onClose: () => void }) {
         data: prev.forKey === key ? prev.data : null,
         forKey: key,
       }));
-      void fetchNodeRoles(nodeId, trimmedToken, controller.signal)
+      void fetchNodeRoles(nodeId, trimmedName, controller.signal)
         .then((payload) => {
           if (controller.signal.aborted) return;
           setRolesState({ loading: false, error: null, data: payload, forKey: key });
@@ -255,20 +255,20 @@ export default function GenerateDialog({ onClose }: { onClose: () => void }) {
       window.clearTimeout(timer);
       controller.abort();
     };
-  }, [nodeId, trimmedToken, rolesRefreshSeq]);
+  }, [nodeId, trimmedName, rolesRefreshSeq]);
 
   const currentRoles: RoleView[] = useMemo(() => {
-    const key = `${nodeId}\0${trimmedToken}`;
+    const key = `${nodeId}\0${trimmedName}`;
     if (rolesState.forKey !== key || !rolesState.data || !rolesState.data.online) {
       return [];
     }
     return rolesState.data.roles;
-  }, [nodeId, trimmedToken, rolesState]);
+  }, [nodeId, trimmedName, rolesState]);
 
   const rolesLoaded = Boolean(
     nodeId &&
-    trimmedToken &&
-    rolesState.forKey === `${nodeId}\0${trimmedToken}` &&
+    trimmedName &&
+    rolesState.forKey === `${nodeId}\0${trimmedName}` &&
     !rolesState.loading &&
     rolesState.data !== null,
   );
@@ -514,11 +514,11 @@ export default function GenerateDialog({ onClose }: { onClose: () => void }) {
       nextErrors.node = "所选节点已离线，请先启动节点或切换其他在线节点";
     }
 
-    if (!trimmedToken) {
-      nextErrors.userToken = "请输入个人令牌";
+    if (!trimmedName) {
+      nextErrors.userName = "请填「我是谁」（你的名字）";
     }
 
-    if (nodeId && trimmedToken && !nodeRolesOffline) {
+    if (nodeId && trimmedName && !nodeRolesOffline) {
       if (rolesState.loading) {
         nextErrors.writerRole = "正在读取节点角色，请稍候";
       } else if (rolesState.error) {
@@ -549,7 +549,7 @@ export default function GenerateDialog({ onClose }: { onClose: () => void }) {
   async function submitInput(input: CasegenInput, enteredToken?: string) {
     if (submitLock.current || (pendingInput && enteredToken === undefined)) return;
     const token = enteredToken ?? readReviewToken();
-    const ready = Boolean(nodeId && trimmedToken && !nodeRolesOffline && !submitting);
+    const ready = Boolean(nodeId && trimmedName && !nodeRolesOffline && !submitting);
     const step = writeTokenAction(ready, token);
     if (step === "blocked") {
       setPendingInput(null);
@@ -566,7 +566,7 @@ export default function GenerateDialog({ onClose }: { onClose: () => void }) {
     setPendingInput(null);
     setSubmitting(true);
     try {
-      const result = await createCasegenRequest(project, input, token, trimmedToken);
+      const result = await createCasegenRequest(project, input, token, trimmedName);
       window.location.hash = `#/modules/${encodeURIComponent(result.module_id)}`;
       onClose();
     } catch (err) {
@@ -849,7 +849,7 @@ export default function GenerateDialog({ onClose }: { onClose: () => void }) {
           {errors.screenshots && <div className="mod-field-error">{errors.screenshots}</div>}
         </div>
 
-        {/* 5. 执行节点与个人令牌 */}
+        {/* 5. 执行节点与我是谁 */}
         <div className="mod-gen-two-col">
           <div className="mod-field">
             <div className="mod-field-head">
@@ -886,23 +886,23 @@ export default function GenerateDialog({ onClose }: { onClose: () => void }) {
 
           <div className="mod-field">
             <div className="mod-field-head">
-              <RequiredLabel text="个人令牌" />
-              <UserTokenHint className="mod-field-meta" expiresAt={tokenExpiresAt} onForget={forgetToken} onToken={setUserToken} />
+              <RequiredLabel text="我是谁" />
+              <IdentityHint className="mod-field-meta" expiresAt={nameExpiresAt} onForget={forgetName} />
             </div>
-            <Input.Password
-              aria-label="个人令牌"
+            <Input
+              aria-label="我是谁"
               autoComplete="off"
-              visibilityToggle={false}
+              maxLength={40}
               allowClear
               disabled={busy}
-              value={userToken}
-              placeholder="输入个人令牌后自动加载节点角色"
+              value={userName}
+              placeholder="你的名字，和启动节点时设的 NODE_USER_NAME 一致"
               onChange={(event) => {
-                setUserToken(event.target.value);
-                setErrors((prev) => ({ ...prev, userToken: undefined }));
+                setUserName(event.target.value);
+                setErrors((prev) => ({ ...prev, userName: undefined }));
               }}
             />
-            {errors.userToken && <div className="mod-field-error">{errors.userToken}</div>}
+            {errors.userName && <div className="mod-field-error">{errors.userName}</div>}
           </div>
         </div>
 
@@ -916,7 +916,7 @@ export default function GenerateDialog({ onClose }: { onClose: () => void }) {
           />
         )}
 
-        {nodeRolesOffline && nodeId && trimmedToken && (
+        {nodeRolesOffline && nodeId && trimmedName && (
           <Alert
             type="warning"
             showIcon
@@ -930,7 +930,7 @@ export default function GenerateDialog({ onClose }: { onClose: () => void }) {
           <div className="mod-field">
             <div className="mod-field-head">
               <RequiredLabel text="测试用例角色" />
-              {nodeId && trimmedToken && !nodeRolesOffline && (
+              {nodeId && trimmedName && !nodeRolesOffline && (
                 <button
                   type="button"
                   className="mod-thumb-del"
@@ -946,8 +946,8 @@ export default function GenerateDialog({ onClose }: { onClose: () => void }) {
               value={writerRole || undefined}
               disabled={busy || !rolesLoaded || nodeRolesOffline || writerRoles.length === 0}
               placeholder={
-                !nodeId || !trimmedToken
-                  ? "先选择节点并输入个人令牌"
+                !nodeId || !trimmedName
+                  ? "先选择节点并填「我是谁」"
                   : rolesState.loading
                     ? "正在读取角色…"
                     : "选择可用的测试用例角色"
@@ -1007,8 +1007,8 @@ export default function GenerateDialog({ onClose }: { onClose: () => void }) {
               value={reviewerRole || undefined}
               disabled={busy || !rolesLoaded || nodeRolesOffline || judgeRoles.length === 0}
               placeholder={
-                !nodeId || !trimmedToken
-                  ? "先选择节点并输入个人令牌"
+                !nodeId || !trimmedName
+                  ? "先选择节点并填「我是谁」"
                   : rolesState.loading
                     ? "正在读取角色…"
                     : "选择可用的判定员角色"

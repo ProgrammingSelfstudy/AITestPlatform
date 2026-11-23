@@ -16,8 +16,8 @@ import {
 } from "./api";
 import { readReviewToken, rememberReviewToken, writeTokenAction } from "./reviewLogic";
 import AppsPanel from "./AppsPanel";
-import UserTokenHint from "./UserTokenHint";
-import { useRememberedUserToken } from "./userToken";
+import IdentityHint from "./IdentityHint";
+import { useRememberedUserName } from "./identity";
 import ReviewTokenDialog from "./ReviewTokenDialog";
 import { formatDate, LoadError } from "./runUi";
 import { REFRESH_MS, usePolling } from "./usePolling";
@@ -269,10 +269,11 @@ function pipeAvailClass(status: CheckStatus): string {
 export default function RolesPage() {
   const [form] = Form.useForm<RoleFormValues>();
 
-  // 节点与个人令牌（令牌填完整后在本浏览器记 30 天，永不回显；API Key 仍不落本地存储）
+  // 节点与「我是谁」（只记名字、靠自觉；在本浏览器记 30 天；API Key 仍不落本地存储）。
+  // 数据是公开的，谁都能看；只有节点主人能改、能检测（花他自己的额度）
   const [selectedNodeId, setSelectedNodeId] = useState<string>("");
-  const { token: userToken, setToken: setUserToken, expiresAt: tokenExpiresAt, forget: forgetToken } = useRememberedUserToken();
-  const trimmedToken = userToken.trim();
+  const { name: userName, setName: setUserName, expiresAt: nameExpiresAt, forget: forgetName } = useRememberedUserName();
+  const trimmedName = userName.trim();
 
   // 节点列表轮询：数据未变时复用旧引用，避免无意义重渲染
   const nodesCacheRef = useRef<{ sig: string; data: NodeView[] } | null>(null);
@@ -299,15 +300,15 @@ export default function RolesPage() {
     }
   }, [onlineNodes, selectedNodeId]);
 
-  // 角色列表轮询：未填个人令牌或未选节点时不发请求；数据未变不触发重渲染或骨架屏闪烁
+  // 角色列表轮询：未选节点时不发请求（名字可以不填，只读查看）；数据未变不触发重渲染或骨架屏闪烁
   const rolesCacheRef = useRef<{ key: string; sig: string; value: RolesPollState } | null>(null);
   const loadRoles = useCallback(
     async (signal: AbortSignal): Promise<RolesPollState> => {
-      if (!selectedNodeId || !trimmedToken) {
+      if (!selectedNodeId) {
         return IDLE_POLL;
       }
-      const payload = await fetchNodeRoles(selectedNodeId, trimmedToken, signal);
-      const key = `${selectedNodeId}\0${trimmedToken}`;
+      const payload = await fetchNodeRoles(selectedNodeId, trimmedName, signal);
+      const key = `${selectedNodeId}\0${trimmedName}`;
       const sig = JSON.stringify(payload);
       if (
         rolesCacheRef.current &&
@@ -320,7 +321,7 @@ export default function RolesPage() {
       rolesCacheRef.current = { key, sig, value };
       return value;
     },
-    [selectedNodeId, trimmedToken],
+    [selectedNodeId, trimmedName],
   );
   const keepPollingRoles = useCallback((state: RolesPollState) => state.status === "loaded", []);
   const { data: rolesPoll, error: rolesError, reload: reloadRoles } = usePolling(
@@ -329,7 +330,7 @@ export default function RolesPage() {
     keepPollingRoles,
   );
 
-  const canQueryRoles = Boolean(selectedNodeId && trimmedToken);
+  const canQueryRoles = Boolean(selectedNodeId);
   const loadedForNode = rolesPoll?.status === "loaded" && rolesPoll.nodeId === selectedNodeId;
   const selectedNodeRecord = useMemo(
     () => nodes?.find((candidate) => candidate.node_id === selectedNodeId) ?? null,
@@ -344,6 +345,19 @@ export default function RolesPage() {
     [loadedForNode, rolesPoll],
   );
   const isInitialLoading = canQueryRoles && !loadedForNode && !rolesError && !isNodeOffline;
+  // 只有节点主人能改、能检测（花他自己的额度）；其他人只读。名字不是机密，靠自觉
+  const mine = loadedForNode ? rolesPoll.payload.mine : null;
+  const canAct = Boolean(trimmedName) && mine === true && !isNodeOffline;
+  const readOnlyReason: string | undefined = !selectedNodeId
+    ? "先在上面选一个在线节点"
+    : canAct
+      ? undefined
+      : !trimmedName
+        ? "你现在是只读：在上面填「我是谁」（你的名字）后，才能检查本机环境、创建和修改角色（只能改自己的节点）"
+        : loadedForNode && mine === false
+          ? (rolesPoll.payload.name_problem ?? "这是别人的节点：你能看，但只能修改和使用自己的节点（用的是各人自己的额度）")
+          : undefined;
+  const readOnly = !canAct;
 
   // 选中角色、本地未保存草稿、新增草稿
   const [selectedRoleId, setSelectedRoleId] = useState<string | null>(null);
@@ -360,7 +374,7 @@ export default function RolesPage() {
 
   const busy = busyAction !== null;
 
-  // 切换节点或清空令牌时立即清理草稿与临时状态（避免残留任何未保存内容或 Key）
+  // 切换节点或换了名字时立即清理草稿与临时状态（避免残留任何未保存内容或 Key）
   useEffect(() => {
     setSelectedRoleId(null);
     setDraftNewRole(null);
@@ -370,7 +384,7 @@ export default function RolesPage() {
     setActionError(null);
     setActionNotice(null);
     form.resetFields();
-  }, [selectedNodeId, trimmedToken, form]);
+  }, [selectedNodeId, trimmedName, form]);
 
   // 合并服务端角色与本地未保存新建角色，方便左栏与编辑区统一渲染
   const allDisplayRoles: RoleView[] = useMemo(() => {
@@ -672,7 +686,7 @@ export default function RolesPage() {
   async function executeWrite(intent: WriteIntent, enteredToken?: string) {
     if (submitLock.current || (pendingWrite && enteredToken === undefined)) return;
     const token = enteredToken ?? readReviewToken();
-    const ready = Boolean(selectedNodeId && trimmedToken && !isNodeOffline && !busy);
+    const ready = Boolean(selectedNodeId && canAct && !busy);
     const step = writeTokenAction(ready, token);
     if (step === "blocked") {
       setPendingWrite(null);
@@ -690,7 +704,7 @@ export default function RolesPage() {
     setActionNotice(null);
     try {
       if (intent.kind === "save") {
-        await saveNodeRoles(selectedNodeId, intent.payload, token, trimmedToken);
+        await saveNodeRoles(selectedNodeId, intent.payload, token, trimmedName);
         setDraftsById({});
         form.setFieldValue("apiKey", "");
         if (intent.createdId) {
@@ -702,13 +716,13 @@ export default function RolesPage() {
         }
         setActionNotice("角色配置已保存并下发到节点。");
       } else if (intent.kind === "init") {
-        await initNodeRoles(selectedNodeId, token, trimmedToken);
+        await initNodeRoles(selectedNodeId, token, trimmedName);
         setActionNotice("已用平台模板初始化角色并下发到节点，请逐个检测后再使用。");
       } else if (intent.kind === "check") {
-        await checkNodeRole(selectedNodeId, intent.roleId, token, trimmedToken);
+        await checkNodeRole(selectedNodeId, intent.roleId, token, trimmedName);
         setActionNotice(`已向节点发起「${intent.roleName}」检测，结果将通过轮询自动更新。`);
       } else {
-        await saveNodeRoles(selectedNodeId, intent.payload, token, trimmedToken);
+        await saveNodeRoles(selectedNodeId, intent.payload, token, trimmedName);
         setDraftsById((prev) => {
           const next = { ...prev };
           delete next[intent.roleId];
@@ -851,9 +865,7 @@ export default function RolesPage() {
     ? { tone: "unc", text: "节点离线" }
     : !selectedNodeId
       ? { tone: "que", text: onlineNodes.length > 0 ? "请选择节点" : "暂无在线节点" }
-      : !trimmedToken
-        ? { tone: "que", text: "等待输入个人令牌" }
-        : rolesError
+      : rolesError
           ? { tone: "fail", text: "读取异常" }
           : !loadedForNode
             ? { tone: "run", text: "正在同步" }
@@ -902,7 +914,7 @@ export default function RolesPage() {
                 )}
               </div>
               <div className="roles-hero-subnote">
-                仅能读取与修改你自己的在线节点；个人令牌和 API Key 都不回显，API Key 不落本地存储，个人令牌填一次会在本浏览器记 30 天。
+                数据大家都能看，只有节点主人能改、能检测（用的是他自己的额度）；API Key 不回显、不落本地存储。
               </div>
             </div>
           </div>
@@ -919,7 +931,7 @@ export default function RolesPage() {
             <div className="roles-kpi-caption">
               {loadedForNode && !isNodeOffline
                 ? `执行员 ${stats.executorsOk}/${stats.executors} 就绪 · 判定员 ${stats.judgesOk}/${stats.judges} 就绪`
-                : "连接在线节点并填入个人令牌后显示"}
+                : "选择在线节点后显示"}
             </div>
           </div>
 
@@ -954,7 +966,7 @@ export default function RolesPage() {
           </div>
         </div>
 
-        {/* 节点选择 + 个人令牌 */}
+        {/* 节点选择 + 我是谁 */}
         <div className="roles-hero-controls">
           <div className="roles-control-field">
             <label className="roles-control-label" htmlFor="roles-node-select">
@@ -978,20 +990,20 @@ export default function RolesPage() {
           </div>
 
           <div className="roles-control-field">
-            <label className="roles-control-label" htmlFor="roles-user-token">
-              <span>个人令牌</span>
-              <UserTokenHint className="roles-control-hint" expiresAt={tokenExpiresAt} onForget={forgetToken} onToken={setUserToken} />
+            <label className="roles-control-label" htmlFor="roles-user-name">
+              <span>我是谁</span>
+              <IdentityHint className="roles-control-hint" expiresAt={nameExpiresAt} onForget={forgetName} />
             </label>
-            <Input.Password
-              id="roles-user-token"
-              aria-label="个人令牌"
+            <Input
+              id="roles-user-name"
+              aria-label="我是谁"
               autoComplete="off"
-              visibilityToggle={false}
               allowClear
+              maxLength={40}
               disabled={busy}
-              value={userToken}
-              onChange={(event) => setUserToken(event.target.value)}
-              placeholder="输入个人令牌后自动读取该节点角色"
+              value={userName}
+              onChange={(event) => setUserName(event.target.value)}
+              placeholder="你的名字（不填也能看，只是不能改）"
             />
           </div>
 
@@ -1043,24 +1055,18 @@ export default function RolesPage() {
         </div>
       )}
 
-      {/* 选应用 → 检查本机环境 → 选模型创建角色。一进页面就显示；还不能用时卡片照常显示但点不了，并说明原因 */}
+      {/* 选应用 → 检查本机环境 → 选模型创建角色。一进页面就显示，所有人都能看；只有节点主人能点（只读时说明原因） */}
       <AppsPanel
         nodeId={selectedNodeId}
-        userToken={trimmedToken}
+        userName={trimmedName}
         online={!isNodeOffline}
         existingRoles={serverRoles}
         busy={busy}
         onCreateRoles={handleCreateFromApp}
-        lockedReason={
-          !selectedNodeId
-            ? "先在上面选一个在线节点，才能检查本机环境"
-            : !trimmedToken
-              ? "先在上面填入个人令牌（用来确认这个节点是你的），才能检查本机环境"
-              : undefined
-        }
+        readOnlyReason={readOnlyReason}
       />
 
-      {/* 门禁态：未选节点 / 未填个人令牌 / 节点离线 / 首次加载中 */}
+      {/* 门禁态：未选节点 / 节点离线 / 首次加载中 */}
       {!selectedNodeId ? (
         <section className="roles-gate-card" aria-label="等待选择在线节点">
           <Empty
@@ -1070,13 +1076,6 @@ export default function RolesPage() {
                 : "请先在顶部选择一个在线节点"
             }
           />
-        </section>
-      ) : !trimmedToken ? (
-        <section className="roles-gate-card" aria-label="等待输入个人令牌">
-          <h2 className="roles-gate-title">请输入个人令牌以读取角色配置</h2>
-          <p className="roles-gate-desc">
-            个人令牌用来向服务端验证所选节点归属于你；未填令牌前不会发起角色请求。填完整后会在本浏览器记住 30 天，随时可以点「忘记令牌」。
-          </p>
         </section>
       ) : isNodeOffline ? (
         <section className="roles-gate-card" aria-label="节点离线">
@@ -1106,7 +1105,7 @@ export default function RolesPage() {
                 该节点还没有配置角色，可以用平台模板一键初始化（不含 Key，之后可修改），或点击下方「新增角色」自己添加。
                 <Button
                   block
-                  disabled={busy || isNodeOffline}
+                  disabled={busy || isNodeOffline || readOnly}
                   loading={busyAction === "init"}
                   onClick={() => void executeWrite({ kind: "init" })}
                 >
@@ -1192,7 +1191,7 @@ export default function RolesPage() {
             <button
               type="button"
               className="roles-add-btn"
-              disabled={busy || isNodeOffline}
+              disabled={busy || isNodeOffline || readOnly}
               onClick={handleAddRole}
             >
               <span aria-hidden="true">+</span>
@@ -1387,7 +1386,7 @@ export default function RolesPage() {
                     )}
                     <Button
                       size="small"
-                      disabled={busy || isEditingNewDraft || isNodeOffline}
+                      disabled={busy || isEditingNewDraft || isNodeOffline || readOnly}
                       loading={busyAction === "check"}
                       onClick={handleCheckCurrent}
                       title={isEditingNewDraft ? "请先保存角色后再检测" : "让节点真调一次模型检测可用性"}
@@ -1397,7 +1396,7 @@ export default function RolesPage() {
                     <Button
                       size="small"
                       danger
-                      disabled={busy || isNodeOffline}
+                      disabled={busy || isNodeOffline || readOnly}
                       loading={busyAction === "delete"}
                       onClick={handleOpenDeleteConfirm}
                     >
@@ -1406,7 +1405,7 @@ export default function RolesPage() {
                     <Button
                       size="small"
                       type="primary"
-                      disabled={busy || isNodeOffline}
+                      disabled={busy || isNodeOffline || readOnly}
                       loading={busyAction === "save"}
                       onClick={() => void handleSave()}
                     >
@@ -1445,7 +1444,7 @@ export default function RolesPage() {
                     <Form<RoleFormValues>
                       form={form}
                       layout="vertical"
-                      disabled={busy || isNodeOffline}
+                      disabled={busy || isNodeOffline || readOnly}
                       onValuesChange={handleFormValuesChange}
                     >
                       <div className="roles-form-grid">
@@ -1591,7 +1590,7 @@ export default function RolesPage() {
                               <div className="roles-models-foot">
                                 <Button
                                   size="small"
-                                  disabled={busy || isNodeOffline}
+                                  disabled={busy || isNodeOffline || readOnly}
                                   onClick={() => add({ model: "", efforts: [] })}
                                 >
                                   + 添加模型

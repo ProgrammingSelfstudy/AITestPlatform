@@ -16,8 +16,8 @@ import { readReviewToken, rememberReviewToken, writeTokenAction } from "./review
 import ReviewTokenDialog from "./ReviewTokenDialog";
 import { formatDate, formatTime, LoadError } from "./runUi";
 import { REFRESH_MS, usePolling } from "./usePolling";
-import UserTokenHint from "./UserTokenHint";
-import { useRememberedUserToken } from "./userToken";
+import IdentityHint from "./IdentityHint";
+import { useRememberedUserName } from "./identity";
 import "./modules.css";
 
 const project = "hafa";
@@ -453,9 +453,9 @@ interface DecisionModalState {
 }
 
 export default function ModuleDetailPage({ id }: { id: string }) {
-  // 个人令牌填完整后在本浏览器记 30 天，不回显
-  const { token: userToken, setToken: setUserToken, expiresAt: tokenExpiresAt, forget: forgetToken } = useRememberedUserToken();
-  const trimmedToken = userToken.trim();
+  // 「我是谁」只记名字，在本浏览器记 30 天
+  const { name: userName, setName: setUserName, expiresAt: nameExpiresAt, forget: forgetName } = useRememberedUserName();
+  const trimmedName = userName.trim();
 
   // 轮询模块列表（找到当前 id），防闪烁缓存
   const modsCacheRef = useRef<{ sig: string; data: ModuleView[] } | null>(null);
@@ -639,8 +639,8 @@ export default function ModuleDetailPage({ id }: { id: string }) {
 
   async function executeWrite(intent: WriteIntent, enteredToken?: string) {
     if (submitLock.current || (pendingWrite && enteredToken === undefined)) return;
-    if (!trimmedToken) {
-      setActionError("请先填写个人令牌（只有发起该模块生成请求的人才能执行批准或拒绝操作）");
+    if (!trimmedName) {
+      setActionError("请先填「我是谁」（只有发起该模块生成请求的人才能批准或拒绝）");
       return;
     }
 
@@ -664,10 +664,10 @@ export default function ModuleDetailPage({ id }: { id: string }) {
 
     try {
       if (intent.kind === "bulk_approve") {
-        const count = await approveReviewed(id, token, trimmedToken);
+        const count = await approveReviewed(id, token, trimmedName);
         setActionNotice(`已一键批准 ${count} 条评审员认为没问题的用例。`);
       } else {
-        await decideCase(id, intent.code, intent.decision, intent.note, token, trimmedToken);
+        await decideCase(id, intent.code, intent.decision, intent.note, token, trimmedName);
         setActionNotice(
           intent.decision === "approve"
             ? `已批准用例 ${intent.code}。`
@@ -687,8 +687,8 @@ export default function ModuleDetailPage({ id }: { id: string }) {
   function handleApproveClick(caseItem: ModuleCase) {
     setActionError(null);
     setActionNotice(null);
-    if (!trimmedToken) {
-      setActionError("请先填写个人令牌再批准用例");
+    if (!trimmedName) {
+      setActionError("请先填「我是谁」再批准用例");
       return;
     }
     if (caseItem.review_status === "needs_human") {
@@ -703,8 +703,8 @@ export default function ModuleDetailPage({ id }: { id: string }) {
   function handleRejectClick(caseItem: ModuleCase) {
     setActionError(null);
     setActionNotice(null);
-    if (!trimmedToken) {
-      setActionError("请先填写个人令牌再拒绝用例");
+    if (!trimmedName) {
+      setActionError("请先填「我是谁」再拒绝用例");
       return;
     }
     setDecisionModal({ caseItem, decision: "reject", requireNote: false });
@@ -734,8 +734,8 @@ export default function ModuleDetailPage({ id }: { id: string }) {
   function handleBulkApprove() {
     setActionError(null);
     setActionNotice(null);
-    if (!trimmedToken) {
-      setActionError("请先填写个人令牌再执行一键批准");
+    if (!trimmedName) {
+      setActionError("请先填「我是谁」再一键批准");
       return;
     }
     if (reviewCounts.reviewed_ok === 0) return;
@@ -785,31 +785,31 @@ export default function ModuleDetailPage({ id }: { id: string }) {
   const isTesting = currentModule.active_runs > 0;
   const flowSteps = buildFlowSteps(currentModule, cases);
 
-  // 共用的个人令牌输入块
+  // 共用的「我是谁」输入块
   const tokenBar = (
     <div className="mod-token-bar">
       <div className="mod-token-field">
         <label className="mod-token-label" htmlFor="mod-detail-user-token">
-          个人令牌
+          我是谁
         </label>
-        <Input.Password
+        <Input
           id="mod-detail-user-token"
-          aria-label="个人令牌"
+          aria-label="我是谁"
           autoComplete="off"
-          visibilityToggle={false}
+          maxLength={40}
           allowClear
           disabled={busy}
-          value={userToken}
-          placeholder="输入个人令牌以批准或拒绝用例"
+          value={userName}
+          placeholder="你的名字（批准或拒绝用例要用）"
           onChange={(event) => {
-            setUserToken(event.target.value);
+            setUserName(event.target.value);
             if (actionError) setActionError(null);
           }}
         />
       </div>
       <div className="mod-token-note">
-        <UserTokenHint expiresAt={tokenExpiresAt} onForget={forgetToken} onToken={setUserToken} />{" "}
-        批准或拒绝用例时提交给服务端校验；只有发起该模块生成请求的人能操作。
+        <IdentityHint expiresAt={nameExpiresAt} onForget={forgetName} />{" "}
+        数据大家都能看；批准或拒绝用例只有发起这个模块生成请求的人能做。
       </div>
     </div>
   );

@@ -829,7 +829,7 @@ async fn 派发消息包含租约和清理标志且不含凭证() {
         token: TOKEN.into(),
         node_id: Some(w.node),
         node_secret: None,
-        user_token: None,
+        user_token: None, user_name: None,
         caps: caps(),
         running_runs: vec![],
         devices: vec![DeviceInfo {

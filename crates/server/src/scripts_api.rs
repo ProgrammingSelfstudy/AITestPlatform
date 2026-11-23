@@ -431,8 +431,9 @@ pub(crate) struct RegressRequest {
 
 /// 校验个人令牌，并确认节点属于这个人：回归占用的是节点的手机，只能发到自己的节点（规则 9）。
 async fn require_owner(state: &ApiState, headers: &axum::http::HeaderMap, node_id: Uuid) -> Result<(), Failure> {
-    let token = headers.get("x-user-token").and_then(|h| h.to_str().ok()).unwrap_or_default();
-    let user = crate::users::user_by_token(state.app.pool(), token).await.map_err(|e| internal(&e))?.ok_or_else(|| fail(StatusCode::UNAUTHORIZED, "需要有效的个人令牌才能发起回归"))?;
+    let Some(user) = crate::users::browser_user(state.app.pool(), headers).await.map_err(|e| internal(&e))? else {
+        return Err(fail(StatusCode::UNAUTHORIZED, crate::users::NEED_NAME_MESSAGE));
+    };
     match crate::users::check_node_owner(state.app.pool(), node_id, user).await.map_err(|e| internal(&e))? {
         crate::users::NodeOwner::Owned => Ok(()),
         crate::users::NodeOwner::Missing => Err(fail(StatusCode::NOT_FOUND, "没有这个节点")),

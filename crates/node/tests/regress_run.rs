@@ -277,19 +277,23 @@ async fn 别的节点也能回归获准的脚本_结果记在它名下() {
 use node::regress_poll::{abandon_stale, poll_once};
 use node::regress_run::regress_script;
 
-/// 造一个用户并把节点交给他，返回个人令牌。
+/// 请求头里的名字要百分号编码（中文不能直接放进 HTTP 头）。身份只记名字，不是机密。
+fn enc(name: &str) -> String {
+    name.bytes().map(|b| if b.is_ascii_alphanumeric() { (b as char).to_string() } else { format!("%{b:02X}") }).collect()
+}
+
+/// 造一个用户并把节点交给他，返回请求头里用的名字（已编码）。
 async fn owner_token(w: &World, name: &str) -> String {
-    let token = server::users::create_user(w.st.pool(), name).await.unwrap();
-    let user = server::users::user_by_name(w.st.pool(), name).await.unwrap().unwrap();
+    let user = server::users::ensure_user_for_test(w.st.pool(), name).await.unwrap();
     sqlx::query("update nodes set owner_user_id = $1 where id = $2").bind(user).bind(w.node).execute(w.st.pool()).await.unwrap();
-    token
+    enc(name)
 }
 
 /// 页面发起：POST /api/scripts/{id}/regress，返回状态码和正文。
 async fn page_request(w: &World, script: Uuid, token: &str, node: Uuid) -> (u16, serde_json::Value) {
     let response = reqwest::Client::new()
         .post(format!("http://{}/api/scripts/{script}/regress", w.addr))
-        .header("x-user-token", token)
+        .header("x-user-name", token)
         .header("x-review-token", REVIEW_TOKEN)
         .header("x-requested-with", "ai-test-platform")
         .json(&json!({"node_id": node}))
@@ -361,7 +365,8 @@ async fn 回归失败是结论_请求算完成_环境问题没有结论_请求�
 async fn 只能发到自己的节点_只有获准版本_不能重复排队() {
     let w = world().await;
     let token = owner_token(&w, "甲").await;
-    let stranger = server::users::create_user(w.st.pool(), "乙").await.unwrap();
+    server::users::ensure_user_for_test(w.st.pool(), "乙").await.unwrap();
+    let stranger = enc("乙");
     let script = approved(&w, "PASS").await;
     let candidate_script = candidate(&w, "PASS2").await;
 
@@ -451,7 +456,7 @@ async fn 没有审核口令不能排队也不能取消() {
         let token = token.clone();
         let node = w.node;
         async move {
-            let mut request = reqwest::Client::new().post(url).header("x-user-token", token).header("x-requested-with", "ai-test-platform").json(&json!({"node_id": node}));
+            let mut request = reqwest::Client::new().post(url).header("x-user-name", token).header("x-requested-with", "ai-test-platform").json(&json!({"node_id": node}));
             if let Some(value) = 口令 {
                 request = request.header("x-review-token", value);
             }
@@ -469,13 +474,14 @@ async fn 没有审核口令不能排队也不能取消() {
 async fn 取消只能取消排队中的_且只能是自己的节点() {
     let w = world().await;
     let token = owner_token(&w, "甲").await;
-    let stranger = server::users::create_user(w.st.pool(), "乙").await.unwrap();
+    server::users::ensure_user_for_test(w.st.pool(), "乙").await.unwrap();
+    let stranger = enc("乙");
     let script = approved(&w, "PASS").await;
     let (_, body) = page_request(&w, script, &token, w.node).await;
     let id = body["id"].as_str().unwrap().to_string();
     let cancel = |token: String, id: String| {
         let url = format!("http://{}/api/regression-requests/{id}/cancel", w.addr);
-        async move { reqwest::Client::new().post(url).header("x-user-token", token).header("x-review-token", REVIEW_TOKEN).header("x-requested-with", "ai-test-platform").header("content-type", "application/json").send().await.unwrap().status().as_u16() }
+        async move { reqwest::Client::new().post(url).header("x-user-name", token).header("x-review-token", REVIEW_TOKEN).header("x-requested-with", "ai-test-platform").header("content-type", "application/json").send().await.unwrap().status().as_u16() }
     };
     assert_eq!(cancel(stranger, id.clone()).await, 403);
     assert_eq!(request_row(&w, &id).await.0, "queued", "别人取消不了");

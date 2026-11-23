@@ -386,6 +386,10 @@ pub struct Hello {
     /// 「谁发起谁付额度」靠它判断任务发起人是不是节点属主。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_token: Option<String>,
+    /// 节点主人的名字（`NODE_USER_NAME`）。**只记名字，不是机密**：节点还没有属主时服务端据此登记并绑定；
+    /// 已有属主时必须是同一个名字。比 `user_token` 简单，两个都带时以名字为准。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_name: Option<String>,
     pub caps: Caps,
     pub devices: Vec<DeviceInfo>,
     /// 重连时本地仍在跑的 run
@@ -638,7 +642,7 @@ mod tests {
     #[test]
     fn 节点消息往返() {
         let run_id = Uuid::new_v4();
-        roundtrip(NodeMsg::Hello(Hello { token: "t".into(), node_id: Some(Uuid::new_v4()), node_secret: Some("s".into()), user_token: Some("u".into()), caps: caps(), devices: vec![device()], running_runs: vec![run_id] }));
+        roundtrip(NodeMsg::Hello(Hello { token: "t".into(), node_id: Some(Uuid::new_v4()), node_secret: Some("s".into()), user_token: Some("u".into()), user_name: Some("小明".into()), caps: caps(), devices: vec![device()], running_runs: vec![run_id] }));
         roundtrip(NodeMsg::Heartbeat(Heartbeat { devices: vec![device()] }));
         roundtrip(NodeMsg::RunStarted { run_id });
         roundtrip(NodeMsg::Step(Step {

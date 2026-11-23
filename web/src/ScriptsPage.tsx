@@ -1,3 +1,4 @@
+import { useRememberedUserName } from "./identity";
 import { Button, Empty, Input, Modal, Segmented, Select, Skeleton, Space, Table, Typography } from "antd";
 import type { ColumnsType } from "antd/es/table";
 import { useCallback, useMemo, useState } from "react";
@@ -63,7 +64,7 @@ interface Pending {
   action: Action;
 }
 
-/** 发起回归或取消排队：先选自己的节点（取消不用），再填个人令牌；个人令牌只在本次请求中使用，不保存。 */
+/** 发起回归或取消排队：先选自己的节点（取消不用），再填「我是谁」（名字，记在本浏览器 30 天）。 */
 interface RegressPending {
   script: ScriptRow;
   cancel: boolean;
@@ -174,7 +175,7 @@ export default function ScriptsPage() {
   const [actionError, setActionError] = useState<string | null>(null);
   const [regress, setRegress] = useState<RegressPending | null>(null);
   const [regressNode, setRegressNode] = useState<string | undefined>();
-  const [userToken, setUserToken] = useState("");
+  const { name: userName, setName: setUserName } = useRememberedUserName();
   const [regressToken, setRegressToken] = useState(false);
   const [statusFilter, setStatusFilter] = useState<StatusFilter>("all");
   const [viewFilter, setViewFilter] = useState<ViewFilter>("all");
@@ -283,7 +284,6 @@ export default function ScriptsPage() {
 
   function openRegress(script: ScriptRow, cancel: boolean) {
     setActionError(null);
-    setUserToken("");
     setRegressNode(undefined);
     setRegressToken(false);
     setRegress({ script, cancel });
@@ -292,18 +292,17 @@ export default function ScriptsPage() {
   function closeRegress() {
     setRegress(null);
     setRegressToken(false);
-    setUserToken("");
   }
 
   async function submitRegress(enteredToken?: string) {
     if (!regress) return;
-    const personal = userToken.trim();
+    const personal = userName.trim();
     if (!regress.cancel && !regressNode) {
       setActionError("请选择在线节点");
       return;
     }
     if (!personal) {
-      setActionError("请输入个人令牌");
+      setActionError("请填「我是谁」（你的名字）");
       return;
     }
     const token = enteredToken ?? readReviewToken();
@@ -694,8 +693,8 @@ export default function ScriptsPage() {
                 disabled: !candidate.online,
               })) ?? []} />
           )}
-          <Input.Password aria-label="个人令牌" autoComplete="off" placeholder="个人令牌（用来确认节点属于你，不会保存）"
-            value={userToken} onChange={(event) => setUserToken(event.target.value)} />
+          <Input aria-label="我是谁" autoComplete="off" maxLength={40} placeholder="我是谁（你的名字，用来确认节点是你的）"
+            value={userName} onChange={(event) => setUserName(event.target.value)} />
           {actionError && <div><Typography.Text type="danger">{actionError}</Typography.Text></div>}
         </Modal>
       )}

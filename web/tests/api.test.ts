@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
-import { cancelRegression, decideScript, requestRegression } from "../src/api";
+import { cancelRegression, decideScript, fetchNodeRoles, requestRegression } from "../src/api";
 import { readReviewToken, rememberReviewToken } from "../src/reviewLogic";
 
 const fetchMock = vi.fn<typeof fetch>();
@@ -21,9 +21,9 @@ function lastCall() {
   return { path: String(path), init: init as RequestInit, headers: new Headers((init as RequestInit).headers) };
 }
 
-test("发起回归：POST 带审核口令、个人令牌和写保护需要的头，请求体只有节点", async () => {
+test("发起回归：POST 带审核口令、「我是谁」（百分号编码）和写保护需要的头，请求体只有节点", async () => {
   respond(201, '{"id":"r1"}');
-  await requestRegression("script-1", "node-1", "review-token-1", "u_personal-1");
+  await requestRegression("script-1", "node-1", "review-token-1", "alice");
   const { path, init, headers } = lastCall();
   expect(path).toBe("/api/scripts/script-1/regress");
   expect(init.method).toBe("POST");
@@ -31,17 +31,17 @@ test("发起回归：POST 带审核口令、个人令牌和写保护需要的头
   expect(headers.get("content-type")).toBe("application/json");
   expect(headers.get("x-requested-with")).toBe("ai-test-platform");
   expect(headers.get("x-review-token")).toBe("review-token-1");
-  expect(headers.get("x-user-token")).toBe("u_personal-1");
+  expect(headers.get("x-user-name")).toBe("alice");
   expect(JSON.parse(String(init.body))).toEqual({ node_id: "node-1" });
 });
 
-test("取消回归：请求编号进路径，同样带两个令牌", async () => {
+test("取消回归：请求编号进路径，同样带审核口令和「我是谁」", async () => {
   respond(204);
-  await cancelRegression("req/1", "review-token-1", "u_personal-1");
+  await cancelRegression("req/1", "review-token-1", "alice");
   const { path, headers } = lastCall();
   expect(path).toBe("/api/regression-requests/req%2F1/cancel");
   expect(headers.get("x-review-token")).toBe("review-token-1");
-  expect(headers.get("x-user-token")).toBe("u_personal-1");
+  expect(headers.get("x-user-name")).toBe("alice");
 });
 
 test("获准脚本：原因进请求体", async () => {
@@ -79,4 +79,18 @@ test("429 提示稍后再试且保留口令；其他错误显示服务端正文"
 test("连不上服务端", async () => {
   fetchMock.mockRejectedValueOnce(new TypeError("fetch failed"));
   await expect(requestRegression("s", "n", "token-x", "u_x")).rejects.toThrow("无法连接平台服务端");
+});
+
+test("「我是谁」放在请求头里：中文做百分号编码，没填就不带", async () => {
+  const calls: Headers[] = [];
+  vi.stubGlobal("fetch", vi.fn(async (_url: unknown, init?: RequestInit) => {
+    calls.push(new Headers(init?.headers));
+    return Response.json({ online: true, roles: [], mine: true, name_problem: null });
+  }));
+  await fetchNodeRoles("n1", "小明");
+  await fetchNodeRoles("n1", "  ");
+  expect(calls[0].get("x-user-name")).toBe(encodeURIComponent("小明"));
+  expect(calls[0].get("x-user-name")).toBe("%E5%B0%8F%E6%98%8E");
+  expect(calls[1].get("x-user-name")).toBeNull();
+  vi.unstubAllGlobals();
 });

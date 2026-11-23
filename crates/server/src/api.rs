@@ -66,7 +66,7 @@ pub(crate) fn routes(app: AppState, paths: Paths) -> Router {
         .route("/api/modules/{id}/approve-reviewed", post(crate::modules::api_approve_reviewed).route_layer(authorize_write.clone()))
         .route("/api/casegen-requests/{id}/result", put(crate::modules::api_finish).layer(axum::extract::DefaultBodyLimit::max(2 * 1024 * 1024)))
         .route("/api/nodes/{id}/roles", post(set_node_roles).route_layer(authorize_write.clone()).get(node_roles))
-        .route("/api/users", post(create_user).route_layer(authorize_write.clone()))
+        .route("/api/users", get(list_users))
         .route("/api/nodes/{id}/apps", get(node_apps))
         .route("/api/nodes/{id}/apps/{source}/scan", post(scan_node_app))
         .route("/api/nodes/{id}/roles/init-template", post(init_node_roles).route_layer(authorize_write.clone()))
@@ -266,36 +266,62 @@ async fn models(State(state): State<ApiState>) -> Result<impl IntoResponse, ApiE
 
 // ---------------------------------------------------------------- 节点的角色与模型配置（每个节点各自一份）
 
-/// 校验个人令牌，并且节点属于该用户。别人的节点、没有属主的节点一律 403，不存在 404。
+/// 「改动或花额度」的操作（保存角色、检测、检查本机应用）：名字对得上某个登记过的人，且节点属于他。
+/// 别人的节点、没有属主的节点一律 403，不存在 404。**只读的查看不走这里**——数据是公开的，谁都能看，只是不能用别人的额度。
 async fn require_owned(state: &ApiState, headers: &axum::http::HeaderMap, id: &str) -> Result<Uuid, ApiError> {
     let node: Uuid = id.parse().map_err(|_| (StatusCode::NOT_FOUND, "没有这个节点".to_string()))?;
-    let token = headers.get("x-user-token").and_then(|h| h.to_str().ok()).unwrap_or_default();
-    if token.is_empty() {
-        return Err((StatusCode::UNAUTHORIZED, "需要有效的个人令牌才能查看或修改角色配置".to_string()));
-    }
-    let user = crate::users::user_by_token(state.app.pool(), token)
-        .await
-        .map_err(|e| internal("校验用户失败", e))?
-        .ok_or((StatusCode::UNAUTHORIZED, "需要有效的个人令牌才能查看或修改角色配置".to_string()))?;
+    let Some(user) = crate::users::browser_user(state.app.pool(), headers).await.map_err(|e| internal("校验用户失败", e))? else {
+        return Err((StatusCode::UNAUTHORIZED, format!("{}（修改角色配置或检测要先说明你是谁；只是查看不需要）", crate::users::NEED_NAME_MESSAGE)));
+    };
     match crate::users::check_node_owner(state.app.pool(), node, user).await.map_err(|e| internal("校验节点属主失败", e))? {
         crate::users::NodeOwner::Owned => Ok(node),
         crate::users::NodeOwner::Missing => Err((StatusCode::NOT_FOUND, "没有这个节点".to_string())),
-        crate::users::NodeOwner::NotYours => Err((StatusCode::FORBIDDEN, "只能查看和修改自己的节点".to_string())),
+        crate::users::NodeOwner::NotYours => Err((StatusCode::FORBIDDEN, "这是别人的节点：你能看，但只能修改和使用自己的节点（用的是各人自己的额度）".to_string())),
     }
+}
+
+/// 只读查看用：节点要存在；顺便告诉前端「这个节点是不是你的」，好决定哪些按钮可用。
+/// 没带令牌 `mine = null`；带了但不是主人、令牌不对或绑定了别的浏览器 `mine = false` 并说明原因。
+async fn viewer(state: &ApiState, headers: &axum::http::HeaderMap, id: &str) -> Result<(Uuid, Viewer), ApiError> {
+    let node: Uuid = id.parse().map_err(|_| (StatusCode::NOT_FOUND, "没有这个节点".to_string()))?;
+    let exists = state.app.node_exists(node).await.map_err(|e| internal("查询节点失败", e))?;
+    if !exists {
+        return Err((StatusCode::NOT_FOUND, "没有这个节点".to_string()));
+    }
+    // 没填名字：只读。填了名字：看这个节点是不是他的；名字没登记过（没有任何节点用它启动）也说明白
+    let Some(name) = crate::users::name_from_headers(headers) else {
+        return Ok((node, Viewer { mine: None, name_problem: None }));
+    };
+    let viewer = match crate::users::user_by_name(state.app.pool(), &name).await.map_err(|e| internal("校验用户失败", e))? {
+        Some(user) => {
+            let owned = matches!(crate::users::check_node_owner(state.app.pool(), node, user).await.map_err(|e| internal("校验节点属主失败", e))?, crate::users::NodeOwner::Owned);
+            Viewer { mine: Some(owned), name_problem: None }
+        }
+        None => Viewer { mine: Some(false), name_problem: Some(format!("「{name}」还没有登记：没有任何节点是用这个名字（NODE_USER_NAME）启动的")) },
+    };
+    Ok((node, viewer))
+}
+
+#[derive(Serialize)]
+struct Viewer {
+    mine: Option<bool>,
+    name_problem: Option<String>,
 }
 
 #[derive(Serialize)]
 struct NodeRolesView {
     online: bool,
     roles: Vec<protocol::RoleReport>,
+    #[serde(flatten)]
+    viewer: Viewer,
 }
 
 /// 节点当前的角色摘要。节点离线时 `online=false` 且不返回角色（上一次的报告可能已过期）。Key 永远不在里面。
 async fn node_roles(State(state): State<ApiState>, Path(id): Path<String>, headers: axum::http::HeaderMap) -> Result<impl IntoResponse, ApiError> {
-    let node = require_owned(&state, &headers, &id).await?;
+    let (node, viewer) = viewer(&state, &headers, &id).await?;
     let online = state.app.node_connected(node).await;
     let roles = if online { state.app.roles_report(node).map(|r| r.roles).unwrap_or_default() } else { vec![] };
-    Ok(([(header::CACHE_CONTROL, "no-store")], Json(NodeRolesView { online, roles })))
+    Ok(([(header::CACHE_CONTROL, "no-store")], Json(NodeRolesView { online, roles, viewer })))
 }
 
 #[derive(Deserialize)]
@@ -351,29 +377,10 @@ async fn check_node_role(State(state): State<ApiState>, Path((id, role)): Path<(
 
 // ---------------------------------------------------------------- 创建个人令牌
 
-#[derive(Deserialize)]
-struct NewUser {
-    name: String,
-}
-
-/// 页面上创建个人令牌：令牌只在这次响应里出现一次，库里只存摘要（和命令行 `server create-user` 同一套）。
-/// 要审核口令：否则局域网里谁都能无限造身份。名字不能重复（它是人看的标识，不是认证）。
-async fn create_user(State(state): State<ApiState>, body: Result<Json<NewUser>, JsonRejection>) -> Result<impl IntoResponse, ApiError> {
-    let Json(body) = body.map_err(|_| bad_request("请求格式无效，请填写名字"))?;
-    let name = body.name.trim();
-    let count = name.chars().count();
-    if count == 0 || count > 40 || name.chars().any(char::is_control) {
-        return Err(bad_request("名字不能为空、不超过 40 个字，也不能有控制字符"));
-    }
-    match crate::users::create_user(state.app.pool(), name).await {
-        Ok(token) => Ok((
-            StatusCode::CREATED,
-            [(header::CACHE_CONTROL, "no-store")],
-            Json(serde_json::json!({ "name": name, "token": token })),
-        )),
-        Err(sqlx::Error::Database(e)) if e.is_unique_violation() => Err((StatusCode::CONFLICT, "这个名字已经有人用了，换一个".to_string())),
-        Err(e) => Err(internal("创建个人令牌失败", e)),
-    }
+/// 所有登记过的名字（节点启动带 `NODE_USER_NAME` 时登记），给页面「我是谁」做提示。名字不是机密。
+async fn list_users(State(state): State<ApiState>) -> Result<impl IntoResponse, ApiError> {
+    let names = crate::users::list_names(state.app.pool()).await.map_err(|e| internal("查询用户失败", e))?;
+    Ok(([(header::CACHE_CONTROL, "no-store")], Json(names)))
 }
 
 // ---------------------------------------------------------------- 本机应用环境检查（选应用 → 检查本机 → 取模型）
@@ -395,11 +402,13 @@ struct AppView {
 struct NodeAppsView {
     online: bool,
     apps: Vec<AppView>,
+    #[serde(flatten)]
+    viewer: Viewer,
 }
 
 /// 四个应用各一项（没检查过的 `scanned = false`）。节点离线时只告诉 `online = false`，不返回上一次的结果（可能已过期）。
 async fn node_apps(State(state): State<ApiState>, Path(id): Path<String>, headers: axum::http::HeaderMap) -> Result<impl IntoResponse, ApiError> {
-    let node = require_owned(&state, &headers, &id).await?;
+    let (node, viewer) = viewer(&state, &headers, &id).await?;
     let online = state.app.node_connected(node).await;
     let scans = if online { state.app.app_scans(node) } else { Default::default() };
     let apps = [ModelSource::ClaudeCli, ModelSource::CodexExec, ModelSource::Agy, ModelSource::DeepSeek]
@@ -409,7 +418,7 @@ async fn node_apps(State(state): State<ApiState>, Path(id): Path<String>, header
             None => AppView { source, scanned: false, scan: None },
         })
         .collect();
-    Ok(([(header::CACHE_CONTROL, "no-store")], Json(NodeAppsView { online, apps })))
+    Ok(([(header::CACHE_CONTROL, "no-store")], Json(NodeAppsView { online, apps, viewer })))
 }
 
 /// 让节点检查本机有没有这个应用、怎么登录的、有哪些模型。只跑本地命令，不调模型、不花额度，所以不要审核口令，
@@ -460,13 +469,12 @@ fn run_error(error: RunError, action: &str) -> ApiError {
 }
 
 /// 校验个人令牌有效、所选节点属于该用户（规则 9：只能用自己的节点）。节点不存在放行，交给后面的校验。
-pub(crate) async fn owner_check(state: &ApiState, token: &str, node: Uuid) -> Result<Uuid, ApiError> {
-    let user = crate::users::user_by_token(state.app.pool(), token)
-        .await
-        .map_err(|e| internal("校验发起人失败", e))?
-        .ok_or((StatusCode::UNAUTHORIZED, "需要有效的个人令牌才能发起任务".to_string()))?;
+pub(crate) async fn owner_check(state: &ApiState, headers: &axum::http::HeaderMap, node: Uuid) -> Result<Uuid, ApiError> {
+    let Some(user) = crate::users::browser_user(state.app.pool(), headers).await.map_err(|e| internal("校验发起人失败", e))? else {
+        return Err((StatusCode::UNAUTHORIZED, crate::users::NEED_NAME_MESSAGE.to_string()));
+    };
     match crate::users::check_node_owner(state.app.pool(), node, user).await.map_err(|e| internal("校验节点属主失败", e))? {
-        crate::users::NodeOwner::NotYours => Err((StatusCode::FORBIDDEN, "只能使用自己的节点发起任务".to_string())),
+        crate::users::NodeOwner::NotYours => Err((StatusCode::FORBIDDEN, "只能使用自己的节点发起任务（数据大家都能看、都能跑，但用的是各人自己的额度）".to_string())),
         crate::users::NodeOwner::Owned | crate::users::NodeOwner::Missing => Ok(user),
     }
 }
@@ -476,12 +484,11 @@ async fn create_task(
     headers: axum::http::HeaderMap,
     body: Result<Json<CreateRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<TaskCreated>), ApiError> {
-    // 发起人身份：个人令牌。任务只能发到发起人自己的节点（规则 9）
-    let token = headers.get("x-user-token").and_then(|h| h.to_str().ok()).unwrap_or_default();
+    // 发起人身份：只记名字（靠自觉）。任务只能发到发起人自己的节点（规则 9）
     let Json(request) =
         body.map_err(|_| bad_request("任务参数格式无效，请检查项目、节点、用例、模型和推理强度"))?;
-    if token.is_empty() {
-        return Err((StatusCode::UNAUTHORIZED, "需要有效的个人令牌才能发起任务".to_string()));
+    if crate::users::name_from_headers(&headers).is_none() {
+        return Err((StatusCode::UNAUTHORIZED, crate::users::NEED_NAME_MESSAGE.to_string()));
     }
     // 节点上报过角色（新版节点）：只能用该节点自己上报、检测通过的角色，所以要先确认节点是发起人的，
     // 否则别人能借错误提示探测别人节点的配置。没上报过（旧版节点）：沿用服务端的 models.json
@@ -489,7 +496,7 @@ async fn create_task(
     let mut owner_checked = false;
     let candidates: Vec<RoleConfig> = match report {
         Some(report) => {
-            owner_check(&state, token, request.node_id).await?;
+            owner_check(&state, &headers, request.node_id).await?;
             owner_checked = true;
             if report.roles.is_empty() {
                 return Err(bad_request("该节点还没有配置角色，请先在「角色与模型」页配置，或用模板初始化"));
@@ -523,7 +530,7 @@ async fn create_task(
         return Err(bad_request("判定员模型不在配置列表中"));
     }
     if !owner_checked {
-        owner_check(&state, token, request.node_id).await?;
+        owner_check(&state, &headers, request.node_id).await?;
     }
     let task = NewTask {
         project: request.project,

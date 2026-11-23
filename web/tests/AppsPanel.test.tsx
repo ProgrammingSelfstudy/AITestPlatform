@@ -40,8 +40,8 @@ function serve(apps: AppView[], online = true) {
 
 const existing: RoleView[] = [];
 
-function mount(onCreate: (roles: RoleInput[]) => void = () => {}, roles: RoleView[] = existing, busy = false) {
-  return render(<AppsPanel nodeId={NODE} userToken="u_synthetic" online existingRoles={roles} busy={busy} onCreateRoles={onCreate} />);
+function mount(onCreate: (roles: RoleInput[]) => void = () => {}, roles: RoleView[] = existing, busy = false, readOnlyReason?: string) {
+  return render(<AppsPanel nodeId={NODE} userName="小明" online existingRoles={roles} busy={busy} onCreateRoles={onCreate} readOnlyReason={readOnlyReason} />);
 }
 
 const scanCalls = () => fetchMock.mock.calls.filter(([, init]) => init?.method === "POST");
@@ -68,7 +68,7 @@ test("四个应用卡片都显示，状态有文字；DeepSeek 显示开发中�
   expect(screen.queryByText(/检查本机环境/)).not.toBeInTheDocument();
 });
 
-test("点应用自动检查本机（不要审核口令），结果显示三行检查清单", async () => {
+test("点应用自动检查本机（不要审核口令，带「我是谁」），结果显示三行检查清单", async () => {
   serve([codex]);
   const user = userEvent.setup();
   mount();
@@ -77,7 +77,7 @@ test("点应用自动检查本机（不要审核口令），结果显示三行�
   await waitFor(() => expect(scanCalls()).toHaveLength(1));
   const [url, init] = scanCalls()[0];
   expect(String(url)).toBe(`/api/nodes/${NODE}/apps/codex_exec/scan`);
-  expect((init?.headers as Record<string, string>)["x-user-token"]).toBe("u_synthetic");
+  expect((init?.headers as Record<string, string>)["x-user-name"]).toBe(encodeURIComponent("小明"));
   expect(await screen.findByText(/已用 ChatGPT 登录/)).toBeInTheDocument();
   expect(screen.getByText(/来自 codex debug models/)).toBeInTheDocument();
   expect(screen.getAllByText("通过").length).toBe(3);
@@ -163,4 +163,28 @@ test("父页面正在保存时创建按钮禁用", async () => {
   await user.click(screen.getByText("Codex").closest("button")!);
   await screen.findByText("选模型并创建角色");
   expect(screen.getByRole("button", { name: /正在保存/ })).toBeDisabled();
+});
+
+test("只读（不是节点主人或没填名字）：能看到上次的检查结果，但不触发检查、不能创建角色", async () => {
+  serve([codex]);
+  const user = userEvent.setup();
+  mount(() => {}, existing, false, "这是别人的节点：你能看，但只能修改和使用自己的节点");
+  expect(await screen.findByText(/这是别人的节点/)).toBeInTheDocument();
+  expect(await screen.findByText("检测到并可用")).toBeInTheDocument();
+  await user.click(screen.getByText("Codex").closest("button")!);
+  // 看得到上一次的结果，但不发检查请求，也没有「重新检查」「创建角色」
+  expect(await screen.findByText(/已用 ChatGPT 登录/)).toBeInTheDocument();
+  expect(scanCalls()).toHaveLength(0);
+  expect(screen.queryByRole("button", { name: /重新检查/ })).not.toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: /创建角色/ })).not.toBeInTheDocument();
+  expect(screen.getByText(/只有节点主人能用这些模型创建角色/)).toBeInTheDocument();
+});
+
+test("只读且这个节点还没检查过：说明只有节点主人能触发检查", async () => {
+  serve([]);
+  const user = userEvent.setup();
+  mount(() => {}, existing, false, "你现在是只读");
+  await user.click((await screen.findByText("Codex")).closest("button")!);
+  expect(await screen.findByText(/只有节点主人能触发检查/)).toBeInTheDocument();
+  expect(scanCalls()).toHaveLength(0);
 });

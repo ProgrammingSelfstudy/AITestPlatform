@@ -32,7 +32,8 @@ const MODELS: &str = r#"{
   ]
 }"#;
 const TOKEN: &str = "test-node-token";
-const USER_TOKEN: &str = "u_synthetic-user-token-for-tests";
+/// 测试用户的名字「测试用户」，请求头里中文要百分号编码（身份只记名字，不是机密）
+const USER_NAME: &str = "%E6%B5%8B%E8%AF%95%E7%94%A8%E6%88%B7";
 const REVIEW_TOKEN: &str = "synthetic-review-token-012345";
 const CREATE_ROUTE: &str = "/api/tasks";
 const BAD_CANCEL_ROUTE: &str = "/api/runs/not-a-uuid/cancel";
@@ -170,7 +171,7 @@ async fn browser_post(app: &Router, path: &str, body: Value) -> (StatusCode, Hea
         path,
         &{
             let mut headers = review_headers(REVIEW_TOKEN);
-            headers.push(("x-user-token", USER_TOKEN));
+            headers.push(("x-user-name", USER_NAME));
             headers
         },
         body.to_string(),
@@ -460,7 +461,7 @@ fn report_role(id: &str, slot: protocol::RoleSlot, source: ModelSource, model: &
 }
 
 fn user_headers(token: &'static str) -> Vec<(&'static str, &'static str)> {
-    vec![("x-user-token", token)]
+    vec![("x-user-name", token)]
 }
 
 fn set_roles_body(roles: Value) -> String {
@@ -472,25 +473,40 @@ fn role_json(id: &str, slot: &str, source: &str, model: &str) -> Value {
 }
 
 #[tokio::test]
-async fn 角色接口需要令牌且只能操作自己的节点() {
+async fn 角色接口_查看公开_修改和检测只能是节点主人() {
     let world = World::new().await;
     let path = format!("/api/nodes/{}/roles", world.node);
-    // 没令牌 / 令牌无效：401
-    let (status, _, _) = request(&world.app, Method::GET, &path, &[], "").await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED);
-    let (status, _, _) = request(&world.app, Method::GET, &path, &user_headers("u_不存在的令牌"), "").await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED);
-    // 节点不属于该用户：403；没有属主的节点：403；不存在：404
-    let other_user: Uuid = sqlx::query_scalar("insert into users (name, token_hash) values ('别人', $1) returning id")
-        .bind(crate::secret_hash("u_other-user-token")).fetch_one(world.state.pool()).await.unwrap();
-    let (status, _, _) = request(&world.app, Method::GET, &path, &user_headers("u_other-user-token"), "").await;
-    assert_eq!(status, StatusCode::FORBIDDEN);
-    let _ = other_user;
+    // 查看是公开的：不填名字也能看，只是不知道「是不是你的」
+    let (status, _, bytes) = request(&world.app, Method::GET, &path, &[], "").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(json_body(&bytes)["mine"].is_null());
+    // 填了名字：是主人 mine=true；别人 mine=false；没登记的名字 mine=false 并说明原因
+    sqlx::query("insert into users (name) values ('other-user')").execute(world.state.pool()).await.unwrap();
+    let mine = |name: &'static str| {
+        let (app, path) = (world.app.clone(), path.clone());
+        async move { json_body(&request(&app, Method::GET, &path, &user_headers(name), "").await.2) }
+    };
+    assert_eq!(mine(USER_NAME).await["mine"], true);
+    assert_eq!(mine("other-user").await["mine"], false);
+    let unknown = mine("nobody").await;
+    assert_eq!(unknown["mine"], false);
+    assert!(unknown["name_problem"].as_str().unwrap().contains("还没有登记"), "{unknown}");
+    // 不存在的节点 404
+    assert_eq!(request(&world.app, Method::GET, &format!("/api/nodes/{}/roles", Uuid::new_v4()), &[], "").await.0, StatusCode::NOT_FOUND);
+    // 修改和检测（花额度）：没填名字 / 名字没登记 401；别人的节点 403；没有属主的节点 403
+    let write = |name: Option<&'static str>| {
+        let mut h = review_headers(REVIEW_TOKEN);
+        if let Some(name) = name {
+            h.push(("x-user-name", name));
+        }
+        let (app, path) = (world.app.clone(), format!("{path}/init-template"));
+        async move { request(&app, Method::POST, &path, &h, "{}").await.0 }
+    };
+    assert_eq!(write(None).await, StatusCode::UNAUTHORIZED);
+    assert_eq!(write(Some("nobody")).await, StatusCode::UNAUTHORIZED);
+    assert_eq!(write(Some("other-user")).await, StatusCode::FORBIDDEN, "别人的节点：能看，不能改");
     sqlx::query("update nodes set owner_user_id = null where id = $1").bind(world.node).execute(world.state.pool()).await.unwrap();
-    let (status, _, _) = request(&world.app, Method::GET, &path, &user_headers(USER_TOKEN), "").await;
-    assert_eq!(status, StatusCode::FORBIDDEN);
-    let (status, _, _) = request(&world.app, Method::GET, &format!("/api/nodes/{}/roles", Uuid::new_v4()), &user_headers(USER_TOKEN), "").await;
-    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(write(Some(USER_NAME)).await, StatusCode::FORBIDDEN, "没有属主的节点谁都不能改");
 }
 
 #[tokio::test]
@@ -499,14 +515,14 @@ async fn 角色接口_离线不返回角色_保存先校验再转发() {
     let path = format!("/api/nodes/{}/roles", world.node);
     world.state.set_roles_report_for_test(world.node, protocol::RolesReport { roles: vec![report_role("a", protocol::RoleSlot::Judge, ModelSource::Agy, "m", &[], None, protocol::CheckStatus::Ok)] });
     // 测试里节点没有 WebSocket 连接：离线，不返回上一次的（可能过期的）角色
-    let (status, headers, bytes) = request(&world.app, Method::GET, &path, &user_headers(USER_TOKEN), "").await;
+    let (status, headers, bytes) = request(&world.app, Method::GET, &path, &user_headers(USER_NAME), "").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(headers[header::CACHE_CONTROL], "no-store");
-    assert_eq!(json_body(&bytes), json!({"online": false, "roles": []}));
+    assert_eq!(json_body(&bytes), json!({"online": false, "roles": [], "mine": true, "name_problem": null}));
     // 保存：无效配置先被拒（400），不会因为节点离线而掩盖
     let post = |body: String| {
         let mut headers = review_headers(REVIEW_TOKEN);
-        headers.push(("x-user-token", USER_TOKEN));
+        headers.push(("x-user-name", USER_NAME));
         let (app, path) = (world.app.clone(), path.clone());
         async move {
             request(&app, Method::POST, &path, &headers, body).await
@@ -530,7 +546,7 @@ async fn 角色接口_离线不返回角色_保存先校验再转发() {
     // 检测：节点上没有这个角色 404；有但离线 409
     let check = |role: &str| {
         let mut h = review_headers(REVIEW_TOKEN);
-        h.push(("x-user-token", USER_TOKEN));
+        h.push(("x-user-name", USER_NAME));
         let (app, p) = (world.app.clone(), format!("{path}/{role}/check"));
         async move { request(&app, Method::POST, &p, &h, "{}").await }
     };
@@ -570,9 +586,9 @@ async fn 创建任务用节点上报的角色_没检测通过或没配置都拒�
     let (_, _, detail) = request(&world.app, Method::GET, &format!("/api/tasks/{}", task.as_str().unwrap()), &[], "").await;
     assert_eq!(json_body(&detail)["judge"]["source"], "agy");
     // 别人拿自己的令牌往这个节点发任务：403，不泄露角色情况
-    sqlx::query("insert into users (name, token_hash) values ('另一个人', $1)").bind(crate::secret_hash("u_another-token")).execute(world.state.pool()).await.unwrap();
+    sqlx::query("insert into users (name) values ('another-person')").execute(world.state.pool()).await.unwrap();
     let mut headers = review_headers(REVIEW_TOKEN);
-    headers.push(("x-user-token", "u_another-token"));
+    headers.push(("x-user-name", "another-person"));
     let (status, _, _) = request(&world.app, Method::POST, "/api/tasks", &headers, payload(world.node, &["TC-04"]).to_string()).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
 }
@@ -613,9 +629,9 @@ async fn 模块和生成请求_必填校验_去重_只能用自己的节点() {
     // 项目不存在：404；别人的令牌往这个节点发：403
     let (status, _, _) = browser_post(&world.app, "/api/projects/不存在的项目/casegen-requests", casegen_body(world.node, "m")).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
-    sqlx::query("insert into users (name, token_hash) values ('生成请求的另一个人', $1)").bind(crate::secret_hash("u_casegen-other")).execute(world.state.pool()).await.unwrap();
+    sqlx::query("insert into users (name) values ('casegen-other')").execute(world.state.pool()).await.unwrap();
     let mut headers = review_headers(REVIEW_TOKEN);
-    headers.push(("x-user-token", "u_casegen-other"));
+    headers.push(("x-user-name", "casegen-other"));
     let (status, _, _) = request(&world.app, Method::POST, path, &headers, casegen_body(world.node, "语聊房").to_string()).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
     // 成功：201；同模块同节点再提交：409
@@ -659,7 +675,7 @@ async fn 测试用例岗位只允许能看图的来源() {
     let path = format!("/api/nodes/{}/roles", world.node);
     let post = |roles: Value| {
         let mut headers = review_headers(REVIEW_TOKEN);
-        headers.push(("x-user-token", USER_TOKEN));
+        headers.push(("x-user-name", USER_NAME));
         let (app, path) = (world.app.clone(), path.clone());
         async move { request(&app, Method::POST, &path, &headers, set_roles_body(roles)).await }
     };
@@ -840,27 +856,27 @@ async fn 评审员的意见只是意见_要人确认才能执行() {
     node_put(&world, world.node, review_path, json!({"ok": false, "detail": "x", "reviews": []})).await;
     assert_eq!(status_of_case(&world, &codes[0]).await.0, "reviewed_ok");
     // 人的决定：个人令牌必须是发起这个模块生成请求的人
-    sqlx::query("insert into users (name, token_hash) values ('不相干的人', $1)").bind(crate::secret_hash("u_unrelated")).execute(world.state.pool()).await.unwrap();
+    sqlx::query("insert into users (name) values ('unrelated')").execute(world.state.pool()).await.unwrap();
     let decide = |code: &str, token: &'static str, body: Value| {
         let mut h = review_headers(REVIEW_TOKEN);
-        h.push(("x-user-token", token));
+        h.push(("x-user-name", token));
         let (app, path) = (world.app.clone(), format!("/api/modules/{module}/cases/{code}/decision"));
         async move { request(&app, Method::POST, &path, &h, body.to_string()).await }
     };
-    assert_eq!(decide(&codes[0], "u_unrelated", json!({"decision": "approve"})).await.0, StatusCode::FORBIDDEN);
-    assert_eq!(decide(&codes[0], "u_不存在", json!({"decision": "approve"})).await.0, StatusCode::FORBIDDEN);
-    assert_eq!(decide(&codes[0], USER_TOKEN, json!({"decision": "maybe"})).await.0, StatusCode::BAD_REQUEST);
+    assert_eq!(decide(&codes[0], "unrelated", json!({"decision": "approve"})).await.0, StatusCode::FORBIDDEN);
+    assert_eq!(decide(&codes[0], "nobody", json!({"decision": "approve"})).await.0, StatusCode::FORBIDDEN);
+    assert_eq!(decide(&codes[0], USER_NAME, json!({"decision": "maybe"})).await.0, StatusCode::BAD_REQUEST);
     // 评审员有疑问的用例，批准要写备注
-    let (status, _, bytes) = decide(&codes[1], USER_TOKEN, json!({"decision": "approve"})).await;
+    let (status, _, bytes) = decide(&codes[1], USER_NAME, json!({"decision": "approve"})).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert!(text(&bytes).contains("备注"));
-    assert_eq!(decide(&codes[1], USER_TOKEN, json!({"decision": "approve", "note": "退出后回首页是产品口头确认的"})).await.0, StatusCode::NO_CONTENT);
+    assert_eq!(decide(&codes[1], USER_NAME, json!({"decision": "approve", "note": "退出后回首页是产品口头确认的"})).await.0, StatusCode::NO_CONTENT);
     let (status, note) = status_of_case(&world, &codes[1]).await;
     assert_eq!(status, "approved");
     assert!(note.contains("文档没写退出后回哪个页面") && note.contains("产品口头确认"), "评审员的疑问和人的备注都要留痕：{note}");
     // 一键批准只批「评审员认为没问题」的
     let mut h = review_headers(REVIEW_TOKEN);
-    h.push(("x-user-token", USER_TOKEN));
+    h.push(("x-user-name", USER_NAME));
     let (status, _, bytes) = request(&world.app, Method::POST, &format!("/api/modules/{module}/approve-reviewed"), &h, "{}").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(json_body(&bytes)["approved"], 1);
@@ -868,7 +884,7 @@ async fn 评审员的意见只是意见_要人确认才能执行() {
     // 批准后才能执行；拒绝的不能
     let (status, _, bytes) = browser_post(&world.app, "/api/tasks", payload(world.node, &[&codes[0], &codes[1]])).await;
     assert_eq!(status, StatusCode::CREATED, "{}", text(&bytes));
-    assert_eq!(decide(&codes[1], USER_TOKEN, json!({"decision": "reject", "note": "不要了"})).await.0, StatusCode::NO_CONTENT);
+    assert_eq!(decide(&codes[1], USER_NAME, json!({"decision": "reject", "note": "不要了"})).await.0, StatusCode::NO_CONTENT);
     let (status, _, _) = browser_post(&world.app, "/api/tasks", payload(world.node, &[&codes[1]])).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     // 模块的用例列表带复核状态和备注
@@ -896,11 +912,13 @@ async fn 评审员没跑成时用例全部转待人工确认() {
 }
 
 #[tokio::test]
-async fn 应用环境检查接口_需要令牌_只能查自己的节点_离线不返回结果() {
+async fn 应用环境检查接口_查看公开_检查只能是节点主人_离线不返回结果() {
     let world = World::new().await;
     let apps = format!("/api/nodes/{}/apps", world.node);
-    // 没令牌 401
-    assert_eq!(request(&world.app, Method::GET, &apps, &[], "").await.0, StatusCode::UNAUTHORIZED);
+    // 查看是公开的：不填名字也能看（只是 mine 为空）
+    let (status, _, bytes) = request(&world.app, Method::GET, &apps, &[], "").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(json_body(&bytes)["mine"].is_null());
     // 放一条检查结果：节点没有 WebSocket 连接（离线），不返回上一次的（可能过期的）结果，但四个应用都在
     world.state.set_app_scan_for_test(world.node, protocol::AppScan {
         source: ModelSource::Agy, installed: true, version: Some("1.0".into()), login: protocol::AppLogin::Ok,
@@ -908,7 +926,7 @@ async fn 应用环境检查接口_需要令牌_只能查自己的节点_离线�
         models: vec![protocol::AppModel { id: "gemini-x".into(), display: "Gemini X".into(), efforts: vec![], default_effort: None }],
         models_note: "来自 agy models".into(), scanned_at: "2026-11-23T00:00:00Z".into(),
     });
-    let (status, headers, bytes) = request(&world.app, Method::GET, &apps, &user_headers(USER_TOKEN), "").await;
+    let (status, headers, bytes) = request(&world.app, Method::GET, &apps, &user_headers(USER_NAME), "").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(headers[header::CACHE_CONTROL], "no-store");
     let view = json_body(&bytes);
@@ -919,48 +937,51 @@ async fn 应用环境检查接口_需要令牌_只能查自己的节点_离线�
     // 触发检查：不认识的应用 404；离线 409；别人的节点 403
     let scan = |source: &str, token: &'static str| {
         let mut h = review_headers(REVIEW_TOKEN);
-        h.push(("x-user-token", token));
+        h.push(("x-user-name", token));
         let (app, path) = (world.app.clone(), format!("{apps}/{source}/scan"));
         async move { request(&app, Method::POST, &path, &h, "{}").await.0 }
     };
-    assert_eq!(scan("不存在的应用", USER_TOKEN).await, StatusCode::NOT_FOUND);
-    assert_eq!(scan("agy", USER_TOKEN).await, StatusCode::CONFLICT);
-    sqlx::query("insert into users (name, token_hash) values ('应用检查的另一个人', $1)").bind(crate::secret_hash("u_apps-other")).execute(world.state.pool()).await.unwrap();
-    assert_eq!(scan("agy", "u_apps-other").await, StatusCode::FORBIDDEN);
+    assert_eq!(scan("不存在的应用", USER_NAME).await, StatusCode::NOT_FOUND);
+    assert_eq!(scan("agy", USER_NAME).await, StatusCode::CONFLICT);
+    sqlx::query("insert into users (name) values ('apps-other')").execute(world.state.pool()).await.unwrap();
+    assert_eq!(scan("agy", "apps-other").await, StatusCode::FORBIDDEN);
 }
 
 #[tokio::test]
-async fn 页面创建个人令牌_要审核口令_令牌只显示一次_库里只存摘要() {
+async fn 数据大家共用_我可以用自己的节点和额度跑别人的用例_但不能用别人的节点() {
     let world = World::new().await;
-    let create = |name: &str, with_review: bool| {
-        let mut h = if with_review { review_headers(REVIEW_TOKEN) } else { WRITE_HEADERS.to_vec() };
-        h.push(("x-user-token", USER_TOKEN));
-        let (app, body) = (world.app.clone(), json!({"name": name}).to_string());
-        async move { request(&app, Method::POST, "/api/users", &h, body).await }
+    // 测试用户生成并批准了一批用例；另一个人（runner）有自己的节点
+    let (module, _, codes) = generated_module(&world, "共用的模块").await;
+    sqlx::query("update test_cases set review_status = 'approved' where module_id = $1").bind(module).execute(world.state.pool()).await.unwrap();
+    let runner: Uuid = sqlx::query_scalar("insert into users (name) values ('runner') returning id").fetch_one(world.state.pool()).await.unwrap();
+    let runner_node = Uuid::new_v4();
+    sqlx::query("insert into nodes (id, caps, online, owner_user_id) values ($1, $2, true, $3)")
+        .bind(runner_node)
+        .bind(json!({"model_sources": [{"source": "claude_cli"}, {"source": "codex_exec"}]}))
+        .bind(runner)
+        .execute(world.state.pool())
+        .await
+        .unwrap();
+    sqlx::query("insert into devices (node_id, serial, platform, status) values ($1,'runner设备','android','idle')").bind(runner_node).execute(world.state.pool()).await.unwrap();
+    let run_as = |name: &'static str, node: Uuid| {
+        let mut h = review_headers(REVIEW_TOKEN);
+        h.push(("x-user-name", name));
+        let (app, body) = (world.app.clone(), payload(node, &[&codes[0]]).to_string());
+        async move { request(&app, Method::POST, "/api/tasks", &h, body).await }
     };
-    // 没审核口令：不能造身份
-    assert_eq!(create("小明", false).await.0, StatusCode::FORBIDDEN);
-    // 名字不合法：400
-    for bad in ["", "   ", &"长".repeat(41), "带\n换行"] {
-        assert_eq!(create(bad, true).await.0, StatusCode::BAD_REQUEST, "{bad:?}");
-    }
-    // 成功：201，令牌只在这次响应里；不缓存
-    let (status, headers, bytes) = create("小明", true).await;
+    // 数据是公开的：不填名字也能看到别人的模块和用例
+    let (status, _, bytes) = request(&world.app, Method::GET, &format!("/api/modules/{module}/cases"), &[], "").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json_body(&bytes)[0]["review_status"], "approved");
+    // runner 用自己的节点跑测试用户的用例：可以，任务落在 runner 自己的节点上（花的是 runner 的额度）
+    let (status, _, bytes) = run_as("runner", runner_node).await;
     assert_eq!(status, StatusCode::CREATED, "{}", text(&bytes));
-    assert_eq!(headers[header::CACHE_CONTROL], "no-store");
-    let created = json_body(&bytes);
-    let token = created["token"].as_str().unwrap().to_string();
-    assert!(token.starts_with("u_") && token.len() > 40, "令牌长度要够：{}", token.len());
-    assert_eq!(created["name"], "小明");
-    // 令牌有效（能找到用户），库里没有明文
-    assert!(crate::users::user_by_token(world.state.pool(), &token).await.unwrap().is_some());
-    let plain: i64 = sqlx::query_scalar("select count(*) from users where token_hash = $1 or name = $1").bind(&token).fetch_one(world.state.pool()).await.unwrap();
-    assert_eq!(plain, 0, "库里只能有摘要，不能有明文令牌");
-    // 同名：409，不会覆盖已有令牌
-    let (status, _, bytes) = create("小明", true).await;
-    assert_eq!(status, StatusCode::CONFLICT);
-    assert!(text(&bytes).contains("已经有人用了"));
-    assert!(crate::users::user_by_token(world.state.pool(), &token).await.unwrap().is_some(), "同名创建失败不能让原来的令牌失效");
+    let node_of_run: Uuid = sqlx::query_scalar("select node_id from tasks order by created_at desc limit 1").fetch_one(world.state.pool()).await.unwrap();
+    assert_eq!(node_of_run, runner_node);
+    // 但 runner 不能把任务派到测试用户的节点（那是用别人的额度）
+    let (status, _, bytes) = run_as("runner", world.node).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{}", text(&bytes));
+    assert!(text(&bytes).contains("各人自己的额度"), "{}", text(&bytes));
 }
 
 struct World {
@@ -980,10 +1001,8 @@ impl World {
         let app = temp.app(state.clone());
         let node = Uuid::new_v4();
         let caps = json!({"model_sources": [{"source": "claude_cli"}, {"source": "codex_exec"}]});
-        // 测试用户及其令牌摘要；节点属于该用户
-        let user: Uuid = sqlx::query_scalar("insert into users (name, token_hash) values ($1, $2) returning id")
-            .bind(format!("测试用户-{node}"))
-            .bind(crate::secret_hash(USER_TOKEN))
+        // 测试用户（只记名字）；节点属于该用户
+        let user: Uuid = sqlx::query_scalar("insert into users (name) values ('测试用户') returning id")
             .fetch_one(state.pool())
             .await
             .unwrap();
@@ -1095,24 +1114,23 @@ async fn 创建任务只能用自己的节点() {
         async move {
             let mut headers = review_headers(REVIEW_TOKEN);
             if let Some(token) = token {
-                headers.push(("x-user-token", token));
+                headers.push(("x-user-name", token));
             }
             request(&app, Method::POST, "/api/tasks", &headers, payload(node, &["TC-04"]).to_string()).await.0
         }
     };
     assert_eq!(post_as(None, world.node).await, StatusCode::UNAUTHORIZED, "没带个人令牌");
-    assert_eq!(post_as(Some("u_不存在的令牌"), world.node).await, StatusCode::UNAUTHORIZED, "令牌无效");
+    assert_eq!(post_as(Some("nobody"), world.node).await, StatusCode::UNAUTHORIZED, "令牌无效");
     // 另一个用户拿自己的有效令牌，不能用别人的节点
-    let other_token = "u_synthetic-other-user-token";
-    sqlx::query("insert into users (name, token_hash) values ('另一个用户', $1)")
-        .bind(crate::secret_hash(other_token))
+    let other_token = "other-name";
+    sqlx::query("insert into users (name) values ('other-name')")
         .execute(world.state.pool())
         .await
         .unwrap();
     assert_eq!(post_as(Some(other_token), world.node).await, StatusCode::FORBIDDEN, "不是自己的节点");
     // 还没有属主的节点谁都不能用
     sqlx::query("update nodes set owner_user_id = null where id = $1").bind(world.node).execute(world.state.pool()).await.unwrap();
-    assert_eq!(post_as(Some(USER_TOKEN), world.node).await, StatusCode::FORBIDDEN, "无属主节点");
+    assert_eq!(post_as(Some(USER_NAME), world.node).await, StatusCode::FORBIDDEN, "无属主节点");
     let count: i64 = sqlx::query_scalar("select count(*) from tasks").fetch_one(world.state.pool()).await.unwrap();
     assert_eq!(count, 0, "被拒绝的请求不能留下任务");
 }

@@ -7,7 +7,8 @@ import RolesPage from "../src/RolesPage";
 
 const fetchMock = vi.fn<typeof fetch>();
 const NODE = "aaaaaaaa-0000-0000-0000-000000000001";
-const USER_TOKEN = "u_synthetic-token-for-tests";
+/** 这个节点的主人（节点启动时的 NODE_USER_NAME）。身份只记名字，不是机密 */
+const OWNER = "小明";
 const SECRET_KEY = "sk-这个Key绝不能出现在页面里";
 
 const nodes: NodeView[] = [{ node_id: NODE, online: true, caps: { node_version: "t", os: "macos", model_sources: [] }, devices: [], last_seen: "2026-11-22T00:00:00Z" }];
@@ -19,14 +20,24 @@ function role(id: string, slot: RoleView["slot"], source: string, status: RoleVi
   };
 }
 
+/** 请求头里的「我是谁」（百分号编码）；没带返回 null */
+const nameOf = (init?: RequestInit): string | null => {
+  const raw = (init?.headers as Record<string, string> | undefined)?.["x-user-name"];
+  return raw ? decodeURIComponent(raw) : null;
+};
+
 function serve(roles: RoleView[], online = true) {
   fetchMock.mockImplementation(async (input, init) => {
     const path = String(input);
     if (init?.method === "POST") return new Response(null, { status: 202 });
     if (path === "/api/nodes") return Response.json(nodes);
-    if (path === `/api/nodes/${NODE}/roles`) return Response.json({ online, roles });
+    // 查看是公开的：谁都能看。mine：没填名字为 null；填了名字，是节点主人为 true，否则 false
+    if (path === `/api/nodes/${NODE}/roles`) {
+      const name = nameOf(init);
+      return Response.json({ online, roles, mine: name === null ? null : name === OWNER, name_problem: null });
+    }
     // 页面顶部的「选应用」面板也会读应用检查结果；这里不关心内容，给一个正常的空结果，免得它因为 404 反复报错重绘
-    if (path === `/api/nodes/${NODE}/apps`) return Response.json({ online, apps: ["claude_cli", "codex_exec", "agy", "deepseek"].map((source) => ({ source, scanned: false })) });
+    if (path === `/api/nodes/${NODE}/apps`) return Response.json({ online, mine: nameOf(init) === OWNER ? true : null, name_problem: null, apps: ["claude_cli", "codex_exec", "agy", "deepseek"].map((source) => ({ source, scanned: false })) });
     return new Response("没有这个接口", { status: 404 });
   });
 }
@@ -34,7 +45,7 @@ function serve(roles: RoleView[], online = true) {
 async function openPage() {
   const user = userEvent.setup();
   render(<RolesPage />);
-  await user.type(await screen.findByPlaceholderText(/个人令牌/), USER_TOKEN);
+  await user.type(await screen.findByPlaceholderText(/你的名字/), OWNER);
   return user;
 }
 
@@ -47,16 +58,27 @@ afterEach(() => {
   fetchMock.mockReset();
 });
 
-test("没填个人令牌时不请求角色", async () => {
-  serve([]);
+test("没填名字也能看角色，但是只读：不能检查、不能创建，并说明为什么", async () => {
+  serve([role("a", "executor", "codex_exec", "ok", "已用 ChatGPT 登录")]);
   render(<RolesPage />);
-  await screen.findByText(/请输入个人令牌/);
-  expect(fetchMock.mock.calls.some(([input]) => String(input).includes("/roles"))).toBe(false);
-  // 「选应用」面板一进页面就能看到：四张卡片照常显示，只是点不了，并说明为什么；也不会发检查请求
+  // 数据公开：不填名字就能看到角色
+  expect((await screen.findAllByText("角色-a")).length).toBeGreaterThan(0);
+  expect(fetchMock.mock.calls.some(([input, init]) => String(input).includes("/roles") && nameOf(init) !== null)).toBe(false);
+  // 「选应用」面板一进页面就能看到：四张卡片照常显示，说明只读的原因；点开也不会发检查请求
   for (const name of ["Claude", "Codex", "Gemini", "DeepSeek"]) expect(screen.getByText(name)).toBeInTheDocument();
-  expect(screen.getAllByText(/先在上面填入个人令牌/).length).toBeGreaterThan(0);
+  expect(screen.getAllByText(/你现在是只读/).length).toBeGreaterThan(0);
   await userEvent.setup().click(screen.getByText("Codex").closest("button")!);
-  expect(fetchMock.mock.calls.some(([input]) => String(input).includes("/apps"))).toBe(false);
+  expect(fetchMock.mock.calls.some(([, init]) => init?.method === "POST")).toBe(false);
+});
+
+test("填的是别人的名字：能看，但不能改（节点是别人的，用的是他的额度）", async () => {
+  serve([role("a", "executor", "codex_exec", "ok", null)]);
+  const user = userEvent.setup();
+  render(<RolesPage />);
+  await user.type(await screen.findByPlaceholderText(/你的名字/), "路人甲");
+  expect((await screen.findAllByText("角色-a")).length).toBeGreaterThan(0);
+  expect((await screen.findAllByText(/这是别人的节点/)).length).toBeGreaterThan(0);
+  expect(screen.getByRole("button", { name: /检\s*测/ })).toBeDisabled();
 });
 
 test("每个检测状态都有文字，失败原因原样显示，Key 永远不出现", { timeout: 20000 }, async () => {
@@ -85,7 +107,7 @@ test("节点离线时明确提示，不显示角色", async () => {
   expect(screen.queryByText("角色-a")).not.toBeInTheDocument();
 });
 
-test("节点还没有角色时可以用模板初始化，请求不带 Key", async () => {
+test("节点还没有角色时可以用模板初始化，请求带「我是谁」、不带 Key", async () => {
   rememberReviewToken("synthetic-review-token-012345");
   serve([]);
   const user = await openPage();
@@ -93,27 +115,24 @@ test("节点还没有角色时可以用模板初始化，请求不带 Key", asyn
   await waitFor(() => expect(fetchMock.mock.calls.some(([input, init]) => init?.method === "POST" && String(input) === `/api/nodes/${NODE}/roles/init-template`)).toBe(true));
   const [, init] = fetchMock.mock.calls.find(([input]) => String(input).endsWith("/init-template"))!;
   expect(String(init?.body)).not.toContain("api_key");
-  expect((init?.headers as Record<string, string>)["x-user-token"]).toBe(USER_TOKEN);
+  expect(nameOf(init)).toBe(OWNER);
 });
 
-test("个人令牌填完整后记在浏览器里：刷新（重新进入页面）后不用再填，也能忘记", { timeout: 30000 }, async () => {
-  const FULL = `u_${"a1B2".repeat(16)}`;
+test("「我是谁」填了记在浏览器里：刷新（重新进入页面）后不用再填，也能清除", { timeout: 30000 }, async () => {
   serve([role("a", "executor", "codex_exec", "ok", null)]);
   const user = userEvent.setup();
   const first = render(<RolesPage />);
-  await user.type(await screen.findByPlaceholderText(/个人令牌/), FULL);
+  await user.type(await screen.findByPlaceholderText(/你的名字/), OWNER);
   await screen.findAllByText("角色-a");
   expect(screen.getByText(/已记住，到期/)).toBeInTheDocument();
-  expect(document.body.textContent).not.toContain(FULL);
-  // 重新进入页面：令牌还在，直接读到角色，不用再填
+  // 重新进入页面：名字还在，请求直接带上，不用再填
   first.unmount();
   fetchMock.mockClear();
   render(<RolesPage />);
   expect((await screen.findAllByText("角色-a")).length).toBeGreaterThan(0);
-  expect(fetchMock.mock.calls.some(([input, init]) => String(input).includes("/roles") && (init?.headers as Record<string, string>)["x-user-token"] === FULL)).toBe(true);
-  // 忘记令牌：清空，回到「请输入个人令牌」
-  await user.click(screen.getByRole("button", { name: "忘记令牌" }));
-  expect((await screen.findAllByText(/请输入个人令牌/)).length).toBeGreaterThan(0);
-  expect(screen.queryByText("角色-a")).not.toBeInTheDocument();
-  expect(window.localStorage.getItem("platform.userToken.v1")).toBeNull();
+  expect(fetchMock.mock.calls.some(([input, init]) => String(input).includes("/roles") && nameOf(init) === OWNER)).toBe(true);
+  // 清除：回到只读
+  await user.click(screen.getByRole("button", { name: "清除" }));
+  expect((await screen.findAllByText(/你现在是只读/)).length).toBeGreaterThan(0);
+  expect(window.localStorage.getItem("platform.userName.v1")).toBeNull();
 });

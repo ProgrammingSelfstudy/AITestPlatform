@@ -48,7 +48,7 @@ test("创建任务：必填项缺哪项提示哪项，缺项时不发请求", as
   const user = userEvent.setup();
   render(<GenerateDialog onClose={() => {}} />);
   await user.click(await screen.findByRole("button", { name: /提交生成任务/ }));
-  for (const message of [/请填写或上传需求文档/, /请至少填写 1 个 UI 图链接/, /请至少上传 1 张 UI 区域截图/, /请输入个人令牌/]) {
+  for (const message of [/请填写或上传需求文档/, /请至少填写 1 个 UI 图链接/, /请至少上传 1 张 UI 区域截图/, /请填「我是谁」/]) {
     expect((await screen.findAllByText(message)).length, String(message)).toBeGreaterThan(0);
   }
   expect(posts()).toHaveLength(0);
@@ -84,7 +84,7 @@ test("复核：批准评审员有疑问的用例必须写备注，没写不发�
   const user = userEvent.setup();
   render(<ModuleDetailPage id={MOD} />);
   await screen.findAllByText("标题-GEN-2");
-  await user.type(screen.getByLabelText("个人令牌"), "u_synthetic-token");
+  await user.type(screen.getByLabelText("我是谁"), "小明");
   await user.click((await screen.findAllByRole("button", { name: /填备注并批准/ }))[0]);
   await user.click(await screen.findByRole("button", { name: /确\s*认\s*批\s*准/ }));
   expect((await screen.findAllByText(/必须填写备注/)).length).toBeGreaterThan(0);

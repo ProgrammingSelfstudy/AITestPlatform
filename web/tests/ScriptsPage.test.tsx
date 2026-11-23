@@ -130,7 +130,7 @@ async function openRegressDialog(user: ReturnType<typeof userEvent.setup>) {
   return screen.findByRole("dialog");
 }
 
-test("发起回归：选在线节点、填个人令牌、再输审核口令，POST 带齐令牌和节点", async () => {
+test("发起回归：选在线节点、填「我是谁」、再输审核口令，POST 带齐名字和节点", async () => {
   serve([script({ id: "s3", version: 3, status: "approved" })]);
   const user = userEvent.setup();
   render(<ScriptsPage />);
@@ -140,7 +140,7 @@ test("发起回归：选在线节点、填个人令牌、再输审核口令，PO
   const offline = await screen.findByText(/bbbbbbbb · 离线/);
   expect(offline.closest(".ant-select-item")).toHaveAttribute("aria-disabled", "true");
   await user.click(await screen.findByText(/aaaaaaaa · 在线/));
-  await user.type(within(dialog).getByLabelText("个人令牌"), "u_personal-1");
+  await user.type(within(dialog).getByLabelText("我是谁"), "alice");
   await user.click(within(dialog).getByRole("button", { name: /排队回归/ }));
 
   // 没有审核口令：先弹口令框，不能直接发
@@ -154,12 +154,12 @@ test("发起回归：选在线节点、填个人令牌、再输审核口令，PO
   const [path, init] = posts()[0];
   expect(String(path)).toBe("/api/scripts/s3/regress");
   const headers = new Headers(init?.headers);
-  expect([headers.get("x-review-token"), headers.get("x-user-token")]).toEqual(["review-token-1", "u_personal-1"]);
+  expect([headers.get("x-review-token"), headers.get("x-user-name")]).toEqual(["review-token-1", "alice"]);
   expect(JSON.parse(String(init?.body))).toEqual({ node_id: NODE_ONLINE });
   await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
 });
 
-test("发起回归：没选节点或没填个人令牌就不发请求，并说明缺什么", async () => {
+test("发起回归：没选节点或没填「我是谁」就不发请求，并说明缺什么", async () => {
   serve([script({ id: "s3", version: 3, status: "approved" })]);
   const user = userEvent.setup();
   render(<ScriptsPage />);
@@ -169,7 +169,7 @@ test("发起回归：没选节点或没填个人令牌就不发请求，并说�
   await user.click(within(dialog).getByRole("combobox"));
   await user.click(await screen.findByText(/aaaaaaaa · 在线/));
   await user.click(within(dialog).getByRole("button", { name: /排队回归/ }));
-  expect(await within(dialog).findByText("请输入个人令牌")).toBeInTheDocument();
+  expect(await within(dialog).findByText("请填「我是谁」（你的名字）")).toBeInTheDocument();
   expect(posts()).toHaveLength(0);
 });
 
@@ -181,7 +181,7 @@ test("发起回归被服务端拒绝：弹窗里显示服务端原因，不关�
   const dialog = await openRegressDialog(user);
   await user.click(within(dialog).getByRole("combobox"));
   await user.click(await screen.findByText(/aaaaaaaa · 在线/));
-  await user.type(within(dialog).getByLabelText("个人令牌"), "u_personal-1");
+  await user.type(within(dialog).getByLabelText("我是谁"), "alice");
   await user.click(within(dialog).getByRole("button", { name: /排队回归/ }));
   expect(await within(dialog).findByText(/只有已获准的脚本版本能回归/)).toBeInTheDocument();
   expect(screen.queryByText("输入审核口令")).not.toBeInTheDocument();
@@ -196,7 +196,7 @@ test("取消回归：不用选节点，请求编号进路径", async () => {
   await user.click(within(await rowOf(3)).getByRole("button", { name: /取消回归/ }));
   const dialog = await screen.findByRole("dialog");
   expect(within(dialog).queryByRole("combobox")).not.toBeInTheDocument();
-  await user.type(within(dialog).getByLabelText("个人令牌"), "u_personal-1");
+  await user.type(within(dialog).getByLabelText("我是谁"), "alice");
   await user.click(within(dialog).getByRole("button", { name: /确认取消/ }));
   await waitFor(() => expect(posts()).toHaveLength(1));
   expect(String(posts()[0][0])).toBe("/api/regression-requests/req-1/cancel");

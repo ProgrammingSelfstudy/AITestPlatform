@@ -46,7 +46,7 @@ fn hello(node_id: Option<Uuid>, devices: Vec<DeviceInfo>, running: Vec<Uuid>) ->
         os: "macos".into(),
         model_sources: vec![ModelSourceCap { source: ModelSource::ClaudeCli, vision: true }, ModelSourceCap { source: ModelSource::CodexExec, vision: true }],
     };
-    serde_json::to_string(&Envelope::new(NodeMsg::Hello(Hello { token: TOKEN.into(), node_id, node_secret: secret_for(node_id), user_token: None, caps, devices, running_runs: running }))).unwrap()
+    serde_json::to_string(&Envelope::new(NodeMsg::Hello(Hello { token: TOKEN.into(), node_id, node_secret: secret_for(node_id), user_token: None, user_name: None, caps, devices, running_runs: running }))).unwrap()
 }
 
 async fn connect(a: SocketAddr, text: String) -> (Client, protocol::Welcome) {

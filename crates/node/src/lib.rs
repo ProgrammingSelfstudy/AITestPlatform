@@ -60,6 +60,8 @@ pub struct NodeConfig {
     pub state_dir: PathBuf,
     /// 节点主人的个人令牌（来自 `NODE_USER_TOKEN`，不写日志）。首次连接时服务端据此绑定节点属主
     pub user_token: Option<String>,
+    /// 节点主人的名字（来自 `NODE_USER_NAME`）。**只记名字，不是机密**：首次连接时服务端据此登记并绑定属主
+    pub user_name: Option<String>,
     pub node_version: String,
     /// 重连退避：从 `backoff_base` 起每次翻倍，封顶 `backoff_cap`
     pub backoff_base: Duration,
@@ -73,6 +75,7 @@ impl NodeConfig {
             token,
             state_dir,
             user_token: None,
+            user_name: None,
             node_version: env!("CARGO_PKG_VERSION").to_string(),
             backoff_base: Duration::from_secs(1),
             backoff_cap: Duration::from_secs(30),
@@ -307,6 +310,7 @@ async fn session<D: Devices, E: RunExecutor>(cfg: &NodeConfig, devices: &D, runn
         node_id: *node_id,
         node_secret: load_node_secret(&cfg.state_dir),
         user_token: cfg.user_token.clone(),
+        user_name: cfg.user_name.clone(),
         caps: detect_caps(&cfg.node_version),
         devices: available_devices,
         running_runs,

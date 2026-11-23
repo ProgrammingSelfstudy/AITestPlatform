@@ -25,6 +25,8 @@ export interface NodeView {
   caps: { node_version: string; os: string; model_sources: ModelSourceCap[] };
   devices: Device[];
   last_seen: string;
+  /** 节点主人的名字（启动节点时的 NODE_USER_NAME）；没有属主为空。用来显示「这是谁的节点」 */
+  owner?: string | null;
 }
 
 export type RunStatus = "queued" | "assigned" | "running" | "judging" | "finished" | "blocked" | "cancelled" | "node_lost";
@@ -264,6 +266,10 @@ export interface NodeRoles {
   /** 节点离线时拿不到角色，页面要明确提示 */
   online: boolean;
   roles: RoleView[];
+  /** 这个节点是不是你的：没填名字为 null（只读），填了名字是 true / false。数据大家都能看，只有主人能改、能检测（花他的额度） */
+  mine: boolean | null;
+  /** 名字没登记等原因，原样显示 */
+  name_problem: string | null;
 }
 
 /** 保存时提交的角色。api_key 只在需要新设或更换 Key 时填；不填表示保持原来的。 */
@@ -385,9 +391,9 @@ export const fetchScripts = (project: string, signal?: AbortSignal) =>
 export const fetchCases = (project: string, signal?: AbortSignal) =>
   get<CaseSummary[]>(`/api/projects/${encodeURIComponent(project)}/cases`, signal);
 
-/** `userToken` 是发起人的个人令牌，只在内存里用一次，不落本地存储。服务端据此确认节点属于发起人。 */
-export async function createTask(task: NewTask, token: string, userToken: string): Promise<{ task_id: string; run_ids: string[] }> {
-  const response = await post("/api/tasks", task, token, { "x-user-token": userToken });
+/** `userName` 是发起人的名字（只记名字、靠自觉）。服务端据此确认所选节点是他的：数据大家都能跑，但只能用自己的节点、花自己的额度。 */
+export async function createTask(task: NewTask, token: string, userName: string): Promise<{ task_id: string; run_ids: string[] }> {
+  const response = await post("/api/tasks", task, token, userHeaders(userName));
   return response.json();
 }
 
@@ -401,13 +407,13 @@ export async function decideScript(id: string, action: "approve" | "retire" | "r
 }
 
 /** 在自己的节点上排一次回归：审核口令加个人令牌（和发起任务同一套），个人令牌只在本次请求中使用。 */
-export async function requestRegression(scriptId: string, nodeId: string, token: string, userToken: string): Promise<void> {
-  await post(`/api/scripts/${encodeURIComponent(scriptId)}/regress`, { node_id: nodeId }, token, { "x-user-token": userToken });
+export async function requestRegression(scriptId: string, nodeId: string, token: string, userName: string): Promise<void> {
+  await post(`/api/scripts/${encodeURIComponent(scriptId)}/regress`, { node_id: nodeId }, token, userHeaders(userName));
 }
 
 /** 取消还在排队的回归请求；节点已经领走的取消不了。 */
-export async function cancelRegression(requestId: string, token: string, userToken: string): Promise<void> {
-  await post(`/api/regression-requests/${encodeURIComponent(requestId)}/cancel`, {}, token, { "x-user-token": userToken });
+export async function cancelRegression(requestId: string, token: string, userName: string): Promise<void> {
+  await post(`/api/regression-requests/${encodeURIComponent(requestId)}/cancel`, {}, token, userHeaders(userName));
 }
 
 export async function submitReview(id: string, review: ReviewSubmission, token: string): Promise<number> {
@@ -436,10 +442,11 @@ export function evidenceUrl(run: RunDetail, name: string): string | undefined {
 // ---------------------------------------------------------------- 角色与模型配置（每个节点各自一份，只能操作自己的节点）
 
 const rolesPath = (nodeId: string) => `/api/nodes/${encodeURIComponent(nodeId)}/roles`;
-const userHeaders = (userToken: string) => ({ "x-user-token": userToken });
+/** 「我是谁」放在请求头里。名字不是机密；中文不能直接放进 HTTP 头，所以百分号编码（服务端会还原）。没填就不带。 */
+const userHeaders = (userName: string): Record<string, string> => (userName.trim() ? { "x-user-name": encodeURIComponent(userName.trim()) } : {});
 
-export async function fetchNodeRoles(nodeId: string, userToken: string, signal?: AbortSignal): Promise<NodeRoles> {
-  const response = await request(rolesPath(nodeId), { signal, headers: userHeaders(userToken) });
+export async function fetchNodeRoles(nodeId: string, userName: string, signal?: AbortSignal): Promise<NodeRoles> {
+  const response = await request(rolesPath(nodeId), { signal, headers: userHeaders(userName) });
   try {
     return (await response.json()) as NodeRoles;
   } catch {
@@ -448,18 +455,18 @@ export async function fetchNodeRoles(nodeId: string, userToken: string, signal?:
 }
 
 /** 整体替换该节点的角色配置，服务端转给节点写入本机；Key 只经这一次转手，不落库。 */
-export async function saveNodeRoles(nodeId: string, roles: RoleInput[], token: string, userToken: string): Promise<void> {
-  await post(rolesPath(nodeId), { roles }, token, userHeaders(userToken));
+export async function saveNodeRoles(nodeId: string, roles: RoleInput[], token: string, userName: string): Promise<void> {
+  await post(rolesPath(nodeId), { roles }, token, userHeaders(userName));
 }
 
 /** 节点还没有任何角色时，用服务端模板（config/models.json）初始化，不带 Key。 */
-export async function initNodeRoles(nodeId: string, token: string, userToken: string): Promise<void> {
-  await post(`${rolesPath(nodeId)}/init-template`, {}, token, userHeaders(userToken));
+export async function initNodeRoles(nodeId: string, token: string, userName: string): Promise<void> {
+  await post(`${rolesPath(nodeId)}/init-template`, {}, token, userHeaders(userName));
 }
 
 /** 让节点真调一次模型，检测这个角色能不能用；结果通过 fetchNodeRoles 轮询得到。 */
-export async function checkNodeRole(nodeId: string, roleId: string, token: string, userToken: string): Promise<void> {
-  await post(`${rolesPath(nodeId)}/${encodeURIComponent(roleId)}/check`, {}, token, userHeaders(userToken));
+export async function checkNodeRole(nodeId: string, roleId: string, token: string, userName: string): Promise<void> {
+  await post(`${rolesPath(nodeId)}/${encodeURIComponent(roleId)}/check`, {}, token, userHeaders(userName));
 }
 
 // ---------------------------------------------------------------- 模块、用例生成与复核
@@ -472,19 +479,19 @@ export const fetchCasegenRequest = (id: string, signal?: AbortSignal) =>
   get<CasegenRequestDetail>(`/api/casegen-requests/${encodeURIComponent(id)}`, signal);
 
 /** 创建任务（生成用例）：模块、需求文档、UI 链接、区域截图都必填，缺哪项服务端说哪项；只能发到自己的节点 */
-export async function createCasegenRequest(project: string, input: CasegenInput, token: string, userToken: string): Promise<{ request_id: string; module_id: string; doc_id: string }> {
-  const response = await post(`/api/projects/${encodeURIComponent(project)}/casegen-requests`, input, token, userHeaders(userToken));
+export async function createCasegenRequest(project: string, input: CasegenInput, token: string, userName: string): Promise<{ request_id: string; module_id: string; doc_id: string }> {
+  const response = await post(`/api/projects/${encodeURIComponent(project)}/casegen-requests`, input, token, userHeaders(userName));
   return response.json();
 }
 
 /** 人的决定：批准（才能执行）或拒绝。评审员有疑问（needs_human）的用例，批准时必须写备注。只有发起这个模块生成请求的人能操作。 */
-export async function decideCase(moduleId: string, code: string, decision: "approve" | "reject", note: string, token: string, userToken: string): Promise<void> {
-  await post(`/api/modules/${encodeURIComponent(moduleId)}/cases/${encodeURIComponent(code)}/decision`, { decision, note }, token, userHeaders(userToken));
+export async function decideCase(moduleId: string, code: string, decision: "approve" | "reject", note: string, token: string, userName: string): Promise<void> {
+  await post(`/api/modules/${encodeURIComponent(moduleId)}/cases/${encodeURIComponent(code)}/decision`, { decision, note }, token, userHeaders(userName));
 }
 
 /** 一键批准评审员认为没问题的（reviewed_ok）；needs_human 的不在内，必须逐条处理。返回批准了几条。 */
-export async function approveReviewed(moduleId: string, token: string, userToken: string): Promise<number> {
-  const response = await post(`/api/modules/${encodeURIComponent(moduleId)}/approve-reviewed`, {}, token, userHeaders(userToken));
+export async function approveReviewed(moduleId: string, token: string, userName: string): Promise<number> {
+  const response = await post(`/api/modules/${encodeURIComponent(moduleId)}/approve-reviewed`, {}, token, userHeaders(userName));
   return ((await response.json()) as { approved: number }).approved;
 }
 
@@ -520,10 +527,12 @@ export interface NodeApps {
   /** 节点离线时拿不到检查结果 */
   online: boolean;
   apps: AppView[];
+  mine: boolean | null;
+  name_problem: string | null;
 }
 
-export async function fetchNodeApps(nodeId: string, userToken: string, signal?: AbortSignal): Promise<NodeApps> {
-  const response = await request(`/api/nodes/${encodeURIComponent(nodeId)}/apps`, { signal, headers: userHeaders(userToken) });
+export async function fetchNodeApps(nodeId: string, userName: string, signal?: AbortSignal): Promise<NodeApps> {
+  const response = await request(`/api/nodes/${encodeURIComponent(nodeId)}/apps`, { signal, headers: userHeaders(userName) });
   try {
     return (await response.json()) as NodeApps;
   } catch {
@@ -532,14 +541,11 @@ export async function fetchNodeApps(nodeId: string, userToken: string, signal?: 
 }
 
 /** 让节点检查本机有没有这个应用、怎么登录的、有哪些模型。只跑本地命令，不调模型、不花额度，不需要审核口令。结果靠 fetchNodeApps 轮询得到。 */
-export async function scanNodeApp(nodeId: string, source: string, userToken: string): Promise<void> {
-  await post(`/api/nodes/${encodeURIComponent(nodeId)}/apps/${encodeURIComponent(source)}/scan`, {}, "", userHeaders(userToken));
+export async function scanNodeApp(nodeId: string, source: string, userName: string): Promise<void> {
+  await post(`/api/nodes/${encodeURIComponent(nodeId)}/apps/${encodeURIComponent(source)}/scan`, {}, "", userHeaders(userName));
 }
 
-// ---------------------------------------------------------------- 创建个人令牌
+// ---------------------------------------------------------------- 谁在用
 
-/** 页面上创建个人令牌。令牌只在这次返回里出现一次，库里只存摘要；要审核口令。名字重复会返回 409。 */
-export async function createUser(name: string, token: string): Promise<{ name: string; token: string }> {
-  const response = await post("/api/users", { name }, token);
-  return response.json();
-}
+/** 登记过的名字（节点启动带 NODE_USER_NAME 时登记），给「我是谁」做提示。名字不是机密。 */
+export const fetchUsers = (signal?: AbortSignal) => get<string[]>("/api/users", signal);

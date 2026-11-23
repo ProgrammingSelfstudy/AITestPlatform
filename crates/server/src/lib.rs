@@ -60,6 +60,8 @@ pub struct NodeView {
     pub caps: Caps,
     pub devices: Vec<DeviceInfo>,
     pub last_seen: DateTime<Utc>,
+    /// 节点主人的名字；还没有属主（没带 NODE_USER_NAME 的节点）为空
+    pub owner: Option<String>,
 }
 
 /// 一个节点当前的连接：服务端要主动给节点发消息（派发、取消）时，往发件箱里放。
@@ -205,9 +207,14 @@ impl AppState {
             Some(None) | None => Some(new_node_secret()),
         };
         // 节点属主：带了个人令牌就必须有效；节点已有属主时必须是同一个人；还没有属主就绑定
-        let presented = match hello.user_token.as_deref() {
-            Some(token) => Some(users::user_by_token(&mut *tx, token).await?.ok_or(RegisterError::Unauthorized)?),
-            None => None,
+        // 名字优先（只记名字、靠自觉）；老节点仍可带个人令牌（令牌必须有效）
+        let presented = match (hello.user_name.as_deref(), hello.user_token.as_deref()) {
+            (Some(name), _) => {
+                let name = users::clean_name(name).ok_or(RegisterError::Unauthorized)?;
+                Some(users::ensure_user(&mut *tx, &name).await?)
+            }
+            (None, Some(token)) => Some(users::user_by_token(&mut *tx, token).await?.ok_or(RegisterError::Unauthorized)?),
+            (None, None) => None,
         };
         let current_owner: Option<Uuid> = sqlx::query_scalar("select owner_user_id from nodes where id = $1").bind(node_id).fetch_optional(&mut *tx).await?.flatten();
         let new_owner = match (current_owner, presented) {
@@ -489,7 +496,7 @@ impl AppState {
             });
         }
         let mut out = Vec::new();
-        for r in sqlx::query("select id, caps, online, last_seen from nodes order by id").fetch_all(&mut *tx).await? {
+        for r in sqlx::query("select n.id, n.caps, n.online, n.last_seen, u.name as owner from nodes n left join users u on u.id = n.owner_user_id order by n.id").fetch_all(&mut *tx).await? {
             let id: Uuid = r.get("id");
             let caps: serde_json::Value = r.get("caps");
             out.push(NodeView {
@@ -498,6 +505,7 @@ impl AppState {
                 caps: serde_json::from_value(caps).map_err(|e| sqlx::Error::Decode(Box::new(e)))?,
                 devices: devices.remove(&id).unwrap_or_default(),
                 last_seen: r.get("last_seen"),
+                owner: r.get("owner"),
             });
         }
         tx.commit().await?;

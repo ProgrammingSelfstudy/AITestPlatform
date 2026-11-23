@@ -210,9 +210,13 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("执行节点启动，连接 {url}");
     let mut cfg = NodeConfig::new(url, token, state_dir);
+    // 节点主人：只记名字（NODE_USER_NAME），靠自觉；老办法 NODE_USER_TOKEN 仍然可用
+    cfg.user_name = std::env::var("NODE_USER_NAME").ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
     cfg.user_token = std::env::var("NODE_USER_TOKEN").ok().filter(|v| !v.is_empty());
-    if cfg.user_token.is_none() {
-        tracing::warn!("没有设置 NODE_USER_TOKEN：节点没有属主，任何人都发不了任务到这个节点（先 server create-user，再把令牌设进来）");
+    match (&cfg.user_name, &cfg.user_token) {
+        (Some(name), _) => tracing::info!("节点主人：{name}"),
+        (None, Some(_)) => tracing::info!("节点主人按个人令牌识别（老办法；建议改用 NODE_USER_NAME=你的名字）"),
+        (None, None) => tracing::warn!("没有设置 NODE_USER_NAME：节点没有属主，任何人都发不了任务到这个节点（启动时设 NODE_USER_NAME=你的名字）"),
     }
     // HAFA_DEVICE_ALLOW=序列号,序列号：只让这些设备参与（账号不能同时登在两台手机上时用）
     let allow: Vec<String> = std::env::var("HAFA_DEVICE_ALLOW").unwrap_or_default().split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();

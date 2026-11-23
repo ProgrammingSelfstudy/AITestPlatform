@@ -293,7 +293,7 @@
   color: var(--text-muted);
 }
 
-/* 顶部节点与个人令牌控制带 */
+/* 顶部节点与「我是谁」控制带 */
 
 .roles-hero-controls {
   display: grid;

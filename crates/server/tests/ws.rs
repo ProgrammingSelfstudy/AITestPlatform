@@ -50,7 +50,7 @@ fn hello(token: &str, node_id: Option<Uuid>, devices: Vec<DeviceInfo>) -> String
         token: token.into(),
         node_id,
         node_secret: secret_for(node_id),
-        user_token: None,
+        user_token: None, user_name: None,
         caps: Caps {
             node_version: "test".into(),
             os: "macos".into(),

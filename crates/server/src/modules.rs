@@ -80,8 +80,15 @@ fn plain_password_line(doc: &str) -> Option<usize> {
     })
 }
 
-pub fn check_doc(doc: &str) -> Res<String> {
-    let doc = doc.trim();
+/// 规范化：换行统一成 `\n`、每行去掉行尾空白、去掉首尾空行。**内容相同就是同一份文档**——
+/// 只是换行符不同（Windows 的 `\r\n`）、行尾多了空格的，不能被当成两份。
+pub fn normalize_doc(raw: &str) -> String {
+    raw.replace("\r\n", "\n").replace('\r', "\n").lines().map(str::trim_end).collect::<Vec<_>>().join("\n").trim().to_string()
+}
+
+pub fn check_doc(raw: &str) -> Res<String> {
+    let doc = normalize_doc(raw);
+    let doc = doc.as_str();
     if doc.is_empty() {
         return invalid("需求文档必填：请粘贴或上传需求文档（Markdown 或文本）");
     }
@@ -402,8 +409,7 @@ pub(crate) async fn api_create_request(
     let Json(mut input) = body.map_err(|_| (StatusCode::BAD_REQUEST, "请求格式无效，或内容太大（截图合计不要超过约 18MB）".to_string()))?;
     // 先校验必填和格式，再校验身份和节点属主：缺项的提示不依赖库
     let validated = validate(&input).map_err(|e| api_error(e, "校验失败"))?;
-    let token = headers.get("x-user-token").and_then(|h| h.to_str().ok()).unwrap_or_default();
-    let user = crate::api::owner_check(&state, token, input.node_id).await?;
+    let user = crate::api::owner_check(&state, &headers, input.node_id).await?;
     if !state.app.node_exists(input.node_id).await.map_err(|e| internal("查询节点失败", e))? {
         return Err((StatusCode::NOT_FOUND, "没有这个节点".to_string()));
     }
@@ -848,12 +854,11 @@ pub(crate) async fn api_module_cases(State(state): State<ApiState>, Path(id): Pa
     module_cases(state.app.pool(), id).await.map(Json).map_err(|e| api_error(e, "查询模块用例失败"))
 }
 
-/// 人的决定：必须是发起这个模块生成请求的人（个人令牌），只能处理生成的用例，且还没批准过。
+/// 人的决定：必须是发起这个模块生成请求的人（按名字），只能处理生成的用例，且还没批准过。
 async fn decider(state: &ApiState, headers: &HeaderMap, module_id: Uuid) -> Res<Uuid> {
-    let token = headers.get("x-user-token").and_then(|h| h.to_str().ok()).unwrap_or_default();
-    let user = crate::users::user_by_token(state.app.pool(), token)
-        .await?
-        .ok_or_else(|| ModuleError::Forbidden("需要有效的个人令牌才能确认或拒绝用例".into()))?;
+    let Some(user) = crate::users::browser_user(state.app.pool(), headers).await? else {
+        return Err(ModuleError::Forbidden(crate::users::NEED_NAME_MESSAGE.into()));
+    };
     let requested: bool = sqlx::query_scalar("select exists(select 1 from casegen_requests where module_id = $1 and requested_by = $2)")
         .bind(module_id)
         .bind(user)
@@ -1023,6 +1028,18 @@ mod tests {
             i.doc = format!("# 需求\n{ok}\n");
             assert_eq!(message(&i), "通过", "不应误伤：{ok}");
         }
+    }
+
+    #[test]
+    fn 内容相同就是同一份文档_换行符和行尾空格不影响() {
+        let a = check_doc("# 需求\n用户可以进入语聊房。\n").unwrap();
+        let b = check_doc("\r\n# 需求  \r\n用户可以进入语聊房。   \r\n\r\n").unwrap();
+        let c = check_doc("# 需求\r用户可以进入语聊房。").unwrap();
+        assert_eq!((a.as_str(), b.as_str(), c.as_str()), ("# 需求\n用户可以进入语聊房。", "# 需求\n用户可以进入语聊房。", "# 需求\n用户可以进入语聊房。"));
+        // 真的不一样（多一个字）才是另一份
+        assert_ne!(a, check_doc("# 需求\n用户可以进入语聊房吗。").unwrap());
+        // 行内的空白是内容的一部分，不动
+        assert_ne!(check_doc("a  b").unwrap(), check_doc("a b").unwrap());
     }
 
     #[test]
