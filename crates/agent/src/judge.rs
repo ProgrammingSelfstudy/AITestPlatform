@@ -16,6 +16,7 @@ use regex_automata::meta::Regex;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use crate::agy_cli::{self, AgyOpts};
 use crate::claude_cli::{self, ClaudeOpts, Failure};
 use crate::prompts::{AppKnowledge, render, verified_facts};
 
@@ -406,14 +407,18 @@ fn human_records(run_dir: &Path, trace: &Value) -> Vec<String> {
         .collect()
 }
 
-struct McpConfig {
-    temp_dir: PathBuf,
+/// 一次评审期间对运行目录的独占占用：持有目录锁，并清掉上一次的查看记录。
+///
+/// 证据服务把评审员**实际查看过**的截图和步骤号写进运行目录里的 `served.json`，核对结论时据此判断它引用的证据是不是真的看过。
+/// 所以同一个运行目录同一时刻只能有一次评审（否则两次评审的记录会混在一起），开始前也必须清掉旧记录。
+/// Claude 和 agy 两条路径共用这一份，核对证据的标准不因评审员不同而不同。
+struct EvidenceSession {
     // 同一轨迹目录里的 served.json 只属于一次正在进行的判定。
     _run_lock: File,
 }
 
-impl McpConfig {
-    fn new(run_dir: &Path, evidence_bin: &Path) -> io::Result<Self> {
+impl EvidenceSession {
+    fn begin(run_dir: &Path) -> io::Result<Self> {
         let run_lock = OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
@@ -427,6 +432,18 @@ impl McpConfig {
             Err(e) if e.kind() == io::ErrorKind::NotFound => (),
             Err(e) => return Err(e),
         }
+        Ok(Self { _run_lock: run_lock })
+    }
+}
+
+struct McpConfig {
+    temp_dir: PathBuf,
+    _session: EvidenceSession,
+}
+
+impl McpConfig {
+    fn new(run_dir: &Path, evidence_bin: &Path) -> io::Result<Self> {
+        let session = EvidenceSession::begin(run_dir)?;
 
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let base = std::env::temp_dir().canonicalize()?;
@@ -444,7 +461,7 @@ impl McpConfig {
         };
         let config = Self {
             temp_dir,
-            _run_lock: run_lock,
+            _session: session,
         };
         let bin = std::path::absolute(evidence_bin)?;
         let as_utf8 = |path: &Path| {
@@ -485,49 +502,34 @@ pub struct JudgeOutcome {
     pub raw: String,
 }
 
-pub async fn run_judge(
-    opts: &ClaudeOpts,
+/// 评审前准备好的输入：不依赖用哪个评审员。
+struct Prepared {
+    expected: Vec<String>,
+    run_dir: PathBuf,
+    trace: Value,
+    page: String,
+    prompt: String,
+}
+
+/// 读出本次轨迹、终态页面文字，拼好提示词。不能评审时返回 `Err`，里面就是该给出的结果（没调模型）。
+fn prepare(
     case: &CaseSpec,
     exec_result: &str,
     exec_reason: &str,
     run_dir: &Path,
-    evidence_bin: &Path,
-) -> JudgeOutcome {
+) -> Result<Prepared, JudgeOutcome> {
     let expected = expected_results(case);
-    let mut outcome = JudgeOutcome {
-        status: JudgeStatus::Failed,
-        final_result: FinalResult::Uncertain,
-        items: checked(None, &expected, &HashSet::new()).items,
-        reason: String::new(),
-        disagreement: String::new(),
-        quota_exhausted: false,
-        cost_usd: None,
-        wall_s: 0.0,
-        raw: String::new(),
-    };
+    let mut outcome = blank_outcome(&expected);
     let images = catalog(run_dir);
     let steps = step_text_catalog(run_dir);
     if images.is_empty() && steps.is_empty() {
         outcome.status = JudgeStatus::NotRun;
         outcome.reason = "本次轨迹无可用截图和步骤文字，未调用模型".into();
-        return outcome;
+        return Err(outcome);
     }
     let Ok(run_dir) = run_dir.canonicalize() else {
         outcome.reason = "判定失败，无法定位本次执行的轨迹目录".into();
-        return outcome;
-    };
-    let start = Instant::now();
-    if let Err(reason) = claude_cli::check_login(opts).await {
-        outcome.wall_s = start.elapsed().as_secs_f64();
-        outcome.reason = format!("判定调用失败，{reason}，转待人工确认");
-        return outcome;
-    }
-    let config = match McpConfig::new(&run_dir, evidence_bin) {
-        Ok(config) => config,
-        Err(e) => {
-            outcome.reason = format!("判定失败，无法准备证据 MCP：{e}");
-            return outcome;
-        }
+        return Err(outcome);
     };
     let trace: Value = read_run_text(&run_dir, "trace.json")
         .and_then(|text| serde_json::from_str(&text).ok())
@@ -544,13 +546,6 @@ pub async fn run_judge(
     } else {
         String::new()
     };
-    let opts = ClaudeOpts {
-        mcp_config: Some(config.path()),
-        tools: vec![],
-        allowed_tools: vec![IMAGE_TOOL.into(), STEP_TEXT_TOOL.into()],
-        system_prompt: Some(JUDGE_SYSTEM.into()),
-        ..opts.clone()
-    };
     let prompt = build_prompt_with_human(
         case,
         exec_result,
@@ -560,7 +555,73 @@ pub async fn run_judge(
         &steps,
         &human_records(&run_dir, &trace),
     );
-    let response = claude_cli::run(&opts, &prompt).await;
+    Ok(Prepared {
+        expected,
+        run_dir,
+        trace,
+        page,
+        prompt,
+    })
+}
+
+/// 评审员给出了文本结论之后：解析，并按证据服务记下的「实际查看记录」核对它引用的证据。
+/// 这是两条评审路径唯一的一份核对逻辑。`who` 只用于说明文字。
+fn conclude(outcome: &mut JudgeOutcome, prepared: &Prepared, who: &str) {
+    let Some(parsed) = parse(&outcome.raw) else {
+        outcome.reason = format!("判定失败，无法解析 {who} 的判定结果，转待人工确认");
+        return;
+    };
+    let served = read_run_text(&prepared.run_dir, "served.json")
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default();
+    let verdict = checked_with_text(
+        Some(&parsed),
+        &prepared.expected,
+        &served,
+        &prepared.trace,
+        &prepared.page,
+    );
+    outcome.status = JudgeStatus::Completed;
+    outcome.final_result = verdict.final_result;
+    outcome.items = verdict.items;
+    outcome.reason = verdict.reason;
+    outcome.disagreement = verdict.disagreement;
+}
+
+pub async fn run_judge(
+    opts: &ClaudeOpts,
+    case: &CaseSpec,
+    exec_result: &str,
+    exec_reason: &str,
+    run_dir: &Path,
+    evidence_bin: &Path,
+) -> JudgeOutcome {
+    let prepared = match prepare(case, exec_result, exec_reason, run_dir) {
+        Ok(prepared) => prepared,
+        Err(outcome) => return outcome,
+    };
+    let mut outcome = blank_outcome(&prepared.expected);
+    let start = Instant::now();
+    if let Err(reason) = claude_cli::check_login(opts).await {
+        outcome.wall_s = start.elapsed().as_secs_f64();
+        outcome.reason = format!("判定调用失败，{reason}，转待人工确认");
+        return outcome;
+    }
+    let config = match McpConfig::new(&prepared.run_dir, evidence_bin) {
+        Ok(config) => config,
+        Err(e) => {
+            outcome.reason = format!("判定失败，无法准备证据 MCP：{e}");
+            return outcome;
+        }
+    };
+    let opts = ClaudeOpts {
+        mcp_config: Some(config.path()),
+        tools: vec![],
+        allowed_tools: vec![IMAGE_TOOL.into(), STEP_TEXT_TOOL.into()],
+        system_prompt: Some(JUDGE_SYSTEM.into()),
+        ..opts.clone()
+    };
+    let response = claude_cli::run(&opts, &prepared.prompt).await;
     outcome.wall_s = start.elapsed().as_secs_f64();
     outcome.cost_usd = response.cost_usd;
     outcome.raw = response.text;
@@ -583,18 +644,107 @@ pub async fn run_judge(
         outcome.reason = format!("判定调用失败，{detail}，转待人工确认");
         return outcome;
     }
-    let Some(parsed) = parse(&outcome.raw) else {
-        outcome.reason = "判定失败，无法解析 Claude 的判定结果，转待人工确认".into();
-        return outcome;
+    conclude(&mut outcome, &prepared, "Claude");
+    outcome
+}
+
+/// Judge 没跑成时的样子：待人工确认，逐条都是待确认。不得用别的东西顶替（规则 5）。
+fn blank_outcome(expected: &[String]) -> JudgeOutcome {
+    JudgeOutcome {
+        status: JudgeStatus::Failed,
+        final_result: FinalResult::Uncertain,
+        items: checked(None, expected, &HashSet::new()).items,
+        reason: String::new(),
+        disagreement: String::new(),
+        quota_exhausted: false,
+        cost_usd: None,
+        wall_s: 0.0,
+        raw: String::new(),
+    }
+}
+
+/// 只给 agy 的工具使用说明。Claude 的命令行把证据工具直接列成 `image` / `step_text`，一句「用 evidence 的 image 工具」就够了；
+/// agy 自带读文件、命令行、浏览器等一批内置工具，MCP 要经通用的 `call_mcp_tool` 调用，不说清楚它就会去读文件
+/// （真实运行里就发生过：两次 `read_file`，被审计拦下，整次评审作废）。
+pub const AGY_TOOL_GUIDE: &str = "【工具使用方式】证据只能通过 MCP 工具获取：调用 call_mcp_tool，ServerName 填 evidence，\
+ToolName 填 image（参数 name 是截图文件名，如 1_after.png）或 step_text（参数 step 是整数步骤号）。\
+不要使用 read_file、命令行、浏览器、搜索等任何其他工具，也不要尝试按路径读取截图或轨迹文件：它们读不到，也不需要读。\
+使用 evidence 之外的任何工具都会使这次评审作废。下面的「按需调用 image 查看」「调用 step_text」都指这两个 MCP 工具。";
+
+/// 用 agy（Gemini）做评审员。和 [`run_judge`] 用同一套提示词、同一份证据服务、同一份核对逻辑；
+/// 区别只在怎么调模型：agy 没有系统提示词开关（提示词合并进用户消息），证据 MCP 经临时 HOME 里的专用配置挂上，
+/// 调用了证据工具之外的任何工具、或有被自动拒绝的动作，整次评审不可信，转待人工确认。
+pub async fn run_judge_agy(
+    opts: &AgyOpts,
+    case: &CaseSpec,
+    exec_result: &str,
+    exec_reason: &str,
+    run_dir: &Path,
+    evidence_bin: &Path,
+) -> JudgeOutcome {
+    let prepared = match prepare(case, exec_result, exec_reason, run_dir) {
+        Ok(prepared) => prepared,
+        Err(outcome) => return outcome,
     };
-    let served = read_run_text(&run_dir, "served.json")
-        .and_then(|text| serde_json::from_str(&text).ok())
-        .unwrap_or_default();
-    let verdict = checked_with_text(Some(&parsed), &expected, &served, &trace, &page);
-    outcome.status = JudgeStatus::Completed;
-    outcome.final_result = verdict.final_result;
-    outcome.items = verdict.items;
-    outcome.reason = verdict.reason;
-    outcome.disagreement = verdict.disagreement;
+    let mut outcome = blank_outcome(&prepared.expected);
+    let start = Instant::now();
+    if let Err(reason) = agy_cli::check_login(opts).await {
+        outcome.wall_s = start.elapsed().as_secs_f64();
+        outcome.reason = format!("判定调用失败，{reason}，转待人工确认");
+        return outcome;
+    }
+    let _session = match EvidenceSession::begin(&prepared.run_dir) {
+        Ok(session) => session,
+        Err(e) => {
+            outcome.reason = format!("判定失败，无法准备证据 MCP：{e}");
+            return outcome;
+        }
+    };
+    let command = match std::path::absolute(evidence_bin).ok().filter(|path| path.to_str().is_some()) {
+        Some(command) => command,
+        None => {
+            outcome.reason = "判定失败，无法准备证据 MCP：证据服务的路径必须是 UTF-8".into();
+            return outcome;
+        }
+    };
+    let opts = AgyOpts {
+        mcp: vec![agy_cli::McpServer {
+            name: "evidence".into(),
+            command,
+            env: BTreeMap::from([("HAFA_RUN_DIR".to_string(), prepared.run_dir.to_string_lossy().into_owned())]),
+        }],
+        allowed_tools: vec![("evidence".into(), "image".into()), ("evidence".into(), "step_text".into())],
+        ..opts.clone()
+    };
+    let prompt = format!("{AGY_TOOL_GUIDE}\n\n{JUDGE_SYSTEM}\n\n---\n\n{}", prepared.prompt);
+    let response = agy_cli::run(&opts, &prompt).await;
+    outcome.wall_s = start.elapsed().as_secs_f64();
+    outcome.raw = response.text.clone();
+    if let Some(failure) = &response.failure {
+        outcome.quota_exhausted = matches!(failure, agy_cli::Failure::Quota(_));
+        // 原始报错可能带本机信息，供节点上报的理由只写错误类型。
+        let detail = match failure {
+            agy_cli::Failure::Quota(_) => "agy 额度用完或被限流".to_string(),
+            agy_cli::Failure::Auth(_) => "agy 登录失效".into(),
+            agy_cli::Failure::Timeout { secs } => format!("agy 超时（总时限 {secs} 秒）"),
+            agy_cli::Failure::Spawn(_) => "无法启动 agy 命令行".into(),
+            agy_cli::Failure::Exit { code } => code.map_or_else(
+                || "agy 进程异常退出".into(),
+                |c| format!("agy 进程异常退出（退出码 {c}）"),
+            ),
+            agy_cli::Failure::Result(_) => "agy 命令行返回错误结果".into(),
+            agy_cli::Failure::NoResult => "agy 命令行没有返回结果事件".into(),
+        };
+        outcome.reason = format!("判定调用失败，{detail}，转待人工确认");
+        return outcome;
+    }
+    // 它想做白名单之外的事：不管最后给出什么结论，这次评审都不可信（可能绕开了证据工具读到没经过服务端记录的内容）
+    if !response.violations.is_empty() || !response.denied.is_empty() {
+        let mut what = response.violations.clone();
+        what.extend(response.denied.iter().map(|action| format!("请求了被拒绝的权限 {action}")));
+        outcome.reason = format!("判定失败，agy 在评审中越出了证据工具的范围（{}），评审结果不可信，转待人工确认", what.join("；"));
+        return outcome;
+    }
+    conclude(&mut outcome, &prepared, "agy");
     outcome
 }

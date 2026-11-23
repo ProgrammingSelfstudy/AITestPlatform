@@ -63,3 +63,44 @@ async fn 真实_agy_登录检查和经证据工具评审() {
     assert!(served.contains("1_after.png") && served.contains("step:1"), "served.json：{served}");
     assert!(!served.contains("2_after.png"), "没取过的证据不能出现在记录里：{served}");
 }
+
+/// 走完整的 Judge 路径：真实 agy 作为评审员，用和 Claude 评审员同一套提示词和同一份核对逻辑。
+/// 合成证据：两条预期分别要求「看图」和「读步骤文字」，所以评审结果里每条的引用必须是它实际查看过的证据。
+#[tokio::test]
+#[ignore = "需要本机 agy 个人账号登录，会花一点 Gemini 额度"]
+async fn 真实_agy_作为评审员走完整_judge_路径() {
+    use agent::judge::run_judge_agy;
+    use protocol::{CaseExpected, CaseSpec, FinalResult, JudgeStatus, Verdict};
+
+    let case = CaseSpec {
+        code: "TC-SYN".into(),
+        title: "合成证据用例".into(),
+        preconditions: vec![],
+        steps: vec!["点击 More".into()],
+        expected: vec![
+            CaseExpected { idx: 1, text: "步骤 1 操作后的截图（1_after.png）里，左上角象限是红色".into() },
+            CaseExpected { idx: 2, text: "步骤 1 操作后，页面控件文字里出现一个形如「动物名-数字」的暗号".into() },
+        ],
+        data: serde_json::json!({}),
+    };
+    let model = std::env::var("AGY_TEST_MODEL").unwrap_or_else(|_| "gemini-4-neon-high".into());
+    let opts = AgyOpts { model: Some(model), total_timeout: Duration::from_secs(400), ..AgyOpts::default() };
+    let run_dir = std::env::temp_dir().join(format!("hafa-agyreal-judge-{}", std::process::id()));
+    fs::create_dir_all(run_dir.join("shots")).unwrap();
+    fs::write(run_dir.join("shots/1_after.png"), SHOT_1).unwrap();
+    fs::write(run_dir.join("shots/2_after.png"), SHOT_2).unwrap();
+    fs::write(run_dir.join("trace.json"), TRACE).unwrap();
+
+    let outcome = run_judge_agy(&opts, &case, "passed", "执行员自评：看到了红色和暗号", &run_dir, &evidence_binary()).await;
+    let served = fs::read_to_string(run_dir.join("served.json")).unwrap_or_default();
+    let _ = fs::remove_dir_all(&run_dir);
+    println!("耗时 {:.1}s，结论 {:?}，served {served}\n条目：{:#?}\n理由：{}", outcome.wall_s, outcome.final_result, outcome.items, outcome.reason);
+
+    assert_eq!(outcome.status, JudgeStatus::Completed, "{}", outcome.reason);
+    assert_eq!(outcome.final_result, FinalResult::Passed, "{}", outcome.reason);
+    assert!(outcome.items.iter().all(|item| item.verdict == Verdict::Passed));
+    assert!(outcome.items[0].file_refs.iter().any(|reference| reference == "1_after.png"), "{:?}", outcome.items[0]);
+    assert!(outcome.items[1].file_refs.iter().any(|reference| reference == "step:1"), "{:?}", outcome.items[1]);
+    // 核对的依据是证据服务自己的查看记录：引用都是真的查看过
+    assert!(served.contains("1_after.png") && served.contains("step:1"), "{served}");
+}
