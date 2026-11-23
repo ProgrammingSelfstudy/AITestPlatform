@@ -50,6 +50,15 @@ pub(crate) fn routes(app: AppState, paths: Paths) -> Router {
     let authorize_write = axum::middleware::from_fn_with_state(app.clone(), reviews::authorize);
     Router::new()
         .route("/api/models", get(models))
+        .route("/api/projects/{project}/modules", post(crate::modules::api_create_module).route_layer(authorize_write.clone()).get(crate::modules::api_list))
+        .route(
+            "/api/projects/{project}/casegen-requests",
+            post(crate::modules::api_create_request)
+                .route_layer(authorize_write.clone())
+                // 截图用 base64 放在 JSON 里：最多 6 张 × 3MB，再加文档，放宽到 32MB
+                .layer(axum::extract::DefaultBodyLimit::max(32 * 1024 * 1024)),
+        )
+        .route("/api/casegen-requests/{id}", get(crate::modules::api_request_detail))
         .route("/api/nodes/{id}/roles", post(set_node_roles).route_layer(authorize_write.clone()).get(node_roles))
         .route("/api/nodes/{id}/roles/init-template", post(init_node_roles).route_layer(authorize_write.clone()))
         .route("/api/nodes/{id}/roles/{role}/check", post(check_node_role).route_layer(authorize_write.clone()))
@@ -366,7 +375,7 @@ fn run_error(error: RunError, action: &str) -> ApiError {
 }
 
 /// 校验个人令牌有效、所选节点属于该用户（规则 9：只能用自己的节点）。节点不存在放行，交给后面的校验。
-async fn owner_check(state: &ApiState, token: &str, node: Uuid) -> Result<Uuid, ApiError> {
+pub(crate) async fn owner_check(state: &ApiState, token: &str, node: Uuid) -> Result<Uuid, ApiError> {
     let user = crate::users::user_by_token(state.app.pool(), token)
         .await
         .map_err(|e| internal("校验发起人失败", e))?

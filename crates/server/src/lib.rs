@@ -7,6 +7,7 @@ mod api;
 pub mod cases;
 mod evidence_sign;
 mod files;
+pub mod modules;
 pub mod recording_retention;
 pub mod regress_requests;
 mod reviews;
@@ -279,6 +280,11 @@ impl AppState {
     #[cfg(test)]
     pub(crate) fn set_roles_report_for_test(&self, node_id: Uuid, report: protocol::RolesReport) {
         self.0.roles.lock().unwrap().insert(node_id, report);
+    }
+
+    /// 节点是否存在（不管在不在线）。
+    pub async fn node_exists(&self, node_id: Uuid) -> Result<bool, sqlx::Error> {
+        sqlx::query_scalar("select exists(select 1 from nodes where id = $1)").bind(node_id).fetch_one(&self.0.pool).await
     }
 
     /// 节点是否有有效连接。

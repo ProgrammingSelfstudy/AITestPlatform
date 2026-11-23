@@ -576,6 +576,82 @@ async fn 创建任务用节点上报的角色_没检测通过或没配置都拒�
     assert_eq!(status, StatusCode::FORBIDDEN);
 }
 
+// ---------------------------------------------------------------- 模块与用例生成请求
+
+fn casegen_body(node: Uuid, module: &str) -> Value {
+    use base64::Engine as _;
+    json!({
+        "module": module,
+        "doc": "# 需求\n用户可以进入语聊房。账号 {{account.username}}。",
+        "ui_links": ["https://example.com/design/1"],
+        "screenshots": [{"data_b64": base64::engine::general_purpose::STANDARD.encode(b"\x89PNG\r\n\x1a\nxxxx")}],
+        "node_id": node,
+    })
+}
+
+#[tokio::test]
+async fn 模块和生成请求_必填校验_去重_只能用自己的节点() {
+    let world = World::new().await;
+    let path = "/api/projects/hafa/casegen-requests";
+    // 必填缺项：400，并说明缺什么
+    for (key, value, expect) in [
+        ("module", json!(""), "模块必填"),
+        ("doc", json!(""), "需求文档必填"),
+        ("ui_links", json!([]), "UI 图链接必填"),
+        ("screenshots", json!([]), "UI 区域截图必填"),
+        ("ui_links", json!(["javascript:alert(1)"]), "http"),
+        ("doc", json!("密码：hunter2"), "明文密码"),
+    ] {
+        let mut body = casegen_body(world.node, "语聊房");
+        body[key] = value;
+        let (status, _, bytes) = browser_post(&world.app, path, body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{key}");
+        assert!(text(&bytes).contains(expect), "{key}：{}", text(&bytes));
+        assert!(!text(&bytes).contains("hunter2"), "错误里不能回显密码");
+    }
+    // 项目不存在：404；别人的令牌往这个节点发：403
+    let (status, _, _) = browser_post(&world.app, "/api/projects/不存在的项目/casegen-requests", casegen_body(world.node, "m")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    sqlx::query("insert into users (name, token_hash) values ('生成请求的另一个人', $1)").bind(crate::secret_hash("u_casegen-other")).execute(world.state.pool()).await.unwrap();
+    let mut headers = review_headers(REVIEW_TOKEN);
+    headers.push(("x-user-token", "u_casegen-other"));
+    let (status, _, _) = request(&world.app, Method::POST, path, &headers, casegen_body(world.node, "语聊房").to_string()).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    // 成功：201；同模块同节点再提交：409
+    let (status, _, bytes) = browser_post(&world.app, path, casegen_body(world.node, "语聊房")).await;
+    assert_eq!(status, StatusCode::CREATED, "{}", text(&bytes));
+    let created = json_body(&bytes);
+    let (status, _, bytes) = browser_post(&world.app, path, casegen_body(world.node, "语聊房")).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{}", text(&bytes));
+    // 另一个模块用同一份文档：项目级文档只存一份
+    let (status, _, bytes) = browser_post(&world.app, path, casegen_body(world.node, "个人主页")).await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(json_body(&bytes)["doc_id"], created["doc_id"]);
+    let docs: i64 = sqlx::query_scalar("select count(*) from project_docs").fetch_one(world.state.pool()).await.unwrap();
+    assert_eq!(docs, 1);
+    // 详情：截图数、链接、状态
+    let id = created["request_id"].as_str().unwrap();
+    let (status, _, bytes) = request(&world.app, Method::GET, &format!("/api/casegen-requests/{id}"), &[], "").await;
+    assert_eq!(status, StatusCode::OK);
+    let detail = json_body(&bytes);
+    assert_eq!((detail["status"].as_str(), detail["screenshot_count"].as_i64(), detail["module"].as_str()), (Some("queued"), Some(1), Some("语聊房")));
+    assert_eq!(detail["ui_links"], json!(["https://example.com/design/1"]));
+    // 模块列表带最近一次请求；老用例不属于任何模块
+    let (status, _, bytes) = request(&world.app, Method::GET, "/api/projects/hafa/modules", &[], "").await;
+    assert_eq!(status, StatusCode::OK);
+    let modules = json_body(&bytes);
+    assert_eq!(modules.as_array().unwrap().len(), 2);
+    assert_eq!(modules[0]["latest_request"]["status"], "queued");
+    assert_eq!(modules[0]["case_count"], 0);
+    // 单独建模块：幂等；名字不合法 400
+    let (status, _, _) = browser_post(&world.app, "/api/projects/hafa/modules", json!({"name": "  "})).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, _, _) = browser_post(&world.app, "/api/projects/hafa/modules", json!({"name": "语聊房"})).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (_, _, bytes) = request(&world.app, Method::GET, "/api/projects/hafa/modules", &[], "").await;
+    assert_eq!(json_body(&bytes).as_array().unwrap().len(), 2, "重复建同名模块不能多出一个");
+}
+
 struct World {
     temp: TempPaths,
     app: Router,

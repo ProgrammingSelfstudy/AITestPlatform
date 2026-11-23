@@ -2203,6 +2203,7 @@ dependencies = [
  "aes-gcm",
  "anyhow",
  "axum",
+ "base64 0.22.1",
  "chrono",
  "dotenvy",
  "futures-util",
