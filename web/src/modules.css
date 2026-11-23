@@ -1,0 +1,1806 @@
+/* 模块列表、模块详情（普通布局 + 测试中指挥台布局）与新建生成任务弹窗共用样式 */
+/* 复用 theme.css 设计变量，支持浅色与深色双主题（WCAG AA），类名统一 mod- 前缀 */
+
+:root {
+  /* 评审员意见状态色（冷靛蓝，绝不与已批准的绿色混淆） */
+  --mod-reviewed-fg: #3730a3;
+  --mod-reviewed-bg: rgba(79, 70, 229, 0.10);
+  --mod-reviewed-border: rgba(79, 70, 229, 0.24);
+
+  /* 必填标记 */
+  --mod-req-fg: #be123c;
+  --mod-req-bg: rgba(225, 29, 72, 0.09);
+
+  /* 测试中指挥台：顶部指挥带、活跃卡片发光、终端日志表面（浅色模式） */
+  --mod-hero-bg: linear-gradient(135deg, rgba(5, 150, 105, 0.055) 0%, var(--bg-surface) 45%, rgba(37, 99, 235, 0.055) 100%);
+  --mod-hero-border: rgba(37, 99, 235, 0.30);
+  --mod-hero-glow: 0 10px 28px -12px rgba(37, 99, 235, 0.16);
+
+  --mod-emblem-bg: rgba(37, 99, 235, 0.09);
+  --mod-emblem-border: rgba(37, 99, 235, 0.36);
+  --mod-emblem-fg: #1d4ed8;
+
+  --mod-active-border: rgba(37, 99, 235, 0.72);
+  --mod-active-glow: 0 0 0 1px rgba(37, 99, 235, 0.22), 0 8px 22px -6px rgba(37, 99, 235, 0.20);
+  --mod-active-bg: linear-gradient(135deg, rgba(37, 99, 235, 0.06) 0%, var(--bg-surface) 64%);
+
+  --mod-fail-border: rgba(190, 18, 60, 0.42);
+  --mod-unc-border: rgba(180, 83, 9, 0.40);
+  --mod-pass-border: rgba(4, 120, 87, 0.32);
+
+  --mod-term-bg: #f1f5f9;
+  --mod-term-header: rgba(15, 23, 42, 0.045);
+  --mod-term-border: rgba(15, 23, 42, 0.12);
+  --mod-term-fg: #0f172a;
+  --mod-term-muted: #475569;
+  --mod-term-row-hover: rgba(15, 23, 42, 0.035);
+
+  --mod-track-bg: rgba(15, 23, 42, 0.08);
+  --mod-pipe-line: rgba(15, 23, 42, 0.18);
+  --mod-pipe-line-active: rgba(37, 99, 235, 0.55);
+}
+
+:root[data-theme="dark"] {
+  --mod-reviewed-fg: #a5b4fc;
+  --mod-reviewed-bg: rgba(99, 102, 241, 0.18);
+  --mod-reviewed-border: rgba(129, 140, 248, 0.36);
+
+  --mod-req-fg: #fb7185;
+  --mod-req-bg: rgba(251, 113, 133, 0.15);
+
+  --mod-hero-bg: linear-gradient(135deg, rgba(16, 185, 129, 0.08) 0%, var(--bg-surface) 44%, rgba(59, 130, 246, 0.09) 100%);
+  --mod-hero-border: rgba(96, 165, 250, 0.34);
+  --mod-hero-glow: 0 0 38px -14px rgba(59, 130, 246, 0.32), var(--shadow-sm);
+
+  --mod-emblem-bg: rgba(59, 130, 246, 0.14);
+  --mod-emblem-border: rgba(96, 165, 250, 0.45);
+  --mod-emblem-fg: #60a5fa;
+
+  --mod-active-border: rgba(96, 165, 250, 0.82);
+  --mod-active-glow: 0 0 0 1px rgba(96, 165, 250, 0.28), 0 0 26px -4px rgba(59, 130, 246, 0.36);
+  --mod-active-bg: linear-gradient(135deg, rgba(59, 130, 246, 0.14) 0%, var(--bg-surface) 66%);
+
+  --mod-fail-border: rgba(251, 113, 133, 0.45);
+  --mod-unc-border: rgba(251, 191, 36, 0.42);
+  --mod-pass-border: rgba(52, 211, 153, 0.34);
+
+  --mod-term-bg: #070a0f;
+  --mod-term-header: rgba(255, 255, 255, 0.035);
+  --mod-term-border: rgba(255, 255, 255, 0.10);
+  --mod-term-fg: #e4e4e7;
+  --mod-term-muted: #94a3b8;
+  --mod-term-row-hover: rgba(255, 255, 255, 0.04);
+
+  --mod-track-bg: rgba(255, 255, 255, 0.09);
+  --mod-pipe-line: rgba(255, 255, 255, 0.16);
+  --mod-pipe-line-active: rgba(96, 165, 250, 0.62);
+}
+
+/* ---------------------------------------------------------------- 通用基础 */
+
+.mod-page {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  color: var(--text-primary);
+  font-family: var(--font-sans);
+}
+
+.mod-mono {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+.mod-wrap-text {
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow-wrap: anywhere;
+}
+
+.mod-link {
+  color: var(--accent);
+  text-decoration: none;
+  font-weight: 500;
+}
+
+.mod-link:hover {
+  color: var(--accent-hover);
+  text-decoration: underline;
+}
+
+.mod-alerts-stack {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+/* ---------------------------------------------------------------- 统一语义徽章（永远文字 + 圆点） */
+
+.mod-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 9px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.45;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.mod-badge-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: currentColor;
+  flex-shrink: 0;
+}
+
+.mod-tone-pass {
+  color: var(--st-pass-fg);
+  background: var(--st-pass-bg);
+}
+
+.mod-tone-fail {
+  color: var(--st-fail-fg);
+  background: var(--st-fail-bg);
+}
+
+.mod-tone-unc {
+  color: var(--st-unc-fg);
+  background: var(--st-unc-bg);
+}
+
+.mod-tone-blk {
+  color: var(--st-blk-fg);
+  background: var(--st-blk-bg);
+}
+
+.mod-tone-run {
+  color: var(--st-run-fg);
+  background: var(--st-run-bg);
+}
+
+.mod-tone-que {
+  color: var(--st-que-fg);
+  background: var(--st-que-bg);
+}
+
+.mod-tone-can {
+  color: var(--st-can-fg);
+  background: var(--st-can-bg);
+}
+
+.mod-tone-lost {
+  color: var(--st-lost-fg);
+  background: var(--st-lost-bg);
+}
+
+.mod-tone-reviewed {
+  color: var(--mod-reviewed-fg);
+  background: var(--mod-reviewed-bg);
+}
+
+@keyframes mod-live-pulse {
+  0%, 100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.35;
+  }
+}
+
+.mod-pulse-dot {
+  animation: mod-live-pulse 1.8s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .mod-pulse-dot {
+    animation: none;
+  }
+}
+
+.mod-origin-tag {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 7px;
+  border-radius: 6px;
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--text-secondary);
+  background: var(--bg-subtle);
+  border: 1px solid var(--border-hairline);
+  white-space: nowrap;
+}
+
+/* ---------------------------------------------------------------- 模块列表页（普通布局） */
+
+.mod-list-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  flex-wrap: wrap;
+}
+
+.mod-list-title-group {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+.mod-list-title {
+  margin: 0;
+  font-size: 22px;
+  font-weight: 700;
+  line-height: 1.25;
+  letter-spacing: -0.02em;
+  color: var(--text-primary);
+}
+
+.mod-flow-banner {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+  padding: 10px 14px;
+  border-radius: var(--radius-md);
+  background: var(--bg-surface);
+  border: 1px solid var(--border-hairline);
+  font-size: 13px;
+  color: var(--text-secondary);
+  box-shadow: var(--shadow-xs);
+}
+
+.mod-flow-banner-label {
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.mod-flow-banner-arrow {
+  color: var(--text-muted);
+}
+
+.mod-cards-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
+  gap: var(--space-4);
+}
+
+.mod-module-card {
+  background: var(--bg-surface);
+  border: 1px solid var(--border-hairline);
+  border-radius: var(--radius-lg);
+  padding: var(--space-5);
+  box-shadow: var(--shadow-xs);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  transition: border-color 140ms ease, box-shadow 140ms ease;
+}
+
+.mod-module-card:hover {
+  border-color: var(--border-strong);
+  box-shadow: var(--shadow-sm);
+}
+
+.mod-module-card.is-failed {
+  border-color: var(--mod-fail-border);
+}
+
+.mod-module-card.is-testing {
+  border-color: var(--mod-hero-border);
+}
+
+.mod-module-card-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-3);
+}
+
+.mod-module-name {
+  font-size: 16px;
+  font-weight: 700;
+  color: var(--text-primary);
+  text-decoration: none;
+  line-height: 1.35;
+  word-break: break-word;
+}
+
+.mod-module-name:hover {
+  color: var(--accent);
+  text-decoration: underline;
+}
+
+.mod-module-fail-box {
+  padding: 9px 12px;
+  border-radius: var(--radius-sm);
+  background: var(--st-fail-bg);
+  border: 1px solid var(--mod-fail-border);
+  color: var(--st-fail-fg);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.mod-module-fail-title {
+  font-weight: 700;
+  margin-bottom: 2px;
+}
+
+.mod-progress-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.mod-progress-bar {
+  height: 6px;
+  width: 100%;
+  border-radius: 999px;
+  background: var(--mod-track-bg);
+  overflow: hidden;
+  display: flex;
+}
+
+.mod-progress-seg-approved {
+  height: 100%;
+  background: var(--st-pass-fg);
+}
+
+.mod-progress-seg-human {
+  height: 100%;
+  background: var(--st-unc-fg);
+}
+
+.mod-progress-seg-other {
+  height: 100%;
+  background: var(--st-que-fg);
+  opacity: 0.45;
+}
+
+.mod-module-metrics {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: var(--space-2);
+}
+
+.mod-metric-cell {
+  background: var(--bg-subtle);
+  border: 1px solid var(--border-hairline);
+  border-radius: var(--radius-sm);
+  padding: 8px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.mod-metric-label {
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.mod-metric-val {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  font-size: 18px;
+  font-weight: 700;
+  line-height: 1.2;
+  color: var(--text-primary);
+}
+
+.mod-metric-val.is-pass {
+  color: var(--st-pass-fg);
+}
+
+.mod-metric-val.is-unc {
+  color: var(--st-unc-fg);
+}
+
+.mod-module-card-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+  padding-top: var(--space-2);
+  border-top: 1px solid var(--border-hairline);
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.mod-empty-card {
+  background: var(--bg-surface);
+  border: 1px solid var(--border-hairline);
+  border-radius: var(--radius-lg);
+  padding: var(--space-8) var(--space-6);
+  text-align: center;
+  box-shadow: var(--shadow-xs);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--space-3);
+}
+
+/* ---------------------------------------------------------------- 模块详情页：普通布局头部与流程进度条 */
+
+.mod-detail-header {
+  background: var(--bg-surface);
+  border: 1px solid var(--border-hairline);
+  border-radius: var(--radius-lg);
+  padding: var(--space-5);
+  box-shadow: var(--shadow-xs);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+
+.mod-detail-header-top {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-4);
+  flex-wrap: wrap;
+}
+
+.mod-detail-title-col {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+
+.mod-back-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 12px;
+  color: var(--text-secondary);
+  text-decoration: none;
+  width: fit-content;
+}
+
+.mod-back-link:hover {
+  color: var(--accent);
+}
+
+.mod-detail-title-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+}
+
+.mod-detail-title {
+  margin: 0;
+  font-size: 22px;
+  font-weight: 700;
+  line-height: 1.25;
+  color: var(--text-primary);
+  word-break: break-word;
+}
+
+.mod-detail-sub {
+  font-size: 12px;
+  color: var(--text-muted);
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+}
+
+.mod-detail-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+}
+
+/* 5 步流程进度条 */
+
+.mod-stepper {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: var(--space-2);
+  padding-top: var(--space-3);
+  border-top: 1px solid var(--border-hairline);
+}
+
+.mod-step {
+  background: var(--bg-subtle);
+  border: 1px solid var(--border-hairline);
+  border-radius: var(--radius-md);
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+.mod-step.is-done {
+  border-color: var(--mod-pass-border);
+  background: var(--st-pass-bg);
+}
+
+.mod-step.is-active {
+  border-color: var(--mod-active-border);
+  background: var(--accent-soft);
+}
+
+.mod-step.is-error {
+  border-color: var(--mod-fail-border);
+  background: var(--st-fail-bg);
+}
+
+.mod-step-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+}
+
+.mod-step-num {
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 700;
+  background: var(--bg-surface);
+  color: var(--text-secondary);
+  border: 1px solid var(--border-strong);
+  flex-shrink: 0;
+}
+
+.mod-step.is-done .mod-step-num {
+  background: var(--st-pass-fg);
+  color: #ffffff;
+  border-color: transparent;
+}
+
+.mod-step.is-active .mod-step-num {
+  background: var(--accent-solid);
+  color: #ffffff;
+  border-color: transparent;
+}
+
+.mod-step.is-error .mod-step-num {
+  background: var(--st-fail-fg);
+  color: #ffffff;
+  border-color: transparent;
+}
+
+.mod-step-name {
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--text-primary);
+}
+
+.mod-step-state {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+
+.mod-step.is-done .mod-step-state {
+  color: var(--st-pass-fg);
+}
+
+.mod-step.is-active .mod-step-state {
+  color: var(--st-run-fg);
+}
+
+.mod-step.is-error .mod-step-state {
+  color: var(--st-fail-fg);
+}
+
+.mod-step-detail {
+  margin-top: 2px;
+  font-size: 11px;
+  line-height: 1.45;
+  color: var(--st-fail-fg);
+}
+
+/* 个人令牌栏 */
+
+.mod-token-bar {
+  background: var(--bg-surface);
+  border: 1px solid var(--border-hairline);
+  border-radius: var(--radius-md);
+  padding: 12px var(--space-4);
+  display: grid;
+  grid-template-columns: minmax(220px, 340px) minmax(0, 1fr);
+  gap: var(--space-4);
+  align-items: center;
+  box-shadow: var(--shadow-xs);
+}
+
+.mod-token-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.mod-token-label {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.mod-token-note {
+  font-size: 12px;
+  color: var(--text-secondary);
+  line-height: 1.5;
+}
+
+/* ---------------------------------------------------------------- 用例复核面板（普通布局 + 指挥台下方共用） */
+
+.mod-panel {
+  background: var(--bg-surface);
+  border: 1px solid var(--border-hairline);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-xs);
+  overflow: hidden;
+}
+
+.mod-panel-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  padding: 14px var(--space-5);
+  border-bottom: 1px solid var(--border-hairline);
+  flex-wrap: wrap;
+}
+
+.mod-panel-title-wrap {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+  min-width: 0;
+}
+
+.mod-panel-title {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--text-primary);
+}
+
+.mod-panel-sub {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.mod-review-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  padding: 12px var(--space-5);
+  background: var(--bg-subtle);
+  border-bottom: 1px solid var(--border-hairline);
+  flex-wrap: wrap;
+}
+
+.mod-filter-tabs {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.mod-filter-btn {
+  border: 1px solid var(--border-hairline);
+  background: var(--bg-surface);
+  color: var(--text-secondary);
+  border-radius: 999px;
+  padding: 4px 10px;
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  transition: border-color 120ms ease, background-color 120ms ease, color 120ms ease;
+}
+
+.mod-filter-btn:hover {
+  border-color: var(--border-strong);
+  color: var(--text-primary);
+}
+
+.mod-filter-btn.is-active {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.mod-bulk-wrap {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+}
+
+.mod-bulk-note {
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.mod-case-list {
+  display: flex;
+  flex-direction: column;
+}
+
+.mod-case-row {
+  padding: 14px var(--space-5);
+  border-bottom: 1px solid var(--border-hairline);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.mod-case-row:last-child {
+  border-bottom: none;
+}
+
+.mod-case-row.is-needs-human {
+  background: linear-gradient(90deg, var(--st-unc-bg) 0%, transparent 45%);
+  border-left: 3px solid var(--st-unc-fg);
+  padding-left: calc(var(--space-5) - 3px);
+}
+
+.mod-case-row-main {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-4);
+}
+
+.mod-case-row-info {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+  flex: 1;
+}
+
+.mod-case-row-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.mod-case-code {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--text-secondary);
+  background: var(--bg-subtle);
+  border: 1px solid var(--border-hairline);
+  border-radius: 6px;
+  padding: 1px 7px;
+}
+
+.mod-case-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-primary);
+  line-height: 1.4;
+}
+
+.mod-case-note {
+  font-size: 12px;
+  line-height: 1.55;
+  color: var(--text-secondary);
+  background: var(--bg-subtle);
+  border: 1px solid var(--border-hairline);
+  border-radius: var(--radius-sm);
+  padding: 7px 10px;
+}
+
+.mod-case-note.is-human-note {
+  border-color: var(--mod-unc-border);
+  background: var(--st-unc-bg);
+  color: var(--text-primary);
+}
+
+.mod-case-note-label {
+  font-weight: 600;
+  color: var(--text-primary);
+  margin-right: 6px;
+}
+
+.mod-case-row-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+  flex-wrap: wrap;
+}
+
+.mod-case-expand-box {
+  background: var(--bg-subtle);
+  border: 1px solid var(--border-hairline);
+  border-radius: var(--radius-md);
+  padding: 12px 14px;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--space-4);
+}
+
+.mod-case-spec-col {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+
+.mod-case-spec-title {
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--text-primary);
+}
+
+.mod-case-spec-list {
+  margin: 0;
+  padding-left: 18px;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--text-secondary);
+}
+
+.mod-case-spec-empty {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.mod-case-run-meta {
+  grid-column: 1 / -1;
+  padding-top: 8px;
+  border-top: 1px solid var(--border-hairline);
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+/* ---------------------------------------------------------------- 模块详情页：测试中指挥台布局 */
+
+.mod-cmd-hero {
+  background: var(--mod-hero-bg);
+  border: 1px solid var(--mod-hero-border);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--mod-hero-glow);
+  padding: var(--space-5);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+
+.mod-cmd-hero-top {
+  display: grid;
+  grid-template-columns: minmax(0, 1.35fr) minmax(210px, 0.95fr) minmax(200px, 0.85fr);
+  gap: var(--space-5);
+  align-items: center;
+}
+
+.mod-cmd-brand {
+  display: flex;
+  align-items: center;
+  gap: var(--space-4);
+  min-width: 0;
+}
+
+.mod-cmd-emblem {
+  width: 56px;
+  height: 56px;
+  flex: 0 0 56px;
+  border-radius: var(--radius-md);
+  background: var(--mod-emblem-bg);
+  border: 1px solid var(--mod-emblem-border);
+  color: var(--mod-emblem-fg);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-family: var(--font-mono);
+  font-size: 20px;
+  font-weight: 700;
+  letter-spacing: -0.04em;
+}
+
+.mod-cmd-titles {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+
+.mod-cmd-heading-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+}
+
+.mod-cmd-title {
+  margin: 0;
+  font-size: 22px;
+  font-weight: 700;
+  line-height: 1.25;
+  letter-spacing: -0.02em;
+  color: var(--text-primary);
+  word-break: break-word;
+}
+
+.mod-cmd-scope-tag {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--border-strong);
+  background: var(--bg-subtle);
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.mod-cmd-runtime {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+  font-size: 13px;
+  color: var(--text-secondary);
+}
+
+.mod-cmd-kpi-center {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  padding: 0 var(--space-3);
+  border-left: 1px solid var(--border-hairline);
+  border-right: 1px solid var(--border-hairline);
+}
+
+.mod-cmd-kpi-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: center;
+  gap: 6px;
+  line-height: 1;
+}
+
+.mod-cmd-kpi-prefix {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-muted);
+}
+
+.mod-cmd-kpi-big {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  font-size: 42px;
+  font-weight: 800;
+  letter-spacing: -0.03em;
+  color: var(--text-primary);
+}
+
+.mod-cmd-kpi-denom {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  font-size: 20px;
+  font-weight: 600;
+  color: var(--text-muted);
+}
+
+.mod-cmd-kpi-caption {
+  margin-top: 6px;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.mod-cmd-side-kpis {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px var(--space-4);
+}
+
+.mod-cmd-side-item {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.mod-cmd-side-label {
+  font-size: 12px;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+.mod-cmd-side-val {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  font-size: 19px;
+  font-weight: 700;
+  color: var(--text-primary);
+}
+
+.mod-cmd-side-val.is-pass {
+  color: var(--st-pass-fg);
+}
+
+.mod-cmd-side-val.is-fail {
+  color: var(--st-fail-fg);
+}
+
+.mod-cmd-side-val.is-unc {
+  color: var(--st-unc-fg);
+}
+
+.mod-cmd-side-val.is-blk {
+  color: var(--st-blk-fg);
+}
+
+.mod-cmd-side-val.is-run {
+  color: var(--st-run-fg);
+}
+
+.mod-cmd-side-val.is-muted {
+  color: var(--text-muted);
+}
+
+/* 指挥台主体两栏 */
+
+.mod-cmd-workspace {
+  display: grid;
+  grid-template-columns: minmax(280px, 31%) minmax(0, 1fr);
+  gap: var(--space-4);
+  align-items: start;
+}
+
+.mod-cmd-sidebar {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  min-width: 0;
+}
+
+.mod-cmd-sidebar-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 2px;
+}
+
+.mod-section-kicker {
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  color: var(--text-muted);
+}
+
+.mod-cmd-card-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  max-height: 680px;
+  overflow-y: auto;
+  padding-right: 2px;
+}
+
+.mod-entity-card {
+  background: var(--bg-surface);
+  border: 1px solid var(--border-hairline);
+  border-radius: var(--radius-md);
+  padding: 12px 14px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  box-shadow: var(--shadow-xs);
+  transition: border-color 140ms ease, box-shadow 140ms ease;
+}
+
+.mod-entity-card.is-running {
+  background: var(--mod-active-bg);
+  border-color: var(--mod-active-border);
+  box-shadow: var(--mod-active-glow);
+}
+
+.mod-entity-card.is-failed {
+  border-color: var(--mod-fail-border);
+}
+
+.mod-entity-card.is-uncertain {
+  border-color: var(--mod-unc-border);
+}
+
+.mod-entity-card-top {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.mod-entity-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-primary);
+  line-height: 1.4;
+  word-break: break-word;
+}
+
+.mod-entity-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.mod-entity-meter {
+  height: 3px;
+  width: 100%;
+  border-radius: 999px;
+  background: var(--mod-track-bg);
+  overflow: hidden;
+}
+
+.mod-entity-meter-fill {
+  height: 100%;
+  border-radius: 999px;
+}
+
+.mod-meter-pass {
+  width: 100%;
+  background: var(--st-pass-fg);
+}
+
+.mod-meter-fail {
+  width: 100%;
+  background: var(--st-fail-fg);
+}
+
+.mod-meter-unc {
+  width: 75%;
+  background: var(--st-unc-fg);
+}
+
+.mod-meter-run {
+  width: 60%;
+  background: var(--st-run-fg);
+}
+
+.mod-meter-blk {
+  width: 50%;
+  background: var(--st-blk-fg);
+}
+
+.mod-meter-que {
+  width: 24%;
+  background: var(--st-que-fg);
+}
+
+/* 指挥台右栏：流程管线 + 统计块 + 类终端运行事件 */
+
+.mod-cmd-main {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  min-width: 0;
+}
+
+.mod-pipe-body {
+  padding: var(--space-4) var(--space-5) var(--space-5);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+
+.mod-pipe-track {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 28px minmax(0, 1fr) 28px minmax(0, 1fr) 28px minmax(0, 1fr);
+  gap: 8px;
+  align-items: center;
+}
+
+.mod-pipe-node {
+  background: var(--bg-subtle);
+  border: 1px solid var(--border-hairline);
+  border-radius: var(--radius-md);
+  padding: 14px 12px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  text-align: center;
+}
+
+.mod-pipe-node.is-lit {
+  border-color: var(--mod-active-border);
+  background: var(--mod-active-bg);
+  box-shadow: var(--mod-active-glow);
+}
+
+.mod-pipe-node.is-done-lit {
+  border-color: var(--mod-pass-border);
+  background: var(--st-pass-bg);
+}
+
+.mod-pipe-icon {
+  width: 34px;
+  height: 34px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--bg-surface);
+  border: 1px solid var(--border-strong);
+  color: var(--text-secondary);
+}
+
+.mod-pipe-node.is-lit .mod-pipe-icon {
+  border-color: var(--st-run-fg);
+  color: var(--st-run-fg);
+}
+
+.mod-pipe-node.is-done-lit .mod-pipe-icon {
+  border-color: var(--st-pass-fg);
+  color: var(--st-pass-fg);
+}
+
+.mod-pipe-stage-name {
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--text-primary);
+}
+
+.mod-pipe-stage-count {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  font-size: 24px;
+  font-weight: 800;
+  line-height: 1.1;
+  color: var(--text-primary);
+}
+
+.mod-pipe-arrow {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--mod-pipe-line);
+}
+
+.mod-pipe-arrow.is-lit {
+  color: var(--mod-pipe-line-active);
+}
+
+.mod-cmd-stats-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: var(--space-3);
+}
+
+.mod-stat-tile {
+  background: var(--bg-subtle);
+  border: 1px solid var(--border-hairline);
+  border-radius: var(--radius-md);
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.mod-stat-tile.is-alert {
+  border-color: var(--mod-fail-border);
+  background: var(--st-fail-bg);
+}
+
+.mod-stat-tile.is-warn {
+  border-color: var(--mod-unc-border);
+  background: var(--st-unc-bg);
+}
+
+.mod-stat-label {
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.mod-stat-num {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  font-size: 24px;
+  font-weight: 800;
+  line-height: 1.15;
+  color: var(--text-primary);
+}
+
+.mod-stat-num.is-pass {
+  color: var(--st-pass-fg);
+}
+
+.mod-stat-num.is-fail {
+  color: var(--st-fail-fg);
+}
+
+.mod-stat-num.is-unc {
+  color: var(--st-unc-fg);
+}
+
+/* 类终端运行事件面板 */
+
+.mod-terminal {
+  background: var(--mod-term-bg);
+  border: 1px solid var(--mod-term-border);
+  border-radius: var(--radius-lg);
+  overflow: hidden;
+  color: var(--mod-term-fg);
+}
+
+.mod-terminal-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  padding: 10px var(--space-4);
+  background: var(--mod-term-header);
+  border-bottom: 1px solid var(--mod-term-border);
+  flex-wrap: wrap;
+}
+
+.mod-terminal-cmd {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--mod-emblem-fg);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.mod-terminal-title {
+  font-family: var(--font-sans);
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--mod-term-fg);
+}
+
+.mod-terminal-count {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  font-size: 12px;
+  color: var(--mod-term-muted);
+}
+
+.mod-terminal-body {
+  padding: var(--space-2) var(--space-4);
+  display: flex;
+  flex-direction: column;
+  max-height: 390px;
+  overflow-y: auto;
+}
+
+.mod-terminal-empty {
+  padding: var(--space-6) var(--space-3);
+  text-align: center;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--mod-term-muted);
+}
+
+.mod-term-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  padding: 9px 6px;
+  border-bottom: 1px solid var(--mod-term-border);
+  font-size: 12px;
+  border-radius: 4px;
+}
+
+.mod-term-row:last-child {
+  border-bottom: none;
+}
+
+.mod-term-row:hover {
+  background: var(--mod-term-row-hover);
+}
+
+.mod-term-row-left {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  min-width: 0;
+  flex: 1;
+}
+
+.mod-term-time {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  color: var(--mod-term-muted);
+  white-space: nowrap;
+}
+
+.mod-term-code {
+  font-family: var(--font-mono);
+  font-weight: 700;
+  color: var(--mod-term-fg);
+  white-space: nowrap;
+}
+
+.mod-term-case-title {
+  color: var(--mod-term-fg);
+  font-weight: 500;
+}
+
+.mod-term-reason {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--st-unc-fg);
+}
+
+.mod-term-none {
+  font-family: var(--font-mono);
+  color: var(--mod-term-muted);
+}
+
+.mod-term-run-link {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--accent);
+  text-decoration: none;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.mod-term-run-link:hover {
+  color: var(--accent-hover);
+  text-decoration: underline;
+}
+
+/* 指挥台下方的可折叠复核区 */
+
+.mod-collapse-head {
+  width: 100%;
+  background: transparent;
+  border: none;
+  padding: 14px var(--space-5);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  cursor: pointer;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+}
+
+.mod-collapse-head:hover {
+  background: var(--bg-hover);
+}
+
+.mod-collapse-toggle {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--accent);
+  white-space: nowrap;
+}
+
+/* ---------------------------------------------------------------- 新建任务（生成用例）弹窗 */
+
+.mod-gen-form {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  margin-top: var(--space-2);
+}
+
+.mod-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.mod-field-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+}
+
+.mod-field-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.mod-req-tag {
+  display: inline-flex;
+  align-items: center;
+  padding: 0 6px;
+  border-radius: 4px;
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1.6;
+  color: var(--mod-req-fg);
+  background: var(--mod-req-bg);
+}
+
+.mod-field-meta {
+  font-size: 12px;
+  color: var(--text-muted);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.mod-field-meta.is-over {
+  color: var(--st-fail-fg);
+  font-weight: 600;
+}
+
+.mod-field-hint {
+  font-size: 12px;
+  color: var(--text-secondary);
+  line-height: 1.5;
+}
+
+.mod-field-error {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--st-fail-fg);
+  line-height: 1.45;
+}
+
+.mod-links-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.mod-link-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.mod-link-row-input {
+  flex: 1;
+  min-width: 0;
+}
+
+.mod-dropzone {
+  border: 1.5px dashed var(--border-strong);
+  border-radius: var(--radius-md);
+  background: var(--bg-subtle);
+  padding: var(--space-4);
+  text-align: center;
+  cursor: pointer;
+  transition: border-color 140ms ease, background-color 140ms ease;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+}
+
+.mod-dropzone:hover,
+.mod-dropzone.is-dragover {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.mod-dropzone.is-disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.mod-dropzone-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.mod-dropzone-sub {
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.mod-thumb-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+  margin-top: 4px;
+}
+
+.mod-thumb-card {
+  position: relative;
+  border: 1px solid var(--border-hairline);
+  border-radius: var(--radius-sm);
+  background: var(--bg-surface);
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+.mod-thumb-img {
+  width: 100%;
+  height: 92px;
+  object-fit: cover;
+  display: block;
+  background: var(--bg-subtle);
+}
+
+.mod-thumb-foot {
+  padding: 5px 8px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--text-secondary);
+  border-top: 1px solid var(--border-hairline);
+}
+
+.mod-thumb-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.mod-thumb-del {
+  border: none;
+  background: transparent;
+  color: var(--st-fail-fg);
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+  padding: 0 2px;
+  flex-shrink: 0;
+}
+
+.mod-thumb-del:hover {
+  text-decoration: underline;
+}
+
+.mod-gen-two-col {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--space-3);
+}
+
+.mod-role-option {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  width: 100%;
+}
+
+.mod-role-option-main {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.mod-role-option-name {
+  font-size: 13px;
+  font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mod-role-option-src {
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.mod-hidden-input {
+  display: none;
+}
+
+/* ---------------------------------------------------------------- 响应式适配（<900px 上下排列） */
+
+@media (max-width: 1080px) {
+  .mod-cmd-hero-top {
+    grid-template-columns: minmax(0, 1fr) minmax(180px, auto);
+  }
+
+  .mod-cmd-kpi-center {
+    border-right: none;
+    padding-right: 0;
+  }
+
+  .mod-cmd-side-kpis {
+    grid-column: 1 / -1;
+    grid-template-columns: repeat(5, minmax(0, 1fr));
+    padding-top: var(--space-3);
+    border-top: 1px solid var(--border-hairline);
+  }
+}
+
+@media (max-width: 899px) {
+  .mod-cmd-workspace {
+    grid-template-columns: 1fr;
+  }
+
+  .mod-cmd-hero-top {
+    grid-template-columns: 1fr;
+    gap: var(--space-4);
+  }
+
+  .mod-cmd-kpi-center {
+    border-left: none;
+    border-right: none;
+    border-top: 1px solid var(--border-hairline);
+    padding: var(--space-3) 0 0;
+    align-items: flex-start;
+    text-align: left;
+  }
+
+  .mod-cmd-side-kpis {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .mod-pipe-track {
+    grid-template-columns: 1fr;
+  }
+
+  .mod-pipe-arrow {
+    transform: rotate(90deg);
+    padding: 2px 0;
+  }
+
+  .mod-cmd-stats-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .mod-stepper {
+    grid-template-columns: 1fr;
+  }
+
+  .mod-token-bar {
+    grid-template-columns: 1fr;
+  }
+
+  .mod-case-row-main {
+    flex-direction: column;
+  }
+
+  .mod-case-expand-box {
+    grid-template-columns: 1fr;
+  }
+
+  .mod-gen-two-col {
+    grid-template-columns: 1fr;
+  }
+
+  .mod-thumb-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .mod-cards-grid {
+    grid-template-columns: 1fr;
+  }
+}

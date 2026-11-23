@@ -198,6 +198,8 @@ pub struct ModuleView {
     pub case_count: i64,
     pub approved_count: i64,
     pub needs_human_count: i64,
+    /// 排队、分配、执行、判定中的 run 数。大于 0 就是「测试中」：页面此时才切到指挥台布局
+    pub active_runs: i64,
     pub latest_request: Option<RequestView>,
 }
 
@@ -216,6 +218,8 @@ pub async fn list(pool: &PgPool, project: &str) -> Res<Vec<ModuleView>> {
                 (select count(*) from test_cases c where c.module_id = m.id) as case_count,
                 (select count(*) from test_cases c where c.module_id = m.id and c.review_status = 'approved') as approved_count,
                 (select count(*) from test_cases c where c.module_id = m.id and c.review_status = 'needs_human') as needs_human_count,
+                (select count(*) from runs x join test_cases c on c.id = x.case_id
+                  where c.module_id = m.id and x.status in ('queued','assigned','running','judging')) as active_runs,
                 r.id as req_id, r.status as req_status, r.detail as req_detail, r.requested_at as req_at
          from modules m
          left join lateral (select * from casegen_requests q where q.module_id = m.id order by q.requested_at desc limit 1) r on true
@@ -233,6 +237,7 @@ pub async fn list(pool: &PgPool, project: &str) -> Res<Vec<ModuleView>> {
             case_count: row.get("case_count"),
             approved_count: row.get("approved_count"),
             needs_human_count: row.get("needs_human_count"),
+            active_runs: row.get("active_runs"),
             latest_request: row.get::<Option<Uuid>, _>("req_id").map(|id| RequestView {
                 id,
                 status: row.get("req_status"),
@@ -786,6 +791,18 @@ pub struct ModuleCase {
     pub review_note: String,
     pub steps: Vec<String>,
     pub expected: Vec<String>,
+    /// 这条用例最近一次执行（还没执行过为 null）
+    pub latest_run: Option<LatestRun>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct LatestRun {
+    pub run_id: Uuid,
+    pub task_id: Uuid,
+    pub status: String,
+    pub final_result: Option<String>,
+    pub blocked_reason: Option<String>,
+    pub queued_at: DateTime<Utc>,
 }
 
 pub async fn module_cases(pool: &PgPool, module_id: Uuid) -> Res<Vec<ModuleCase>> {
@@ -793,7 +810,13 @@ pub async fn module_cases(pool: &PgPool, module_id: Uuid) -> Res<Vec<ModuleCase>
     if !exists {
         return Err(ModuleError::NotFound("没有这个模块".into()));
     }
-    let rows = sqlx::query("select code, title, origin, review_status, review_note, steps, expected from test_cases where module_id = $1 order by code")
+    let rows = sqlx::query(
+        "select c.code, c.title, c.origin, c.review_status, c.review_note, c.steps, c.expected,
+                r.id as run_id, r.task_id, r.status as run_status, r.final_result, r.blocked_reason, r.queued_at
+         from test_cases c
+         left join lateral (select * from runs x where x.case_id = c.id order by x.seq desc limit 1) r on true
+         where c.module_id = $1 order by c.code",
+    )
         .bind(module_id)
         .fetch_all(pool)
         .await?;
@@ -808,6 +831,14 @@ pub async fn module_cases(pool: &PgPool, module_id: Uuid) -> Res<Vec<ModuleCase>
             review_note: r.get("review_note"),
             steps: strings(r.get("steps")),
             expected: r.get::<serde_json::Value, _>("expected").as_array().map(|a| a.iter().filter_map(|e| e["text"].as_str().map(str::to_owned)).collect()).unwrap_or_default(),
+            latest_run: r.get::<Option<Uuid>, _>("run_id").map(|run_id| LatestRun {
+                run_id,
+                task_id: r.get("task_id"),
+                status: r.get("run_status"),
+                final_result: r.get("final_result"),
+                blocked_reason: r.get("blocked_reason"),
+                queued_at: r.get("queued_at"),
+            }),
         })
         .collect())
 }

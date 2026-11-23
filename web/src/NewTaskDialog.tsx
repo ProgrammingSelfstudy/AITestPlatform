@@ -1,6 +1,6 @@
 import { Alert, Form, Input, Modal, Select, Skeleton } from "antd";
 import { useEffect, useRef, useState } from "react";
-import { createTask, fetchCases, fetchModels, fetchNodes, type ModelRole, type Models } from "./api";
+import { createTask, fetchCases, fetchModels, fetchNodes, type ModelRole, type Models, type ReviewStatus } from "./api";
 import { readReviewToken, rememberReviewToken, writeTokenAction } from "./reviewLogic";
 import ReviewTokenDialog from "./ReviewTokenDialog";
 import { LoadError } from "./runUi";
@@ -13,6 +13,14 @@ async function loadChoices(signal: AbortSignal) {
   const [cases, models] = await Promise.all([fetchCases(project, signal), fetchModels(signal)]);
   return { cases, models };
 }
+
+const REVIEW_LABEL: Record<ReviewStatus, string> = {
+  draft: "草稿",
+  reviewed_ok: "评审员认为没问题，待你确认",
+  needs_human: "需要人工确认",
+  approved: "已批准",
+  rejected: "已拒绝",
+};
 
 const rolesOf = (models: Models | undefined, slot: ModelRole["slot"]) => models?.roles.filter((r) => r.slot === slot) ?? [];
 
@@ -27,7 +35,7 @@ interface Fields {
   userToken: string;
 }
 
-export default function NewTaskDialog({ onClose }: { onClose: () => void }) {
+export default function NewTaskDialog({ onClose, initialCases }: { onClose: () => void; initialCases?: string[] }) {
   const [form] = Form.useForm<Fields>();
   const { data, error } = usePolling(loadChoices, REFRESH_MS, onceLoaded);
   const { data: nodes, error: nodeError } = usePolling(fetchNodes);
@@ -54,6 +62,8 @@ export default function NewTaskDialog({ onClose }: { onClose: () => void }) {
     const executor = rolesOf(data.models, "executor")[0];
     const judge = rolesOf(data.models, "judge")[0];
     if (form.getFieldValue("executorRole")) return;
+    // 从模块页进来时预选该模块已批准的用例
+    if (initialCases?.length) form.setFieldValue("cases", initialCases);
     form.setFieldsValue({
       executorRole: executor?.id,
       executor: executor?.default.model,
@@ -155,8 +165,8 @@ export default function NewTaskDialog({ onClose }: { onClose: () => void }) {
                 optionRender={(option) => <span className="case-choice">{option.label}</span>}
                 options={data.cases.map((c) => ({
                   value: c.code,
-                  label: `${c.code} · ${c.title}${c.should_fail ? "（故意失败）" : ""}${c.status !== "active" ? `（受阻 · ${c.blocked_reason || "原因未填写"}）` : ""}`,
-                  disabled: c.status !== "active",
+                  label: `${c.code} · ${c.title}${c.should_fail ? "（故意失败）" : ""}${c.status !== "active" ? `（受阻 · ${c.blocked_reason || "原因未填写"}）` : ""}${c.review_status !== "approved" ? `（${REVIEW_LABEL[c.review_status]}，不能执行）` : ""}`,
+                  disabled: c.status !== "active" || c.review_status !== "approved",
                 }))}
               />
             </Form.Item>

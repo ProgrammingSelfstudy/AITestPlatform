@@ -4,12 +4,14 @@ import { useEffect, useState } from "react";
 import NodesPage from "./NodesPage";
 import ScriptsPage from "./ScriptsPage";
 import RolesPage from "./RolesPage";
+import ModulesPage from "./ModulesPage";
+import ModuleDetailPage from "./ModuleDetailPage";
 import RunPage from "./RunPage";
 import { TaskPage, TasksPage } from "./TasksPage";
 import "./styles.css";
 
 type Mode = "light" | "dark";
-type Route = { page: "nodes" | "tasks" | "scripts" | "roles" | "missing" } | { page: "task" | "run"; id: string };
+type Route = { page: "nodes" | "tasks" | "scripts" | "roles" | "modules" | "missing" } | { page: "task" | "run" | "module"; id: string };
 
 function readRoute(): Route {
   const hash = window.location.hash;
@@ -17,6 +19,9 @@ function readRoute(): Route {
   if (hash === "#/tasks") return { page: "tasks" };
   if (hash === "#/scripts") return { page: "scripts" };
   if (hash === "#/roles") return { page: "roles" };
+  if (hash === "#/modules") return { page: "modules" };
+  const moduleMatch = /^#\/modules\/([a-z0-9-]+)$/i.exec(hash);
+  if (moduleMatch) return { page: "module", id: moduleMatch[1] };
   const match = /^#\/(tasks|runs)\/([a-z0-9-]+)$/i.exec(hash);
   if (match) return { page: match[1] === "tasks" ? "task" : "run", id: match[2] };
   return { page: "missing" };
@@ -38,6 +43,8 @@ const BREADCRUMB: Record<Route["page"], string> = {
   tasks: "测试任务",
   scripts: "回归脚本",
   roles: "角色与模型",
+  modules: "模块",
+  module: "模块详情",
   task: "任务详情",
   run: "运行详情",
   missing: "找不到这个页面",
@@ -117,7 +124,8 @@ function Shell({ mode, onToggle }: { mode: Mode; onToggle: () => void }) {
   const nodes = route.page === "nodes";
   const scripts = route.page === "scripts";
   const roles = route.page === "roles";
-  const tasks = !nodes && !scripts && !roles && route.page !== "missing";
+  const modules = route.page === "modules" || route.page === "module";
+  const tasks = !nodes && !scripts && !roles && !modules && route.page !== "missing";
 
   return (
     <div className="app-shell">
@@ -137,6 +145,15 @@ function Shell({ mode, onToggle }: { mode: Mode; onToggle: () => void }) {
                 <line x1="6" y1="17" x2="6.01" y2="17" />
               </svg>
               <span>节点与设备</span>
+            </a>
+            <a href="#/modules" aria-current={modules ? "page" : undefined}>
+              <svg className="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
+                <rect x="3" y="3" width="7" height="7" rx="1" />
+                <rect x="14" y="3" width="7" height="7" rx="1" />
+                <rect x="3" y="14" width="7" height="7" rx="1" />
+                <rect x="14" y="14" width="7" height="7" rx="1" />
+              </svg>
+              <span>模块</span>
             </a>
             <a href="#/tasks" aria-current={tasks ? "page" : undefined}>
               <svg className="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
@@ -207,6 +224,8 @@ function Shell({ mode, onToggle }: { mode: Mode; onToggle: () => void }) {
           {route.page === "tasks" && <TasksPage />}
           {route.page === "scripts" && <ScriptsPage />}
           {route.page === "roles" && <RolesPage />}
+          {route.page === "modules" && <ModulesPage />}
+          {route.page === "module" && <ModuleDetailPage key={route.id} id={route.id} />}
           {route.page === "task" && <TaskPage key={route.id} id={route.id} />}
           {route.page === "run" && <RunPage key={route.id} id={route.id} />}
           {route.page === "missing" && (

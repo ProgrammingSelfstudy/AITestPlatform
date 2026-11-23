@@ -874,6 +874,11 @@ async fn 评审员的意见只是意见_要人确认才能执行() {
     let (_, _, bytes) = request(&world.app, Method::GET, &format!("/api/modules/{module}/cases"), &[], "").await;
     let list = json_body(&bytes);
     assert_eq!((list[0]["review_status"].as_str(), list[1]["review_status"].as_str()), (Some("approved"), Some("rejected")));
+    // 执行过的用例带最近一次执行；没执行过的是 null。有排队中的 run 时模块就是「测试中」
+    assert_eq!(list[0]["latest_run"]["status"], "queued");
+    assert!(list[1]["latest_run"]["run_id"].is_string(), "被拒绝前执行过一次，仍能看到最近一次执行");
+    let (_, _, bytes) = request(&world.app, Method::GET, "/api/projects/hafa/modules", &[], "").await;
+    assert_eq!(json_body(&bytes)[0]["active_runs"], 2);
 }
 
 #[tokio::test]

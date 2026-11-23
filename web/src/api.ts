@@ -150,6 +150,76 @@ export interface CaseSummary {
   should_fail: boolean;
   status: string;
   blocked_reason: string | null;
+  /** 生成的用例要先复核和人工确认（approved）才能执行；导入的老用例恒为 approved */
+  review_status: ReviewStatus;
+}
+
+/** 生成用例的复核状态：评审员的「通过」（reviewed_ok）只是意见，必须人确认（approved）才能执行 */
+export type ReviewStatus = "draft" | "reviewed_ok" | "needs_human" | "approved" | "rejected";
+
+export type CasegenStatus = "queued" | "running" | "finished" | "failed" | "cancelled";
+
+export interface CasegenRequestView {
+  id: string;
+  status: CasegenStatus;
+  /** 失败原因或成功说明，原样给用户看 */
+  detail: string;
+  requested_at: string;
+}
+
+export interface ModuleView {
+  id: string;
+  name: string;
+  created_at: string;
+  case_count: number;
+  approved_count: number;
+  needs_human_count: number;
+  /** 排队、分配、执行、判定中的 run 数；大于 0 就是「测试中」，此时才用指挥台布局 */
+  active_runs: number;
+  latest_request: CasegenRequestView | null;
+}
+
+export interface LatestRun {
+  run_id: string;
+  task_id: string;
+  status: string;
+  final_result: "passed" | "failed" | "uncertain" | "blocked" | null;
+  blocked_reason: string | null;
+  queued_at: string;
+}
+
+export interface ModuleCase {
+  code: string;
+  title: string;
+  origin: "imported" | "generated";
+  review_status: ReviewStatus;
+  /** 评审员的意见和人的备注，原样显示 */
+  review_note: string;
+  steps: string[];
+  expected: string[];
+  latest_run: LatestRun | null;
+}
+
+export interface CasegenRequestDetail {
+  id: string;
+  module: string;
+  status: CasegenStatus;
+  detail: string;
+  ui_links: string[];
+  screenshot_count: number;
+  doc_sha256: string;
+  requested_at: string;
+}
+
+/** 创建任务的必填项：模块、需求文档、UI 图链接、UI 区域截图（base64，AI 只看截图，不会打开链接） */
+export interface CasegenInput {
+  module: string;
+  doc: string;
+  ui_links: string[];
+  screenshots: { data_b64: string }[];
+  node_id: string;
+  writer_role?: string;
+  reviewer_role?: string;
 }
 
 /** 一个角色 = 某个岗位（执行员 / 判定员）可选的一个来源和它的模型。新增角色或模型只改服务端配置。 */
@@ -390,4 +460,30 @@ export async function initNodeRoles(nodeId: string, token: string, userToken: st
 /** 让节点真调一次模型，检测这个角色能不能用；结果通过 fetchNodeRoles 轮询得到。 */
 export async function checkNodeRole(nodeId: string, roleId: string, token: string, userToken: string): Promise<void> {
   await post(`${rolesPath(nodeId)}/${encodeURIComponent(roleId)}/check`, {}, token, userHeaders(userToken));
+}
+
+// ---------------------------------------------------------------- 模块、用例生成与复核
+
+export const fetchModules = (project: string, signal?: AbortSignal) =>
+  get<ModuleView[]>(`/api/projects/${encodeURIComponent(project)}/modules`, signal);
+export const fetchModuleCases = (moduleId: string, signal?: AbortSignal) =>
+  get<ModuleCase[]>(`/api/modules/${encodeURIComponent(moduleId)}/cases`, signal);
+export const fetchCasegenRequest = (id: string, signal?: AbortSignal) =>
+  get<CasegenRequestDetail>(`/api/casegen-requests/${encodeURIComponent(id)}`, signal);
+
+/** 创建任务（生成用例）：模块、需求文档、UI 链接、区域截图都必填，缺哪项服务端说哪项；只能发到自己的节点 */
+export async function createCasegenRequest(project: string, input: CasegenInput, token: string, userToken: string): Promise<{ request_id: string; module_id: string; doc_id: string }> {
+  const response = await post(`/api/projects/${encodeURIComponent(project)}/casegen-requests`, input, token, userHeaders(userToken));
+  return response.json();
+}
+
+/** 人的决定：批准（才能执行）或拒绝。评审员有疑问（needs_human）的用例，批准时必须写备注。只有发起这个模块生成请求的人能操作。 */
+export async function decideCase(moduleId: string, code: string, decision: "approve" | "reject", note: string, token: string, userToken: string): Promise<void> {
+  await post(`/api/modules/${encodeURIComponent(moduleId)}/cases/${encodeURIComponent(code)}/decision`, { decision, note }, token, userHeaders(userToken));
+}
+
+/** 一键批准评审员认为没问题的（reviewed_ok）；needs_human 的不在内，必须逐条处理。返回批准了几条。 */
+export async function approveReviewed(moduleId: string, token: string, userToken: string): Promise<number> {
+  const response = await post(`/api/modules/${encodeURIComponent(moduleId)}/approve-reviewed`, {}, token, userHeaders(userToken));
+  return ((await response.json()) as { approved: number }).approved;
 }
