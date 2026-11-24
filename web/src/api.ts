@@ -228,7 +228,7 @@ export interface CasegenInput {
 /** 一个角色 = 某个岗位（执行员 / 判定员）可选的一个来源和它的模型。新增角色或模型只改服务端配置。 */
 export interface ModelRole {
   id: string;
-  slot: "executor" | "judge" | "case_writer" | "planner";
+  slot: "executor" | "judge" | "case_writer" | "planner" | "ui_review";
   name: string;
   source: string;
   default: { model: string; effort: string | null };
@@ -787,7 +787,7 @@ export interface FlowTemplate {
   code: string;
   name: string;
   remark: string;
-  /** 岗位（executor / judge / case_writer / planner）→ 角色名称 */
+  /** 岗位（executor / judge / case_writer / planner / ui_review）→ 角色名称 */
   roles: Record<string, string>;
 }
 

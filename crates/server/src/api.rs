@@ -223,7 +223,7 @@ fn source_supported(role: &RoleConfig) -> bool {
         RoleSlot::Executor => role.source == ModelSource::CodexExec,
         RoleSlot::Judge => matches!(role.source, ModelSource::ClaudeCli | ModelSource::Agy),
         // 要看 UI 截图：Claude（stream-json 图片输入）和 Codex（-i）都实测能看图；agy 的图片输入还没验证，先不开放
-        RoleSlot::CaseWriter => matches!(role.source, ModelSource::ClaudeCli | ModelSource::CodexExec),
+        RoleSlot::CaseWriter | RoleSlot::UiReview => matches!(role.source, ModelSource::ClaudeCli | ModelSource::CodexExec),
         // 管理员只说话（纯文本），三个本机来源都行
         RoleSlot::Planner => matches!(role.source, ModelSource::ClaudeCli | ModelSource::CodexExec | ModelSource::Agy),
     }
@@ -245,7 +245,7 @@ fn role_valid(role: &RoleConfig) -> bool {
 /// 模型配置文件要求两个岗位都有；节点上的角色可以一个一个配置，所以保存时不要求，派任务时才检查。
 fn roles_valid(roles: &[RoleConfig], require_both: bool, limit: impl Fn(RoleSlot) -> usize) -> bool {
     let unique = roles.iter().enumerate().all(|(i, r)| roles[..i].iter().all(|o| o.id != r.id));
-    let within_limit = [RoleSlot::Executor, RoleSlot::Judge, RoleSlot::CaseWriter, RoleSlot::Planner]
+    let within_limit = [RoleSlot::Executor, RoleSlot::Judge, RoleSlot::CaseWriter, RoleSlot::Planner, RoleSlot::UiReview]
         .iter()
         .all(|slot| roles.iter().filter(|r| r.slot == *slot).count() <= limit(*slot));
     unique && within_limit && roles.iter().all(role_valid) && (!require_both || [RoleSlot::Executor, RoleSlot::Judge].iter().all(|slot| roles.iter().any(|r| r.slot == *slot)))
@@ -382,12 +382,13 @@ async fn set_node_roles(
         (RoleSlot::Executor, crate::configs::role_limit(pool, "executor", RoleSlot::MAX_PER_SLOT).await),
         (RoleSlot::Judge, crate::configs::role_limit(pool, "judge", RoleSlot::MAX_PER_SLOT).await),
         (RoleSlot::CaseWriter, crate::configs::role_limit(pool, "case_writer", RoleSlot::MAX_PER_SLOT).await),
+        (RoleSlot::UiReview, crate::configs::role_limit(pool, "ui_review", RoleSlot::MAX_PER_SLOT).await),
         (RoleSlot::Planner, crate::configs::role_limit(pool, "planner", RoleSlot::MAX_PER_SLOT).await),
     ];
     let limit = |slot: RoleSlot| limits.iter().find(|(s, _)| *s == slot).map_or(RoleSlot::MAX_PER_SLOT, |(_, n)| *n);
     if !roles_valid(&configs, false, limit) {
         // 先挑能说清楚的原因（岗位超过上限）；其余再给笼统提示
-        if let Some((slot, name)) = [(RoleSlot::Executor, "执行员"), (RoleSlot::Judge, "判定员"), (RoleSlot::CaseWriter, "测试用例"), (RoleSlot::Planner, "管理员")]
+        if let Some((slot, name)) = [(RoleSlot::Executor, "执行员"), (RoleSlot::Judge, "判定员"), (RoleSlot::CaseWriter, "测试用例"), (RoleSlot::Planner, "管理员"), (RoleSlot::UiReview, "UI 走查")]
             .into_iter()
             .find(|(slot, _)| configs.iter().filter(|r| r.slot == *slot).count() > limit(*slot))
         {

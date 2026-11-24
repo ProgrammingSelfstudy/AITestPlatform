@@ -2532,7 +2532,7 @@ async fn 参数配置_一级列表能搜索分页_二级详情带配置项() {
     assert_eq!(all["total"], 3);
     let codes: Vec<_> = all["rows"].as_array().unwrap().iter().map(|r| r["code"].as_str().unwrap().to_string()).collect();
     assert_eq!(codes, ["role_limit", "device_retry", "stuck_detect"]);
-    assert_eq!(all["rows"][0]["item_count"], 4);
+    assert_eq!(all["rows"][0]["item_count"], 5);
 
     // 按编码、名称搜索；% 和 _ 当普通字符，不当通配符
     let (_, _, bytes) = request(&world.app, Method::GET, "/api/configs?code=retry", &[], "").await;
@@ -2554,11 +2554,11 @@ async fn 参数配置_一级列表能搜索分页_二级详情带配置项() {
     assert_eq!(status, StatusCode::OK);
     let detail = json_body(&bytes);
     assert_eq!(detail["type"]["name"], "岗位角色上限");
-    assert_eq!(detail["items"]["total"], 4);
+    assert_eq!(detail["items"]["total"], 5);
     let first = &detail["items"]["rows"][0];
     assert_eq!((first["code"].clone(), first["value"].clone()), (json!("executor"), json!("3")));
     let (_, _, bytes) = request(&world.app, Method::GET, "/api/configs/role_limit?page=2&page_size=3", &[], "").await;
-    assert_eq!(json_body(&bytes)["items"]["rows"].as_array().unwrap().len(), 1);
+    assert_eq!(json_body(&bytes)["items"]["rows"].as_array().unwrap().len(), 2);
 
     // 不存在的类型：404
     let (status, _, _) = request(&world.app, Method::GET, "/api/configs/nope", &[], "").await;
@@ -2704,7 +2704,7 @@ async fn 参数配置_导入导出_整体校验_跳过或覆盖() {
     assert_eq!(status, StatusCode::OK);
     let exported = json_body(&bytes);
     assert_eq!(exported["types"][0]["code"], "role_limit");
-    assert_eq!(exported["types"][0]["items"].as_array().unwrap().len(), 4);
+    assert_eq!(exported["types"][0]["items"].as_array().unwrap().len(), 5);
 
     // 不是管理员：403
     assert_eq!(import("other", other_token, json!({"mode": "skip", "document": doc("1")})).await.0, StatusCode::FORBIDDEN);
@@ -2829,4 +2829,29 @@ async fn 参数配置_流程模板的值要是岗位到角色名的_json() {
         let code: &'static str = Box::leak(format!("bad_flow_{n}").into_boxed_str());
         assert_eq!(post("/api/configs/flow_template/items", item(code, value)).await, StatusCode::BAD_REQUEST, "{value}");
     }
+}
+
+#[tokio::test]
+async fn 角色岗位_ui走查要看图_只有_claude_和_codex_能当() {
+    let world = World::new().await;
+    let path = format!("/api/nodes/{}/roles", world.node);
+    let post = |roles: Vec<Value>| {
+        let mut headers = review_headers(REVIEW_TOKEN);
+        headers.push(("x-user-name", USER_NAME));
+        let (app, path) = (world.app.clone(), path.clone());
+        async move { request(&app, Method::POST, &path, &headers, set_roles_body(json!(roles))).await.0 }
+    };
+    // Claude、Codex 能当：校验通过，节点离线所以 409
+    for source in ["claude_cli", "codex_exec"] {
+        assert_eq!(post(vec![role_json("u", "ui_review", source, "m")]).await, StatusCode::CONFLICT, "{source}");
+    }
+    // agy 的图片输入还没验证、deepseek 没有运行器：400
+    for source in ["agy", "deepseek"] {
+        assert_eq!(post(vec![role_json("u", "ui_review", source, "m")]).await, StatusCode::BAD_REQUEST, "{source}");
+    }
+    // 岗位上限读参数配置里的 ui_review：改成 1 后第二个就 400
+    let pool = world.state.pool();
+    sqlx::query("update config_items set value = '1' where code = 'ui_review'").execute(pool).await.unwrap();
+    let two = vec![role_json("u1", "ui_review", "claude_cli", "m"), role_json("u2", "ui_review", "codex_exec", "m")];
+    assert_eq!(post(two).await, StatusCode::BAD_REQUEST);
 }

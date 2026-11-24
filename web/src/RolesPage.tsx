@@ -51,6 +51,7 @@ const SLOT_LABEL: Record<ModelRole["slot"], string> = {
   judge: "判定员",
   case_writer: "测试用例",
   planner: "管理员",
+  ui_review: "UI 走查",
 };
 
 interface ModelRowField {
@@ -94,8 +95,8 @@ function isAbnormalStatus(status: CheckStatus): boolean {
 }
 
 function allowedSlotsForSource(source: string): ModelRole["slot"][] {
-  if (source === "codex_exec") return ["executor", "case_writer", "planner"];
-  if (source === "claude_cli") return ["judge", "case_writer", "planner"];
+  if (source === "codex_exec") return ["executor", "case_writer", "planner", "ui_review"];
+  if (source === "claude_cli") return ["judge", "case_writer", "planner", "ui_review"];
   if (source === "agy") return ["judge", "planner"];
   return ["executor", "judge"];
 }
@@ -852,7 +853,7 @@ export default function RolesPage() {
       createdIds.push(input.id);
     }
 
-    for (const slot of ["executor", "judge", "case_writer", "planner"] as const) {
+    for (const slot of ["executor", "judge", "case_writer", "planner", "ui_review"] as const) {
       const limit = roleLimits[slot] ?? ROLE_SLOT_LIMIT;
       if (payload.filter((role) => role.slot === slot).length > limit) {
         setActionError(`${SLOT_LABEL[slot]}最多 ${limit} 个（上限在「参数配置」里设置），请先删掉多余的。`);
@@ -1417,6 +1418,11 @@ export default function RolesPage() {
                                 value: "planner",
                                 label: "管理员",
                                 disabled: !slotSupported("planner"),
+                              },
+                              {
+                                value: "ui_review",
+                                label: "UI 走查",
+                                disabled: !slotSupported("ui_review"),
                               },
                             ]}
                           />

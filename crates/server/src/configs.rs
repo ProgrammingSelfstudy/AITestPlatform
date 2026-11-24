@@ -688,7 +688,7 @@ async fn push_params(state: &ApiState) {
 fn check_known_value(type_code: &str, item_code: &str, value: &str) -> Result<(), ApiError> {
     use protocol::SetParams as P;
     let (label, min, max) = match (type_code, item_code) {
-        ("role_limit", "executor" | "judge" | "case_writer" | "planner") => ("岗位角色上限", 1, 20),
+        ("role_limit", "executor" | "judge" | "case_writer" | "planner" | "ui_review") => ("岗位角色上限", 1, 20),
         ("device_retry", "max_attempts") => ("设备命令重试次数", *P::RETRY_RANGE.start(), *P::RETRY_RANGE.end()),
         ("stuck_detect", "stuck_n") => ("卡住判定次数", *P::STUCK_N_RANGE.start(), *P::STUCK_N_RANGE.end()),
         ("stuck_detect", "keep") => ("卡住检测保留记录数", *P::STUCK_N_RANGE.start(), P::KEEP_MAX),
@@ -701,11 +701,11 @@ fn check_known_value(type_code: &str, item_code: &str, value: &str) -> Result<()
     }
 }
 
-/// 流程模板的值：JSON 对象，岗位（executor / judge / case_writer / planner）对应角色名称。
+/// 流程模板的值：JSON 对象，岗位（executor / judge / case_writer / planner / ui_review）对应角色名称。
 /// 新建任务时选这个流程，就按名称去节点上找对应岗位的角色。至少要有一个岗位。
 fn check_flow_template(value: &str) -> Result<(), ApiError> {
-    const SLOTS: [&str; 4] = ["executor", "judge", "case_writer", "planner"];
-    let invalid = || bad("流程模板的值要是 JSON，例如 {\"case_writer\":\"角色名\",\"judge\":\"角色名\"}，岗位只能是 executor、judge、case_writer、planner，角色名不超过 60 个字");
+    const SLOTS: [&str; 5] = ["executor", "judge", "case_writer", "planner", "ui_review"];
+    let invalid = || bad("流程模板的值要是 JSON，例如 {\"case_writer\":\"角色名\",\"judge\":\"角色名\"}，岗位只能是 executor、judge、case_writer、planner、ui_review，角色名不超过 60 个字");
     let parsed: serde_json::Value = serde_json::from_str(value).map_err(|_| invalid())?;
     let object = parsed.as_object().filter(|o| !o.is_empty()).ok_or_else(invalid)?;
     for (slot, name) in object {

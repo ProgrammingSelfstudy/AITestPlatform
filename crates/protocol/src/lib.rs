@@ -114,6 +114,8 @@ pub enum RoleSlot {
     CaseWriter,
     /// 管理员：读需求文档和各模块状态，和人聊天，**只提议**，人点确认才派任务
     Planner,
+    /// UI 走查：拿设计稿截图和实际界面截图对比，找出不一致的地方。要看图，来源和测试用例岗位一样
+    UiReview,
 }
 
 impl RoleSlot {
