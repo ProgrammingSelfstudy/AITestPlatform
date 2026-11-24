@@ -80,6 +80,7 @@ impl Fixture {
                 model: Some("判定员模型".into()),
                 effort: Some("high".into()),
             },
+            extra_judges: vec![],
             lease_id: None,
             needs_cleanup: false,
             limits: Limits {

@@ -76,6 +76,11 @@ impl Reporter {
         self.send(NodeMsg::JudgeDone(JudgeDone { run_id: self.run_id, judge_status: status, final_result, items }));
     }
 
+    /// 多个判定员时，每个人各自的评审结果；在 `judge_done` 之前上报，服务端按「一致才采用」汇总。
+    pub fn judge_opinions(&self, opinions: Vec<protocol::JudgeOpinion>) {
+        self.send(NodeMsg::JudgeOpinions(protocol::JudgeOpinions { run_id: self.run_id, opinions }));
+    }
+
     /// 受阻：这是最终结果之一。
     pub fn blocked(&self, reason: BlockedReason, detail: String) {
         self.terminal.store(true, Ordering::SeqCst);

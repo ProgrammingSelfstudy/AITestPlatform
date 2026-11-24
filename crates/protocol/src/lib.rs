@@ -487,6 +487,44 @@ pub struct JudgeDone {
     pub items: Vec<JudgeItem>,
 }
 
+/// 一个判定员对这次 run 的评审。**多个判定员同时评审同一份证据**时，每个人一条，单独记录、单独显示，不合并。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct JudgeOpinion {
+    /// 0 是主判定员（`RunAssign.judge`），1 起是 `extra_judges` 里的第几个
+    pub seq: u32,
+    pub judge: RoleModel,
+    pub judge_status: JudgeStatus,
+    pub final_result: FinalResult,
+    pub items: Vec<JudgeItem>,
+}
+
+/// 多个判定员的评审结果，在 `JudgeDone` 之前发出（同一条连接上有顺序）。只有 1 个判定员时不发。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct JudgeOpinions {
+    pub run_id: Uuid,
+    pub opinions: Vec<JudgeOpinion>,
+}
+
+/// 多个判定员的汇总：**所有人都完成评审且结论一致，才采用这个结论**；
+/// 只要有分歧、或有人没跑成（失败 / 没运行），一律「待人工确认」，不能强行通过（规则 5）。
+/// 返回 (整体评审状态, 最终结果)。整体状态只有所有人都 `Completed` 才是 `Completed`。
+pub fn consensus(opinions: &[(JudgeStatus, FinalResult)]) -> (JudgeStatus, FinalResult) {
+    let Some((first_status, first_result)) = opinions.first().copied() else { return (JudgeStatus::NotRun, FinalResult::Uncertain) };
+    if opinions.len() == 1 {
+        return (first_status, first_result);
+    }
+    let all_completed = opinions.iter().all(|(s, _)| *s == JudgeStatus::Completed);
+    let status = if all_completed {
+        JudgeStatus::Completed
+    } else if opinions.iter().any(|(s, _)| *s == JudgeStatus::Failed) {
+        JudgeStatus::Failed
+    } else {
+        JudgeStatus::NotRun
+    };
+    let agree = all_completed && opinions.iter().all(|(_, r)| *r == first_result) && first_result != FinalResult::Blocked;
+    (status, if agree { first_result } else { FinalResult::Uncertain })
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct NeedHuman {
     pub run_id: Uuid,
@@ -531,6 +569,8 @@ pub enum NodeMsg {
     Step(Step),
     ExecutorDone(ExecutorDone),
     JudgeDone(JudgeDone),
+    /// 多个判定员时，每个人各自的评审结果（在 `JudgeDone` 之前）
+    JudgeOpinions(JudgeOpinions),
     NeedHuman(NeedHuman),
     RunBlocked(RunBlocked),
     QuotaExhausted(QuotaExhausted),
@@ -553,6 +593,7 @@ impl NodeMsg {
             Self::Step(step) => Some(step.run_id),
             Self::ExecutorDone(done) => Some(done.run_id),
             Self::JudgeDone(done) => Some(done.run_id),
+            Self::JudgeOpinions(opinions) => Some(opinions.run_id),
             Self::RunBlocked(blocked) => Some(blocked.run_id),
             Self::QuotaExhausted(exhausted) => exhausted.run_id,
             _ => None,
@@ -596,6 +637,9 @@ pub struct RunAssign {
     pub device_serial: String,
     pub executor: RoleModel,
     pub judge: RoleModel,
+    /// 其他判定员：和 `judge` 同时评审同一份证据，各自独立出结论（可能不一样）。没有就是只有一个判定员。
+    #[serde(default)]
+    pub extra_judges: Vec<RoleModel>,
     /// 账号租约。`None` 表示这次执行不需要账号（手机上已经是目标账号）；有账号时节点凭它取一次性凭证。
     /// 不用全零 id 占位：那会让「有租约」和「没租约」无法区分。
     #[serde(default)]
@@ -693,6 +737,34 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn 多个判定员的汇总_一致才采用_有分歧或没跑成都是待人工确认() {
+        use FinalResult as F;
+        use JudgeStatus as S;
+        let ok = |r: F| (S::Completed, r);
+        // 只有一个：原样
+        assert_eq!(consensus(&[ok(F::Passed)]), (S::Completed, F::Passed));
+        assert_eq!(consensus(&[(S::Failed, F::Uncertain)]), (S::Failed, F::Uncertain));
+        // 都完成且一致：采用
+        assert_eq!(consensus(&[ok(F::Passed), ok(F::Passed), ok(F::Passed)]), (S::Completed, F::Passed));
+        assert_eq!(consensus(&[ok(F::Failed), ok(F::Failed)]), (S::Completed, F::Failed));
+        // 有分歧：待人工确认，不能强行通过，也不能强行判失败
+        assert_eq!(consensus(&[ok(F::Passed), ok(F::Failed)]), (S::Completed, F::Uncertain));
+        assert_eq!(consensus(&[ok(F::Passed), ok(F::Passed), ok(F::Uncertain)]), (S::Completed, F::Uncertain));
+        // 有人没跑成：就算其他人都说通过，也是待人工确认
+        assert_eq!(consensus(&[ok(F::Passed), (S::Failed, F::Uncertain)]), (S::Failed, F::Uncertain));
+        assert_eq!(consensus(&[ok(F::Passed), (S::NotRun, F::Uncertain)]), (S::NotRun, F::Uncertain));
+        assert_eq!(consensus(&[]), (S::NotRun, F::Uncertain));
+        // 协议：多判定员消息能来回，tracked_run 能认出是哪个 run
+        let opinions = JudgeOpinions {
+            run_id: Uuid::nil(),
+            opinions: vec![JudgeOpinion { seq: 1, judge: RoleModel { source: ModelSource::Agy, model: Some("m".into()), effort: None }, judge_status: S::Completed, final_result: F::Passed, items: vec![] }],
+        };
+        let wire = serde_json::to_string(&Envelope::new(NodeMsg::JudgeOpinions(opinions.clone()))).unwrap();
+        assert!(wire.contains("judge_opinions"));
+        assert_eq!(NodeMsg::JudgeOpinions(opinions).tracked_run(), Some(Uuid::nil()));
+    }
+
+    #[test]
     fn 运行参数收进合法范围_重试不超过三次() {
         assert_eq!(SetParams::default(), SetParams::clamped(3, 3, 6));
         assert_eq!(SetParams::clamped(99, 1, 1), SetParams { device_retry: 3, stuck_n: 2, stuck_keep: 2 });
@@ -785,6 +857,7 @@ mod tests {
             device_serial: "1263040493010797".into(),
             executor: RoleModel { source: ModelSource::CodexExec, model: None, effort: None },
             judge: RoleModel { source: ModelSource::ClaudeCli, model: None, effort: None },
+            extra_judges: vec![RoleModel { source: ModelSource::Agy, model: Some("gemini-x".into()), effort: None }],
             lease_id: Some(Uuid::new_v4()),
             needs_cleanup: true,
             limits: Limits { max_steps: 60, timeout_s: 900 },
@@ -873,6 +946,7 @@ mod tests {
             device_serial: "x".into(),
             executor: RoleModel { source: ModelSource::ClaudeCli, model: None, effort: None },
             judge: RoleModel { source: ModelSource::ClaudeCli, model: None, effort: None },
+            extra_judges: vec![],
             lease_id: None,
             needs_cleanup: false,
             limits: Limits { max_steps: 1, timeout_s: 1 },

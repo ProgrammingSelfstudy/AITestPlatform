@@ -402,7 +402,7 @@ impl AppState {
                 Ok(Some(c)) => {
                     let limits = limits_for(&c.case);
                     let assign = RunAssign {
-                        run_id: c.run_id, case: c.case, device_serial: c.device_serial, executor: c.executor, judge: c.judge,
+                        run_id: c.run_id, case: c.case, device_serial: c.device_serial, executor: c.executor, judge: c.judge, extra_judges: c.extra_judges,
                         lease_id: c.lease_id, needs_cleanup: c.needs_cleanup, limits,
                     };
                     tracing::info!(%node_id, run_id = %c.run_id, "派发 run");
@@ -438,6 +438,7 @@ impl AppState {
             }
             NodeMsg::Step(s) => runs::record_step(pool, node_id, &s).await.map(|_| ()),
             NodeMsg::ExecutorDone(d) => runs::executor_done(pool, node_id, &d).await,
+            NodeMsg::JudgeOpinions(o) => runs::record_judge_opinions(pool, node_id, &o).await,
             NodeMsg::JudgeDone(j) => {
                 freed = true;
                 runs::judge_done(pool, node_id, &j).await.map(|o| {

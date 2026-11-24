@@ -1,6 +1,6 @@
 import { Alert, Button, Descriptions, Empty, Modal, Skeleton, Space, Tag, Typography } from "antd";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { evidenceUrl, fetchRun, type JudgeItem, type RunDetail, type RunStep } from "./api";
+import { evidenceUrl, fetchRun, ROLE_SOURCES, type JudgeItem, type JudgeOpinion, type RunDetail, type RunStep } from "./api";
 import RecordingPlayer, { type RecordingControls } from "./RecordingPlayer";
 import { ReviewPanel, ReviewWorkspace } from "./RunReviews";
 import { findRecordingPosition } from "./reviewLogic";
@@ -50,6 +50,44 @@ function targetFor(step: RunStep): string | undefined {
 const EVIDENCE_RENEW_MS = 9 * 60 * 1000;
 type RunPoll = { run: RunDetail; renewInMs: number };
 const runInProgress = ({ run }: RunPoll) => !isTerminal(run);
+
+const OPINION_STATUS: Record<JudgeOpinion["judge_status"], string> = { completed: "完成评审", failed: "评审没跑成", not_run: "没有评审" };
+const OPINION_RESULT: Record<JudgeOpinion["final_result"], string> = { passed: "通过", failed: "失败", uncertain: "待人工确认" };
+
+/** 多个判定员同时评审时，每个人各自的结论单独列出来；他们不一致就是「待人工确认」，这里能看到是谁说了什么。 */
+function JudgeOpinions({ opinions }: { opinions: JudgeOpinion[] }) {
+  return (
+    <section className="surface run-panel" aria-label="各判定员的结果">
+      <div className="panel-heading run-detail-heading">
+        <Typography.Title level={4}>各判定员的结果</Typography.Title>
+        <Typography.Text type="secondary">{opinions.length} 个判定员同时评审同一份证据；都完成且结论一致才采用，否则待人工确认</Typography.Text>
+      </div>
+      {opinions.map((opinion) => {
+        const source = ROLE_SOURCES.find((item) => item.value === opinion.source)?.label ?? opinion.source;
+        return (
+          <article className="judge-item" data-verdict={opinion.final_result} key={opinion.seq}>
+            <div className="panel-heading">
+              <Typography.Text strong className="wrap-text">
+                {opinion.seq === 0 ? "主判定员" : `判定员 ${opinion.seq + 1}`} · {source}{opinion.model ? ` · ${opinion.model}` : ""}
+              </Typography.Text>
+              <span>
+                <Tag>{OPINION_STATUS[opinion.judge_status]}</Tag>
+                <Tag color={opinion.final_result === "passed" ? "green" : opinion.final_result === "failed" ? "red" : "orange"}>{OPINION_RESULT[opinion.final_result]}</Tag>
+              </span>
+            </div>
+            {opinion.items.map((item) => (
+              <div className="run-evidence wrap-text" key={item.idx}>
+                {item.idx}. {item.expected_text || "预期原文缺失"} <VerdictTag verdict={item.verdict} />
+                <div>证据：{item.evidence || "—"}</div>
+              </div>
+            ))}
+            {opinion.judge_status !== "completed" && <div className="run-evidence">这个判定员没有给出逐条结论。</div>}
+          </article>
+        );
+      })}
+    </section>
+  );
+}
 
 export default function RunPage({ id }: { id: string }) {
   const previous = useRef<RunDetail>(null);
@@ -296,6 +334,7 @@ function RunContent({ run }: { run: RunDetail }) {
             })}
             {!expected.length && <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="没有逐条预期" />}
           </section>
+          {(run.judge_opinions ?? []).length > 1 && <JudgeOpinions opinions={run.judge_opinions ?? []} />}
         </div>
       </div>
       {preview && previewUrl && (

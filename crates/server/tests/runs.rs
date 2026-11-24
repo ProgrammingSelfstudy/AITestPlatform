@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::time::Duration;
 
 use protocol::{
-    BlockedReason, CaseExpected, ExecutorDone, FinalResult, JudgeDone, JudgeItem, JudgeStatus, ModelSource, RoleModel, RunBlocked, Step, Verdict,
+    BlockedReason, CaseExpected, ExecutorDone, FinalResult, JudgeDone, JudgeItem, JudgeOpinion, JudgeOpinions, JudgeStatus, ModelSource, RoleModel, RunBlocked, Step, Verdict,
 };
 use serde_json::json;
 use server::cases::{import, NewCase};
@@ -590,4 +590,139 @@ async fn 创建任务_节点上一台设备都没登记过_app_用例跳过() {
     let t = task(&w, &["A"]).await;
     assert!(t.skipped.is_empty());
     assert_eq!(status_of(&w.st, t.run_ids[0]).await, "queued");
+}
+
+
+// ---------------------------------------------------------------- 多个判定员同时评审
+
+fn opinion(seq: u32, status: JudgeStatus, fin: FinalResult, items: Vec<JudgeItem>) -> JudgeOpinion {
+    JudgeOpinion { seq, judge: RoleModel { source: ModelSource::ClaudeCli, model: Some(format!("m{seq}")), effort: None }, judge_status: status, final_result: fin, items }
+}
+
+fn all_passed() -> Vec<JudgeItem> {
+    vec![item(1, Verdict::Passed), item(2, Verdict::Passed)]
+}
+
+/// 建一个带「其他判定员」的任务，领取并推进到判定阶段。
+async fn judging_with_extras(w: &World, extras: &[RoleModel]) -> (Uuid, runs::Claimed) {
+    let t = runs::create_task_with_judges(w.st.pool(), &NewTask { project: "p".into(), node_id: w.node, case_codes: vec!["A".into()], executor: ex(), judge: jd() }, extras).await.unwrap();
+    let c = runs::claim_next(w.st.pool(), w.node).await.unwrap().unwrap();
+    to_judging(w, c.run_id).await;
+    (t.task_id, c)
+}
+
+#[tokio::test]
+async fn 其他判定员随任务保存_领取时一起下发() {
+    let w = world(1).await;
+    // 其他判定员的来源节点上没有：和主判定员、执行员一样，建任务时就拒绝
+    let missing = vec![RoleModel { source: ModelSource::Agy, model: Some("gemini-x".into()), effort: None }];
+    let err = runs::create_task_with_judges(w.st.pool(), &NewTask { project: "p".into(), node_id: w.node, case_codes: vec!["A".into()], executor: ex(), judge: jd() }, &missing).await.unwrap_err();
+    assert!(err.to_string().contains("其他判定员") && err.to_string().contains("agy"), "{err}");
+    let extras = vec![RoleModel { source: ModelSource::ClaudeCli, model: Some("opus".into()), effort: None }, jd()];
+    let t = runs::create_task_with_judges(w.st.pool(), &NewTask { project: "p".into(), node_id: w.node, case_codes: vec!["A".into()], executor: ex(), judge: jd() }, &extras).await.unwrap();
+    let c = runs::claim_next(w.st.pool(), w.node).await.unwrap().unwrap();
+    assert_eq!(c.task_id, t.task_id);
+    assert_eq!(c.extra_judges, extras);
+    // 不带其他判定员：和以前一样，空
+    let t2 = task(&w, &["B"]).await;
+    runs::cancel(w.st.pool(), c.run_id).await.unwrap();
+    let c2 = runs::claim_next(w.st.pool(), w.node).await.unwrap().unwrap();
+    assert_eq!((c2.task_id, c2.extra_judges.len()), (t2.task_id, 0));
+}
+
+#[tokio::test]
+async fn 多个判定员_结论一致才采用_各人的结果单独记录() {
+    let w = world(1).await;
+    let (_, c) = judging_with_extras(&w, &[jd(), jd()]).await;
+    let opinions = JudgeOpinions { run_id: c.run_id, opinions: vec![
+        opinion(0, JudgeStatus::Completed, FinalResult::Passed, all_passed()),
+        opinion(1, JudgeStatus::Completed, FinalResult::Passed, all_passed()),
+        opinion(2, JudgeStatus::Completed, FinalResult::Passed, all_passed()),
+    ] };
+    runs::record_judge_opinions(w.st.pool(), w.node, &opinions).await.unwrap();
+    let out = runs::judge_done(w.st.pool(), w.node, &judge(c.run_id, FinalResult::Passed, all_passed())).await.unwrap();
+    assert_eq!((out.final_result, out.overridden), (FinalResult::Passed, false));
+    let n: i64 = sqlx::query_scalar("select count(*) from judge_opinions where run_id = $1").bind(c.run_id).fetch_one(w.st.pool()).await.unwrap();
+    assert_eq!(n, 3, "三个判定员各一条");
+    let models: Vec<Option<String>> = sqlx::query_scalar("select model from judge_opinions where run_id = $1 order by seq").bind(c.run_id).fetch_all(w.st.pool()).await.unwrap();
+    assert_eq!(models, [Some("m0".into()), Some("m1".into()), Some("m2".into())]);
+    let items: i64 = sqlx::query_scalar("select count(*) from judge_items where run_id = $1").bind(c.run_id).fetch_one(w.st.pool()).await.unwrap();
+    assert_eq!(items, 2, "逐条判定表里放主判定员的");
+}
+
+#[tokio::test]
+async fn 多个判定员_有分歧或有人没跑成_一律待人工确认_不能强行通过() {
+    // 1 个说通过、1 个说失败（逐条里有 failed）：分歧 → 待确认
+    let w = world(1).await;
+    let (_, c) = judging_with_extras(&w, &[jd()]).await;
+    let failing = vec![item(1, Verdict::Passed), item(2, Verdict::Failed)];
+    runs::record_judge_opinions(w.st.pool(), w.node, &JudgeOpinions { run_id: c.run_id, opinions: vec![
+        opinion(0, JudgeStatus::Completed, FinalResult::Passed, all_passed()),
+        opinion(1, JudgeStatus::Completed, FinalResult::Failed, failing),
+    ] }).await.unwrap();
+    // 节点（被篡改或有 bug）硬说通过：以服务端汇总为准
+    let out = runs::judge_done(w.st.pool(), w.node, &judge(c.run_id, FinalResult::Passed, all_passed())).await.unwrap();
+    assert_eq!((out.final_result, out.overridden), (FinalResult::Uncertain, true));
+    assert_eq!(status_of(&w.st, c.run_id).await, "finished");
+    let fin: Option<String> = sqlx::query_scalar("select final_result from runs where id = $1").bind(c.run_id).fetch_one(w.st.pool()).await.unwrap();
+    assert_eq!(fin.as_deref(), Some("uncertain"));
+
+    // 其他人都说通过，但有一个没跑成：待确认，评审状态是 failed
+    let w = world(1).await;
+    let (_, c) = judging_with_extras(&w, &[jd(), jd()]).await;
+    runs::record_judge_opinions(w.st.pool(), w.node, &JudgeOpinions { run_id: c.run_id, opinions: vec![
+        opinion(0, JudgeStatus::Completed, FinalResult::Passed, all_passed()),
+        opinion(1, JudgeStatus::Failed, FinalResult::Uncertain, vec![]),
+        opinion(2, JudgeStatus::Completed, FinalResult::Passed, all_passed()),
+    ] }).await.unwrap();
+    let out = runs::judge_done(w.st.pool(), w.node, &judge(c.run_id, FinalResult::Passed, all_passed())).await.unwrap();
+    assert_eq!(out.final_result, FinalResult::Uncertain);
+    let r = sqlx::query("select judge_status, final_result from runs where id = $1").bind(c.run_id).fetch_one(w.st.pool()).await.unwrap();
+    assert_eq!((r.get::<Option<String>, _>("judge_status").as_deref(), r.get::<Option<String>, _>("final_result").as_deref()), (Some("failed"), Some("uncertain")));
+
+    // 一个判定员说通过，但他逐条里漏判了一条预期：服务端复算成待确认，汇总也不是通过
+    let w = world(1).await;
+    let (_, c) = judging_with_extras(&w, &[jd()]).await;
+    runs::record_judge_opinions(w.st.pool(), w.node, &JudgeOpinions { run_id: c.run_id, opinions: vec![
+        opinion(0, JudgeStatus::Completed, FinalResult::Passed, all_passed()),
+        opinion(1, JudgeStatus::Completed, FinalResult::Passed, vec![item(1, Verdict::Passed)]),
+    ] }).await.unwrap();
+    let out = runs::judge_done(w.st.pool(), w.node, &judge(c.run_id, FinalResult::Passed, all_passed())).await.unwrap();
+    assert_eq!(out.final_result, FinalResult::Uncertain, "漏判不能当通过");
+}
+
+#[tokio::test]
+async fn 多个判定员的结果_只能由这个节点在判定阶段提交_序号不能重复() {
+    let w = world(1).await;
+    let t = task(&w, &["A"]).await;
+    let c = runs::claim_next(w.st.pool(), w.node).await.unwrap().unwrap();
+    let good = JudgeOpinions { run_id: c.run_id, opinions: vec![opinion(0, JudgeStatus::Completed, FinalResult::Passed, all_passed()), opinion(1, JudgeStatus::Completed, FinalResult::Passed, all_passed())] };
+    // 还没到判定阶段：不行
+    assert!(matches!(runs::record_judge_opinions(w.st.pool(), w.node, &good).await, Err(RunError::Illegal { .. })));
+    to_judging(&w, c.run_id).await;
+    // 别的节点：不行
+    let other = seed_node(&w.st, 1, "B").await;
+    assert!(matches!(runs::record_judge_opinions(w.st.pool(), other, &good).await, Err(RunError::Invalid(_))));
+    // 空的、序号重复的、完成却是 blocked 的：不行
+    assert!(matches!(runs::record_judge_opinions(w.st.pool(), w.node, &JudgeOpinions { run_id: c.run_id, opinions: vec![] }).await, Err(RunError::Invalid(_))));
+    let dup = JudgeOpinions { run_id: c.run_id, opinions: vec![opinion(0, JudgeStatus::Completed, FinalResult::Passed, all_passed()), opinion(0, JudgeStatus::Completed, FinalResult::Passed, all_passed())] };
+    assert!(matches!(runs::record_judge_opinions(w.st.pool(), w.node, &dup).await, Err(RunError::Invalid(_))));
+    let blocked = JudgeOpinions { run_id: c.run_id, opinions: vec![opinion(0, JudgeStatus::Completed, FinalResult::Blocked, all_passed())] };
+    assert!(matches!(runs::record_judge_opinions(w.st.pool(), w.node, &blocked).await, Err(RunError::Invalid(_))));
+    // 重传同样的结果：幂等
+    runs::record_judge_opinions(w.st.pool(), w.node, &good).await.unwrap();
+    runs::record_judge_opinions(w.st.pool(), w.node, &good).await.unwrap();
+    let n: i64 = sqlx::query_scalar("select count(*) from judge_opinions where run_id = $1").bind(c.run_id).fetch_one(w.st.pool()).await.unwrap();
+    assert_eq!(n, 2);
+    let _ = t;
+}
+
+#[tokio::test]
+async fn 只有一个判定员_行为和以前完全一样_不产生多判定员记录() {
+    let w = world(1).await;
+    let (_, c) = judging_with_extras(&w, &[]).await;
+    let out = runs::judge_done(w.st.pool(), w.node, &judge(c.run_id, FinalResult::Passed, all_passed())).await.unwrap();
+    assert_eq!(out.final_result, FinalResult::Passed);
+    let n: i64 = sqlx::query_scalar("select count(*) from judge_opinions where run_id = $1").bind(c.run_id).fetch_one(w.st.pool()).await.unwrap();
+    assert_eq!(n, 0);
 }

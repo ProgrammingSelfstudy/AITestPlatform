@@ -619,6 +619,9 @@ struct CreateRequest {
     case_codes: Vec<String>,
     executor: ExecutorChoice,
     judge: JudgeChoice,
+    /// 其他判定员：和 `judge` 同时评审同一份证据，各自独立出结论（可能不一样），结果分别记录。数量受「判定员」岗位角色上限限制。
+    #[serde(default)]
+    more_judges: Vec<JudgeChoice>,
 }
 
 #[derive(Deserialize)]
@@ -707,6 +710,27 @@ async fn create_task(
     if find_model(judge_role, &request.judge.model).is_none() {
         return Err(bad_request("判定员模型不在配置列表中"));
     }
+    // 其他判定员：必须是不同的、可用的判定员角色，模型在配置里；总数（含主判定员）不超过「判定员」岗位上限
+    let mut extra_judges: Vec<RoleModel> = Vec::new();
+    let mut used_roles = vec![judge_role.id.clone()];
+    for more in &request.more_judges {
+        let Some(role_id) = more.role.as_deref() else { return Err(bad_request("其他判定员要写明是哪个角色")) };
+        let role = pick(&candidates, RoleSlot::Judge, Some(role_id)).ok_or_else(|| bad_request("其他判定员角色不在可用列表中（没有配置，或还没有检测通过）"))?;
+        if used_roles.contains(&role.id) {
+            return Err(bad_request(format!("判定员角色「{}」选了不止一次：同时评审要找不同的人", role.name)));
+        }
+        if find_model(role, &more.model).is_none() {
+            return Err(bad_request(format!("判定员「{}」的模型不在配置列表中", role.name)));
+        }
+        used_roles.push(role.id.clone());
+        extra_judges.push(RoleModel { source: role.source, model: Some(more.model.clone()), effort: None });
+    }
+    if !extra_judges.is_empty() {
+        let limit = crate::configs::role_limit(state.app.pool(), "judge", RoleSlot::MAX_PER_SLOT).await;
+        if 1 + extra_judges.len() > limit {
+            return Err(bad_request(format!("判定员最多同时 {limit} 个（上限在参数配置里设置），现在选了 {} 个", 1 + extra_judges.len())));
+        }
+    }
     if !owner_checked {
         owner_check(&state, &headers, request.node_id).await?;
     }
@@ -725,7 +749,7 @@ async fn create_task(
             effort: None,
         },
     };
-    let mut created = runs::create_task(state.app.pool(), &task)
+    let mut created = runs::create_task_with_judges(state.app.pool(), &task, &extra_judges)
         .await
         .map_err(|e| run_error(e, "创建任务失败"))?;
     let no_account = runs::skip_account_runs(state.app.pool(), created.task_id).await.map_err(|e| run_error(e, "创建任务失败"))?;
@@ -947,12 +971,26 @@ struct JudgeItemView {
     file_refs: Vec<String>,
 }
 
+/// 多个判定员时，每个判定员各自的评审结果（单判定员的 run 这里是空的）。
+#[derive(Serialize)]
+struct JudgeOpinionView {
+    /// 0 是主判定员，1 起是其他判定员
+    seq: i32,
+    source: String,
+    model: Option<String>,
+    effort: Option<String>,
+    judge_status: String,
+    final_result: String,
+    items: Vec<JudgeItemView>,
+}
+
 #[derive(Serialize)]
 struct RunDetail {
     #[serde(flatten)]
     record: RunRecord,
     run_steps: Vec<StepView>,
     judge_items: Vec<JudgeItemView>,
+    judge_opinions: Vec<JudgeOpinionView>,
     files: Vec<String>,
     file_urls: BTreeMap<String, String>,
     recordings: Vec<SignedRecording>,
@@ -1009,6 +1047,10 @@ async fn load_run(
         "select idx, expected_text, verdict, evidence, file_refs from judge_items where run_id = $1 order by idx",
     )
     .bind(id).fetch_all(&mut *tx).await?;
+    let opinion_rows = sqlx::query("select seq, source, model, effort, judge_status, final_result, items from judge_opinions where run_id = $1 order by seq")
+        .bind(id)
+        .fetch_all(&mut *tx)
+        .await?;
     let files = files::names(&mut tx, id).await?;
     let recordings = files::recordings(&mut tx, id).await?;
     tx.commit().await?;
@@ -1051,6 +1093,39 @@ async fn load_run(
         item.file_refs.retain(|reference| files::valid_judge_reference(reference));
     }
 
+    // 每个判定员各自的结果：和主判定员的逐条判定一样，先展开占位再脱敏，只留合法的证据引用；一个人评审的条数少于用例预期时，缺的不编造
+    let judge_opinions: Vec<JudgeOpinionView> = if opinion_rows.len() > 1 {
+        opinion_rows
+            .iter()
+            .map(|r| {
+                let items: Vec<protocol::JudgeItem> = serde_json::from_value(r.get::<Value, _>("items")).unwrap_or_default();
+                JudgeOpinionView {
+                    seq: r.get("seq"),
+                    source: r.get("source"),
+                    model: r.get("model"),
+                    effort: r.get("effort"),
+                    judge_status: r.get("judge_status"),
+                    final_result: r.get("final_result"),
+                    items: items
+                        .into_iter()
+                        .map(|i| {
+                            let expected = record.case_spec.expected.iter().find(|e| e.idx == i.idx).map(|e| e.text.clone()).unwrap_or_default();
+                            JudgeItemView {
+                                idx: i.idx as i32,
+                                expected_text: public_text(&expected),
+                                verdict: serde_json::to_value(i.verdict).ok().and_then(|v| v.as_str().map(str::to_owned)).unwrap_or_default(),
+                                evidence: public_text(&i.evidence),
+                                file_refs: i.file_refs.into_iter().filter(|reference| files::valid_judge_reference(reference)).collect(),
+                            }
+                        })
+                        .collect(),
+                }
+            })
+            .collect()
+    } else {
+        vec![]
+    };
+
     let evidence_expires_at = Utc::now().timestamp() + evidence_sign::TTL_SECS;
     let file_urls = files
         .iter()
@@ -1067,6 +1142,7 @@ async fn load_run(
         record,
         run_steps,
         judge_items,
+        judge_opinions,
         files,
         file_urls,
         recordings,

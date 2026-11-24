@@ -1,6 +1,6 @@
 import { Alert, Form, Input, Modal, Select, Skeleton } from "antd";
 import { useEffect, useRef, useState } from "react";
-import { createTask, fetchCases, fetchModels, fetchNodes, type ModelRole, type Models, type ReviewStatus } from "./api";
+import { createTask, fetchCases, fetchModels, fetchNodes, fetchRoleLimits, ROLE_SLOT_LIMIT, type ModelRole, type Models, type ReviewStatus } from "./api";
 import { readReviewToken, rememberReviewToken, writeTokenAction } from "./reviewLogic";
 import ReviewTokenDialog from "./ReviewTokenDialog";
 import { LoadError } from "./runUi";
@@ -34,6 +34,8 @@ interface Fields {
   effort?: string;
   judgeRole: string;
   judge: string;
+  /** 其他判定员（角色 id）：和上面的判定员同时评审同一份证据，各自出结论 */
+  moreJudges?: string[];
   userName: string;
 }
 
@@ -53,6 +55,13 @@ export default function NewTaskDialog({ onClose, initialCases }: { onClose: () =
   const nodeUnavailable = Boolean(node && nodes && !nodes.some((candidate) => candidate.node_id === node && candidate.online));
   const executorRoleId = Form.useWatch("executorRole", form);
   const judgeRoleId = Form.useWatch("judgeRole", form);
+  // 判定员最多同时几个：读参数配置里的岗位上限，读不到用默认
+  const [maxJudges, setMaxJudges] = useState(ROLE_SLOT_LIMIT);
+  useEffect(() => {
+    const controller = new AbortController();
+    void fetchRoleLimits(controller.signal).then((limits) => { if (!controller.signal.aborted && limits.judge) setMaxJudges(limits.judge); });
+    return () => controller.abort();
+  }, []);
   const executorRoles = rolesOf(data?.models, "executor");
   const judgeRoles = rolesOf(data?.models, "judge");
   const executorRole = executorRoles.find((r) => r.id === executorRoleId);
@@ -116,6 +125,9 @@ export default function NewTaskDialog({ onClose, initialCases }: { onClose: () =
         case_codes: fields.cases,
         executor: { role: fields.executorRole, model: fields.executor, ...(fields.effort ? { effort: fields.effort } : {}) },
         judge: { role: fields.judgeRole, model: fields.judge },
+        ...(fields.moreJudges?.length
+          ? { more_judges: fields.moreJudges.map((id) => ({ role: id, model: judgeRoles.find((r) => r.id === id)?.default.model ?? "" })) }
+          : {}),
       }, token, fields.userName.trim());
       rememberUserName(fields.userName);
       window.location.hash = `/tasks/${task.task_id}`;
@@ -194,6 +206,21 @@ export default function NewTaskDialog({ onClose, initialCases }: { onClose: () =
             <Form.Item name="judge" label="判定员模型" rules={[{ required: true, message: "请选择判定员模型" }]}>
               <Select options={judgeRole?.models.map((m) => ({ value: m.model, label: m.model })) ?? []} />
             </Form.Item>
+            {judgeRoles.length > 1 && (
+              <Form.Item
+                name="moreJudges"
+                label="其他判定员（可选，同时评审）"
+                extra={`多选几个不同的判定员，他们和上面的判定员同时评审同一份证据，各自出结论，结果分别记录（用各自角色的默认模型）。都完成且结论一致才采用，有分歧就转待人工确认。判定员最多同时 ${maxJudges} 个（在「参数配置」里设置）。`}
+                rules={[{ type: "array", max: Math.max(0, maxJudges - 1), message: `最多再选 ${Math.max(0, maxJudges - 1)} 个（含上面的判定员一共不超过 ${maxJudges} 个）` }]}
+              >
+                <Select
+                  mode="multiple"
+                  allowClear
+                  placeholder="不选就是只有一个判定员"
+                  options={judgeRoles.filter((r) => r.id !== judgeRoleId).map((r) => ({ value: r.id, label: `${r.name}（${r.default.model}）` }))}
+                />
+              </Form.Item>
+            )}
             <Form.Item
               name="userName" label="我是谁" extra={<span>填你的名字，用来确认所选节点是你的（只能用自己的节点，花自己的额度）。<IdentityHint
                 userName={userName} expiresAt={userNameExpiry()} nameProblem={submitError}

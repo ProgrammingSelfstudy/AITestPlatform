@@ -15,7 +15,7 @@ use agent::codex_exec::command::DeviceMcp;
 use agent::codex_exec::{run_executor, CodexOpts};
 use agent::judge::{run_judge, run_judge_agy};
 use agent::prompts::{build_task_prompt, device_hints, AppKnowledge, DEVICE_TOOLS, SYSTEM_PROMPT};
-use protocol::{BlockedReason, FinalResult, JudgeStatus, LeaseCredentials, ModelSource, RunAssign, Verdict};
+use protocol::{BlockedReason, FinalResult, JudgeOpinion, JudgeStatus, LeaseCredentials, ModelSource, RoleModel, RunAssign, Verdict};
 use serde_json::json;
 use uuid::Uuid;
 
@@ -284,6 +284,10 @@ impl RealExecutor {
         rep.executor_done(verdict, reason.clone(), cost);
 
         // 3. 判定员按角色配置复核本次轨迹。
+        // 有其他判定员：所有判定员同时评审同一份证据，各自出结论；单判定员走下面原来的流程，行为不变。
+        if !a.extra_judges.is_empty() {
+            return self.judge_with_several(a, &rep, run_dir, result, &reason, judge_opts, &uploaded).await;
+        }
         let judge_source = a.judge.source;
         if !matches!(judge_source, ModelSource::ClaudeCli | ModelSource::Agy) || self.0.evidence_bin.as_os_str().is_empty() {
             if !matches!(judge_source, ModelSource::ClaudeCli | ModelSource::Agy) {
@@ -322,6 +326,75 @@ impl RealExecutor {
         rep.judge_done(outcome.status, outcome.final_result, outcome.items);
         if outcome.quota_exhausted {
             rep.quota_exhausted(judge_source);
+        }
+    }
+
+    /// 一个判定员评审一次。来源还没实现、或没有证据工具时，如实返回「没运行」（待人工确认），不编造结论。
+    async fn judge_one(&self, role: &RoleModel, a: &RunAssign, result: &str, reason: &str, run_dir: &Path, judge_opts: &ClaudeOpts, uploaded: &std::collections::HashSet<String>) -> agent::judge::JudgeOutcome {
+        let not_run = |why: String| agent::judge::JudgeOutcome {
+            status: JudgeStatus::NotRun,
+            final_result: FinalResult::Uncertain,
+            items: vec![],
+            reason: why,
+            disagreement: String::new(),
+            quota_exhausted: false,
+            cost_usd: None,
+            wall_s: 0.0,
+            raw: String::new(),
+        };
+        if !matches!(role.source, ModelSource::ClaudeCli | ModelSource::Agy) {
+            return not_run(format!("判定员来源 {:?} 还没有实现，这个判定员没有评审，转待人工确认", role.source));
+        }
+        if self.0.evidence_bin.as_os_str().is_empty() {
+            return not_run("没有证据工具，这个判定员没有评审，转待人工确认".into());
+        }
+        let mut outcome = if role.source == ModelSource::Agy {
+            let opts = agent::agy_cli::AgyOpts { model: role.model.clone(), ..Default::default() };
+            run_judge_agy(&opts, &a.case, result, reason, run_dir, &self.0.evidence_bin).await
+        } else {
+            let opts = ClaudeOpts { model: role.model.clone(), effort: role.effort.clone(), cwd: Some(run_dir.to_path_buf()), ..judge_opts.clone() };
+            run_judge(&opts, &a.case, result, reason, run_dir, &self.0.evidence_bin).await
+        };
+        for item in &mut outcome.items {
+            let cited = item.file_refs.len();
+            item.file_refs.retain(|reference| reference.starts_with("step:") || uploaded.contains(reference));
+            if item.file_refs.len() < cited {
+                item.evidence.push_str(if item.file_refs.is_empty() { "（引用的截图上传失败）" } else { "（部分截图上传失败）" });
+            }
+        }
+        outcome
+    }
+
+    /// 多个判定员：**同时**评审同一份证据（互不知道对方的结论），每个人的结果单独上报、单独记录；
+    /// 最终结果由服务端汇总（都完成且一致才采用，否则待人工确认）。这里也按同样的规则算一份给 `judge_done`，服务端以自己的为准。
+    #[allow(clippy::too_many_arguments)]
+    async fn judge_with_several(&self, a: &RunAssign, rep: &Reporter, run_dir: &Path, result: &str, reason: &str, judge_opts: ClaudeOpts, uploaded: &std::collections::HashSet<String>) {
+        let roles: Vec<&RoleModel> = std::iter::once(&a.judge).chain(a.extra_judges.iter()).collect();
+        rep.log("info", format!("{} 个判定员同时评审", roles.len()));
+        let outcomes = futures_util::future::join_all(roles.iter().map(|role| self.judge_one(role, a, result, reason, run_dir, &judge_opts, uploaded))).await;
+        let mut opinions = Vec::new();
+        for (seq, (role, outcome)) in roles.iter().zip(&outcomes).enumerate() {
+            let cost = outcome.cost_usd.map_or_else(|| "未返回".to_owned(), |usd| format!("{usd:.6} 美元"));
+            rep.log("info", format!("判定员 {} 评审结束：{:?}，用时 {:.1} 秒，折算费用 {cost}", seq + 1, outcome.final_result, outcome.wall_s));
+            if outcome.status != JudgeStatus::Completed {
+                rep.log("warn", format!("判定员 {} 没有完成评审：{}", seq + 1, outcome.reason));
+            }
+            opinions.push(JudgeOpinion {
+                seq: seq as u32,
+                judge: (*role).clone(),
+                judge_status: outcome.status,
+                final_result: outcome.final_result,
+                items: if outcome.status == JudgeStatus::Completed { outcome.items.clone() } else { vec![] },
+            });
+        }
+        let (status, final_result) = protocol::consensus(&opinions.iter().map(|o| (o.judge_status, o.final_result)).collect::<Vec<_>>());
+        let primary_items = opinions.first().map(|o| o.items.clone()).unwrap_or_default();
+        rep.judge_opinions(opinions);
+        rep.judge_done(status, final_result, primary_items);
+        for (role, outcome) in roles.iter().zip(&outcomes) {
+            if outcome.quota_exhausted {
+                rep.quota_exhausted(role.source);
+            }
         }
     }
 }

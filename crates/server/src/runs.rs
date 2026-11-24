@@ -9,7 +9,7 @@
 
 use chrono::{DateTime, Utc};
 use protocol::{
-    BlockedReason, CaseSpec, ExecutorDone, FinalResult, JudgeDone, JudgeStatus, ModelSource, ResumeDecision, ResumeItem, RoleModel, RunBlocked, Step, Verdict,
+    BlockedReason, CaseSpec, ExecutorDone, FinalResult, JudgeDone, JudgeItem, JudgeOpinions, JudgeStatus, ModelSource, ResumeDecision, ResumeItem, RoleModel, RunBlocked, Step, Verdict,
 };
 use serde_json::Value;
 use sqlx::{Acquire, PgConnection, PgPool, Row};
@@ -169,6 +169,11 @@ pub(crate) fn skip_reason(platforms: &[String], node_platforms: &[String]) -> Op
 /// 创建任务：每个用例一个 run（排队），并把用例内容快照进 run。
 /// 校验：节点存在且有所选的模型来源、项目存在、用例都存在且不是受阻状态。
 pub async fn create_task(pool: &PgPool, t: &NewTask) -> Res<TaskCreated> {
+    create_task_with_judges(pool, t, &[]).await
+}
+
+/// 同 `create_task`，另外带「其他判定员」：它们和主判定员同时评审同一份证据，和任务在同一个事务里写入（不会出现被领取了才补上的空档）。
+pub async fn create_task_with_judges(pool: &PgPool, t: &NewTask, extra_judges: &[RoleModel]) -> Res<TaskCreated> {
     if t.case_codes.is_empty() {
         return Err(RunError::Invalid("至少要选一个用例".into()));
     }
@@ -176,7 +181,7 @@ pub async fn create_task(pool: &PgPool, t: &NewTask) -> Res<TaskCreated> {
     let caps: Option<Value> = sqlx::query_scalar("select caps from nodes where id = $1").bind(t.node_id).fetch_optional(&mut *tx).await?;
     let Some(caps) = caps else { return Err(RunError::Invalid(format!("没有这个节点：{}", t.node_id))) };
     let have: Vec<String> = caps["model_sources"].as_array().map(|a| a.iter().filter_map(|m| m["source"].as_str().map(str::to_string)).collect()).unwrap_or_default();
-    for (role, r) in [("执行员", &t.executor), ("Judge", &t.judge)] {
+    for (role, r) in [("执行员", &t.executor), ("Judge", &t.judge)].into_iter().chain(extra_judges.iter().map(|j| ("其他判定员", j))) {
         if !have.iter().any(|s| s == src_str(r.source)) {
             return Err(RunError::Invalid(format!("该节点没有可用的 {}，不能用作{role}（节点现有：{}）", src_str(r.source), have.join("、"))));
         }
@@ -184,11 +189,12 @@ pub async fn create_task(pool: &PgPool, t: &NewTask) -> Res<TaskCreated> {
     let project_id: Option<Uuid> = sqlx::query_scalar("select id from projects where name = $1").bind(&t.project).fetch_optional(&mut *tx).await?;
     let Some(project_id) = project_id else { return Err(RunError::Invalid(format!("没有这个项目：{}", t.project))) };
 
-    let task_id: Uuid = sqlx::query_scalar("insert into tasks (project_id, node_id, executor, judge) values ($1,$2,$3,$4) returning id")
+    let task_id: Uuid = sqlx::query_scalar("insert into tasks (project_id, node_id, executor, judge, extra_judges) values ($1,$2,$3,$4,$5) returning id")
         .bind(project_id)
         .bind(t.node_id)
         .bind(serde_json::to_value(&t.executor).expect("可序列化"))
         .bind(serde_json::to_value(&t.judge).expect("可序列化"))
+        .bind(serde_json::to_value(extra_judges).expect("可序列化"))
         .fetch_one(&mut *tx)
         .await?;
     let mut run_ids = vec![];
@@ -282,6 +288,8 @@ pub struct Claimed {
     pub case_version: i32,
     pub executor: RoleModel,
     pub judge: RoleModel,
+    /// 其他判定员（和主判定员同时评审同一份证据）；空就是只有一个判定员
+    pub extra_judges: Vec<RoleModel>,
     pub lease_id: Option<Uuid>,
     pub needs_cleanup: bool,
 }
@@ -297,7 +305,7 @@ pub(crate) async fn claim_next_with_accounts(pool: &PgPool, node_id: Uuid, accou
     'queued: loop {
         let mut tx = pool.begin().await?;
         let run = sqlx::query(
-            "select r.id, r.task_id, r.case_version, r.case_spec, r.seq, t.executor, t.judge,
+            "select r.id, r.task_id, r.case_version, r.case_spec, r.seq, t.executor, t.judge, t.extra_judges,
                     strpos(r.case_spec::text, '{{account.') > 0 as needs_account
              from runs r join tasks t on t.id = r.task_id
              where r.node_id = $1 and r.status = 'queued' and r.seq > $2
@@ -369,6 +377,7 @@ pub(crate) async fn claim_next_with_accounts(pool: &PgPool, node_id: Uuid, accou
             case_version: run.get("case_version"),
             executor: dec(run.get("executor"))?,
             judge: dec(run.get("judge"))?,
+            extra_judges: serde_json::from_value(run.get::<Value, _>("extra_judges")).map_err(|e| sqlx::Error::Decode(Box::new(e)))?,
             lease_id,
             needs_cleanup: lease.is_some_and(|l| l.needs_cleanup),
         };
@@ -511,7 +520,83 @@ pub struct JudgeOutcome {
     pub overridden: bool,
 }
 
+/// 一个判定员的最终结果，由服务端按逐条判定复算；节点还校验了原始条数和模型的整体结论，这两项在逐条结果里复算不出来，
+/// 所以节点说「待确认」而逐条全通过时，保留「待确认」。没跑成（非 Completed）一律待确认。
+fn checked_final(status: JudgeStatus, node_final: FinalResult, items: &[JudgeItem], expected_len: usize) -> FinalResult {
+    if status != JudgeStatus::Completed {
+        return FinalResult::Uncertain;
+    }
+    match (compute_final(items, expected_len), node_final) {
+        (FinalResult::Passed, FinalResult::Uncertain) => FinalResult::Uncertain,
+        (computed, _) => computed,
+    }
+}
+
+fn judge_status_str(s: JudgeStatus) -> &'static str {
+    match s {
+        JudgeStatus::Completed => "completed",
+        JudgeStatus::Failed => "failed",
+        JudgeStatus::NotRun => "not_run",
+    }
+}
+
+fn final_str(f: FinalResult) -> &'static str {
+    match f {
+        FinalResult::Passed => "passed",
+        FinalResult::Failed => "failed",
+        _ => "uncertain",
+    }
+}
+
+/// 多个判定员时，节点在 `JudgeDone` 之前上报每个人各自的评审结果：存下来（每人一条，单独记录，不合并）。
+/// 逐条判定由服务端复算后再存；最终结果由 `judge_done` 按「一致才采用」汇总。
+pub async fn record_judge_opinions(pool: &PgPool, node_id: Uuid, o: &JudgeOpinions) -> Res<()> {
+    if o.opinions.is_empty() {
+        return Err(RunError::Invalid("判定员评审结果不能是空的".into()));
+    }
+    let mut seen = std::collections::HashSet::new();
+    if !o.opinions.iter().all(|x| seen.insert(x.seq)) {
+        return Err(RunError::Invalid("判定员评审结果的序号重复了".into()));
+    }
+    let mut tx = pool.begin().await?;
+    let row = sqlx::query("select case_spec, status, node_id from runs where id = $1 for update").bind(o.run_id).fetch_optional(&mut *tx).await?;
+    let Some(row) = row else { return Err(RunError::NotFound(o.run_id)) };
+    if row.get::<Uuid, _>("node_id") != node_id {
+        return Err(RunError::Invalid(format!("run {} 不属于这个节点，不能提交判定", o.run_id)));
+    }
+    if row.get::<String, _>("status") != "judging" {
+        return Err(RunError::Illegal { run: o.run_id, from: row.get("status"), action: "提交判定" });
+    }
+    let spec: CaseSpec = serde_json::from_value(row.get::<Value, _>("case_spec")).map_err(|e| sqlx::Error::Decode(Box::new(e)))?;
+    for x in &o.opinions {
+        if x.judge_status == JudgeStatus::Completed && x.final_result == FinalResult::Blocked {
+            return Err(RunError::Invalid("Judge 完成时最终结果不能是 blocked".into()));
+        }
+        let fin = checked_final(x.judge_status, x.final_result, &x.items, spec.expected.len());
+        // 没跑成的判定员不存逐条结果（和单判定员一样）
+        let items = if x.judge_status == JudgeStatus::Completed { serde_json::to_value(&x.items).expect("可序列化") } else { serde_json::json!([]) };
+        sqlx::query(
+            "insert into judge_opinions (run_id, seq, source, model, effort, judge_status, final_result, items) values ($1,$2,$3,$4,$5,$6,$7,$8)
+             on conflict (run_id, seq) do update set source = excluded.source, model = excluded.model, effort = excluded.effort,
+               judge_status = excluded.judge_status, final_result = excluded.final_result, items = excluded.items",
+        )
+        .bind(o.run_id)
+        .bind(x.seq as i32)
+        .bind(src_str(x.judge.source))
+        .bind(&x.judge.model)
+        .bind(&x.judge.effort)
+        .bind(judge_status_str(x.judge_status))
+        .bind(final_str(fin))
+        .bind(items)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
 /// Judge 完成：judging → finished。逐项判定由服务端复算，并保留 Judge 对整体的待确认结论。
+/// 有多个判定员（先上报过 `JudgeOpinions`）时，最终结果由服务端汇总：所有人都完成且结论一致才采用，否则待人工确认。
 pub async fn judge_done(pool: &PgPool, node_id: Uuid, j: &JudgeDone) -> Res<JudgeOutcome> {
     let mut tx = pool.begin().await?;
     let row = sqlx::query("select case_spec, status, node_id from runs where id = $1 for update").bind(j.run_id).fetch_optional(&mut *tx).await?;
@@ -524,48 +609,59 @@ pub async fn judge_done(pool: &PgPool, node_id: Uuid, j: &JudgeDone) -> Res<Judg
     }
     let spec: CaseSpec = serde_json::from_value(row.get::<Value, _>("case_spec")).map_err(|e| sqlx::Error::Decode(Box::new(e)))?;
 
-    let completed = j.judge_status == JudgeStatus::Completed;
-    if completed && j.final_result == FinalResult::Blocked {
-        return Err(RunError::Invalid("Judge 完成时最终结果不能是 blocked".into()));
-    }
-    let computed = if completed {
-        match (compute_final(&j.items, spec.expected.len()), j.final_result) {
-            // 节点还校验了原始条数和模型的整体结论，这两项在逐条结果中无法复算。
-            (FinalResult::Passed, FinalResult::Uncertain) => FinalResult::Uncertain,
-            (computed, _) => computed,
-        }
+    let stored = sqlx::query("select seq, judge_status, final_result, items from judge_opinions where run_id = $1 order by seq")
+        .bind(j.run_id)
+        .fetch_all(&mut *tx)
+        .await?;
+    let (js, computed, items): (JudgeStatus, FinalResult, Vec<JudgeItem>) = if stored.len() > 1 {
+        // 多个判定员：各人的结果已经在 judge_opinions 里（服务端复算过），这里只做汇总；逐条判定表里放主判定员（seq 0）的
+        let each: Vec<(JudgeStatus, FinalResult)> = stored
+            .iter()
+            .map(|r| {
+                let status = match r.get::<String, _>("judge_status").as_str() {
+                    "completed" => JudgeStatus::Completed,
+                    "failed" => JudgeStatus::Failed,
+                    _ => JudgeStatus::NotRun,
+                };
+                let fin = match r.get::<String, _>("final_result").as_str() {
+                    "passed" => FinalResult::Passed,
+                    "failed" => FinalResult::Failed,
+                    _ => FinalResult::Uncertain,
+                };
+                (status, fin)
+            })
+            .collect();
+        let (status, fin) = protocol::consensus(&each);
+        let primary = stored.iter().find(|r| r.get::<i32, _>("seq") == 0);
+        let items = primary
+            .filter(|r| r.get::<String, _>("judge_status") == "completed")
+            .and_then(|r| serde_json::from_value::<Vec<JudgeItem>>(r.get::<Value, _>("items")).ok())
+            .unwrap_or_default();
+        (status, fin, items)
     } else {
-        FinalResult::Uncertain
+        let completed = j.judge_status == JudgeStatus::Completed;
+        if completed && j.final_result == FinalResult::Blocked {
+            return Err(RunError::Invalid("Judge 完成时最终结果不能是 blocked".into()));
+        }
+        (j.judge_status, checked_final(j.judge_status, j.final_result, &j.items, spec.expected.len()), if completed { j.items.clone() } else { vec![] })
     };
     let overridden = computed != j.final_result;
-    if completed {
-        for i in &j.items {
-            let text = spec.expected.iter().find(|e| e.idx == i.idx).map(|e| e.text.clone()).unwrap_or_default();
-            sqlx::query("insert into judge_items (run_id, idx, expected_text, verdict, evidence, file_refs) values ($1,$2,$3,$4,$5,$6) on conflict (run_id, idx) do update set verdict = excluded.verdict, evidence = excluded.evidence, file_refs = excluded.file_refs")
-                .bind(j.run_id)
-                .bind(i.idx as i32)
-                .bind(text)
-                .bind(verdict_str(i.verdict))
-                .bind(&i.evidence)
-                .bind(&i.file_refs)
-                .execute(&mut *tx)
-                .await?;
-        }
+    for i in &items {
+        let text = spec.expected.iter().find(|e| e.idx == i.idx).map(|e| e.text.clone()).unwrap_or_default();
+        sqlx::query("insert into judge_items (run_id, idx, expected_text, verdict, evidence, file_refs) values ($1,$2,$3,$4,$5,$6) on conflict (run_id, idx) do update set verdict = excluded.verdict, evidence = excluded.evidence, file_refs = excluded.file_refs")
+            .bind(j.run_id)
+            .bind(i.idx as i32)
+            .bind(text)
+            .bind(verdict_str(i.verdict))
+            .bind(&i.evidence)
+            .bind(&i.file_refs)
+            .execute(&mut *tx)
+            .await?;
     }
-    let js = match j.judge_status {
-        JudgeStatus::Completed => "completed",
-        JudgeStatus::Failed => "failed",
-        JudgeStatus::NotRun => "not_run",
-    };
-    let fin = match computed {
-        FinalResult::Passed => "passed",
-        FinalResult::Failed => "failed",
-        _ => "uncertain",
-    };
     sqlx::query("update runs set status = 'finished', judge_status = $2, final_result = $3, finished_at = now() where id = $1")
         .bind(j.run_id)
-        .bind(js)
-        .bind(fin)
+        .bind(judge_status_str(js))
+        .bind(final_str(computed))
         .execute(&mut *tx)
         .await?;
     release_resources(&mut tx, j.run_id, false).await?;

@@ -99,6 +99,18 @@ export interface JudgeItem {
   file_refs: string[];
 }
 
+/** 多个判定员同时评审同一份证据时，每个判定员各自的结果（单判定员的 run 没有） */
+export interface JudgeOpinion {
+  /** 0 是主判定员，1 起是其他判定员 */
+  seq: number;
+  source: string;
+  model: string | null;
+  effort: string | null;
+  judge_status: "completed" | "failed" | "not_run";
+  final_result: "passed" | "failed" | "uncertain";
+  items: JudgeItem[];
+}
+
 export interface Recording {
   seq: number;
   url: string;
@@ -114,6 +126,8 @@ export interface RunDetail extends RunView {
   cost: { model?: string | null; effort?: string | null; wall_s?: number; tool_calls?: number } | null;
   run_steps: RunStep[];
   judge_items: JudgeItem[];
+  /** 多个判定员时每个人各自的结果；单判定员为空数组 */
+  judge_opinions?: JudgeOpinion[];
   files: string[];
   file_urls: Record<string, string>;
   recordings: Recording[];
@@ -349,6 +363,8 @@ export interface NewTask {
   case_codes: string[];
   executor: { role: string; model: string; effort?: string };
   judge: { role: string; model: string };
+  /** 其他判定员：和 judge 同时评审同一份证据、各自出结论；不能和 judge 或彼此重复 */
+  more_judges?: { role: string; model: string }[];
 }
 
 async function request(path: string, options: RequestInit): Promise<Response> {
