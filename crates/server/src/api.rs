@@ -52,6 +52,8 @@ pub(crate) fn routes(app: AppState, paths: Paths) -> Router {
     Router::new()
         .route("/api/models", get(models))
         .route("/api/configs", get(crate::configs::api_list_types).post(crate::configs::api_create_type))
+        .route("/api/configs/export", get(crate::configs::api_export))
+        .route("/api/configs/import", post(crate::configs::api_import).layer(axum::extract::DefaultBodyLimit::max(2 * 1024 * 1024)))
         .route("/api/configs/{code}", get(crate::configs::api_type_detail))
         // 写入全用 POST：浏览器写入守卫（来源、Content-Type、X-Requested-With）只管 POST
         .route("/api/configs/{code}/update", post(crate::configs::api_update_type))

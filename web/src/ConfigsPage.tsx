@@ -2,6 +2,7 @@ import { Alert, Button, Drawer, Form, Input, Popconfirm, Switch, Table, Tag, Too
 import type { TableColumnsType } from "antd";
 import { useEffect, useState } from "react";
 import { createConfigType, deleteConfigType, fetchConfigTypes, updateConfigType, type ConfigStatus, type ConfigType, type ConfigTypeInput } from "./api";
+import ConfigImportDialog from "./ConfigImportDialog";
 import { useRememberedUserName } from "./identity";
 import { formatDate } from "./runUi";
 
@@ -91,6 +92,7 @@ export default function ConfigsPage() {
   const [loading, setLoading] = useState(true);
   const [reloadKey, setReloadKey] = useState(0);
   const [drawer, setDrawer] = useState<{ open: boolean; editing: ConfigType | null }>({ open: false, editing: null });
+  const [importing, setImporting] = useState(false);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -171,7 +173,7 @@ export default function ConfigsPage() {
 
       <div className="config-toolbar">
         <Tooltip title={canWrite ? undefined : NEED_ADMIN_HINT}><span><Button type="primary" disabled={!canWrite} onClick={() => setDrawer({ open: true, editing: null })}>新增</Button></span></Tooltip>
-        <Tooltip title="导入功能下一期开放"><span><Button disabled>导入</Button></span></Tooltip>
+        <Tooltip title={canWrite ? undefined : NEED_ADMIN_HINT}><span><Button disabled={!canWrite} onClick={() => setImporting(true)}>导入</Button></span></Tooltip>
         <Button onClick={reload}>刷新</Button>
       </div>
 
@@ -194,6 +196,7 @@ export default function ConfigsPage() {
         }}
       />
 
+      <ConfigImportDialog open={importing} userName={userName.trim()} onClose={() => setImporting(false)} onDone={reload} />
       <TypeDrawer
         editing={drawer.editing}
         open={drawer.open}

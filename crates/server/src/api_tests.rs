@@ -2670,3 +2670,77 @@ async fn 参数配置_岗位上限读配置_写坏了用默认值() {
     sqlx::query("update config_types set status = 'disabled' where code = 'role_limit'").execute(pool).await.unwrap();
     assert_eq!(post(base(&["j1", "j2", "j3"])).await, StatusCode::CONFLICT);
 }
+
+#[tokio::test]
+async fn 参数配置_导入导出_整体校验_跳过或覆盖() {
+    let temp = TempPaths::with_config();
+    let state = test_state(config()).await;
+    let app = temp.app(state.clone());
+    let password = Uuid::new_v4().to_string();
+    for name in ["root", "other"] {
+        assert_eq!(post_credentials(&app, "/api/users", name, &password).await.0, StatusCode::CREATED);
+    }
+    sqlx::query("update users set is_admin = true where name = 'root'").execute(state.pool()).await.unwrap();
+    let (admin_token, other_token) = (login_token(&app, "root", &password).await, login_token(&app, "other", &password).await);
+    let import = |name: &'static str, token: String, body: Value| {
+        let app = app.clone();
+        async move {
+            let mut headers = WRITE_HEADERS.to_vec();
+            headers.push(("x-user-name", name));
+            headers.push(("x-user-token", token.as_str()));
+            let (status, _, bytes) = request(&app, Method::POST, "/api/configs/import", &headers, body.to_string()).await;
+            (status, bytes)
+        }
+    };
+    let doc = |value: &str| json!({"types": [{"name": "导入类型", "code": "imp_type", "items": [{"name": "项", "code": "item_a", "value": value}]}]});
+
+    // 导出：所有人能看，带种子数据；也是导入模板
+    let (status, _, bytes) = request(&app, Method::GET, "/api/configs/export", &[], "").await;
+    assert_eq!(status, StatusCode::OK);
+    let exported = json_body(&bytes);
+    assert_eq!(exported["types"][0]["code"], "role_limit");
+    assert_eq!(exported["types"][0]["items"].as_array().unwrap().len(), 4);
+
+    // 不是管理员：403
+    assert_eq!(import("other", other_token, json!({"mode": "skip", "document": doc("1")})).await.0, StatusCode::FORBIDDEN);
+
+    // 管理员导入：新建 1 个类型和 1 个配置项
+    let (status, body) = import("root", admin_token.clone(), json!({"mode": "skip", "document": doc("1")})).await;
+    assert_eq!(status, StatusCode::OK, "{}", text(&body));
+    let r = json_body(&body);
+    assert_eq!((r["created_types"].clone(), r["created_items"].clone()), (json!(1), json!(1)));
+
+    // 再导入同样编码：跳过不改；覆盖才改值
+    let (_, body) = import("root", admin_token.clone(), json!({"mode": "skip", "document": doc("2")})).await;
+    let r = json_body(&body);
+    assert_eq!((r["skipped_types"].clone(), r["skipped_items"].clone(), r["created_items"].clone()), (json!(1), json!(1), json!(0)));
+    let value = |app: Router| async move {
+        let (_, _, bytes) = request(&app, Method::GET, "/api/configs/imp_type", &[], "").await;
+        json_body(&bytes)["items"]["rows"][0]["value"].as_str().unwrap().to_string()
+    };
+    assert_eq!(value(app.clone()).await, "1");
+    let (_, body) = import("root", admin_token.clone(), json!({"mode": "overwrite", "document": doc("2")})).await;
+    assert_eq!(json_body(&body)["updated_items"], 1);
+    assert_eq!(value(app.clone()).await, "2");
+
+    // 整体校验：一条像密钥，整个文件都不写（包括前面合格的新类型），并说明是哪一条
+    let bad_doc = json!({"types": [
+        {"name": "好的", "code": "good_type", "items": []},
+        {"name": "坏的", "code": "bad_type", "items": [{"name": "k", "code": "key_a", "value": "sk-abcdefghijklmnopqrstuv"}]},
+    ]});
+    let (status, body) = import("root", admin_token.clone(), json!({"mode": "skip", "document": bad_doc})).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(text(&body).contains("bad_type") && text(&body).contains("key_a"), "{}", text(&body));
+    let (status, _, _) = request(&app, Method::GET, "/api/configs/good_type", &[], "").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "校验失败不能写入任何东西");
+
+    // 文件里编码重复、保留编码、方式不对：都是 400
+    for document in [
+        json!({"types": [{"name": "a", "code": "dup_type"}, {"name": "b", "code": "dup_type"}]}),
+        json!({"types": [{"name": "a", "code": "export"}]}),
+        json!({"types": []}),
+    ] {
+        assert_eq!(import("root", admin_token.clone(), json!({"mode": "skip", "document": document})).await.0, StatusCode::BAD_REQUEST);
+    }
+    assert_eq!(import("root", admin_token, json!({"mode": "merge", "document": doc("1")})).await.0, StatusCode::BAD_REQUEST);
+}

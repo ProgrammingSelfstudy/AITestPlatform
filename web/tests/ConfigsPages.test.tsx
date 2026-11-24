@@ -109,3 +109,44 @@ test("不是管理员：写操作按钮都禁用", async () => {
   expect(screen.getByRole("button", { name: /新\s?增/ })).toBeDisabled();
   expect(screen.getByRole("button", { name: /修\s?改/ })).toBeDisabled();
 });
+
+test("管理员：粘贴 JSON 导入，选覆盖，显示结果；格式不对时不请求", async () => {
+  fetchMock.mockImplementation(async (url, init) =>
+    init?.method === "POST" && String(url) === "/api/configs/import"
+      ? Response.json({ created_types: 1, updated_types: 0, skipped_types: 0, created_items: 2, updated_items: 0, skipped_items: 0 })
+      : Response.json(page([type()], true)),
+  );
+  const user = userEvent.setup();
+  render(<ConfigsPage />);
+  await screen.findByRole("link", { name: "role_limit" });
+  await user.click(screen.getByRole("button", { name: /导\s?入/ }));
+  const dialog = await screen.findByRole("dialog");
+  const box = within(dialog).getByLabelText("配置 JSON");
+  await user.click(box);
+  await user.paste("这不是 JSON");
+  await user.click(within(dialog).getByRole("button", { name: /导\s?入/ }));
+  expect(await within(dialog).findByText(/不是有效的 JSON/)).toBeInTheDocument();
+  expect(posts()).toHaveLength(0);
+  await user.clear(box);
+  await user.click(box);
+  await user.paste('{"types":[{"name":"类型","code":"imp_type","items":[{"name":"项","code":"item_a","value":"1"}]}]}');
+  await user.click(within(dialog).getByLabelText("已有的编码用文件覆盖"));
+  await user.click(within(dialog).getByRole("button", { name: /导\s?入/ }));
+  expect(await within(dialog).findByText(/类型：新建 1、覆盖 0、跳过 0；配置项：新建 2/)).toBeInTheDocument();
+  expect(JSON.parse(String(posts()[0][1]?.body))).toMatchObject({ mode: "overwrite", document: { types: [{ code: "imp_type" }] } });
+});
+
+test("导入：服务端整体校验失败时原样显示是哪一条", async () => {
+  fetchMock.mockImplementation(async (_url, init) =>
+    init?.method === "POST" ? new Response("类型「bad_type」第 1 个配置项「key_a」：值里不能出现密码或 API Key", { status: 400 }) : Response.json(page([type()], true)),
+  );
+  const user = userEvent.setup();
+  render(<ConfigsPage />);
+  await screen.findByRole("link", { name: "role_limit" });
+  await user.click(screen.getByRole("button", { name: /导\s?入/ }));
+  const dialog = await screen.findByRole("dialog");
+  await user.click(within(dialog).getByLabelText("配置 JSON"));
+  await user.paste('{"types":[{"name":"坏","code":"bad_type"}]}');
+  await user.click(within(dialog).getByRole("button", { name: /导\s?入/ }));
+  expect(await within(dialog).findByText(/key_a/)).toBeInTheDocument();
+});

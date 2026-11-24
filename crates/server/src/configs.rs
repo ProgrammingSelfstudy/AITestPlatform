@@ -224,6 +224,10 @@ pub(crate) fn looks_secret(text: &str) -> bool {
 }
 
 fn valid_code(code: &str) -> bool {
+    // export、import 是接口路径，不能当类型编码用（会和 /api/configs/{code} 撞）
+    if code == "export" || code == "import" {
+        return false;
+    }
     let mut chars = code.chars();
     chars.next().is_some_and(|c| c.is_ascii_lowercase())
         && code.len() <= 50
@@ -454,4 +458,180 @@ pub(crate) async fn role_limit(pool: &sqlx::PgPool, slot: &str, default: usize) 
         Ok(Some((value,))) => value.trim().parse::<usize>().ok().filter(|n| (1..=20).contains(n)).unwrap_or(default),
         _ => default,
     }
+}
+
+// ---------------------------------------------------------------- 导出和导入（JSON）
+
+#[derive(Serialize, Deserialize)]
+pub(crate) struct ExportItem {
+    name: String,
+    code: String,
+    value: String,
+    #[serde(default)]
+    label: String,
+    #[serde(default)]
+    group_name: String,
+    #[serde(default)]
+    sort: i32,
+    #[serde(default)]
+    remark: String,
+    #[serde(default = "normal")]
+    status: String,
+}
+
+#[derive(Serialize, Deserialize)]
+pub(crate) struct ExportType {
+    name: String,
+    code: String,
+    #[serde(default)]
+    remark: String,
+    #[serde(default = "normal")]
+    status: String,
+    #[serde(default)]
+    items: Vec<ExportItem>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub(crate) struct ConfigDocument {
+    types: Vec<ExportType>,
+}
+
+/// 导出全部配置（所有人能看，里面本来就不该有密码）。同时也是导入文件的模板。
+pub(crate) async fn api_export(State(state): State<ApiState>) -> Result<impl IntoResponse, ApiError> {
+    let pool = state.app.pool();
+    let types = sqlx::query("select id, name, code, remark, status from config_types order by id")
+        .fetch_all(pool)
+        .await
+        .map_err(|e| internal("导出配置失败", e))?;
+    let mut out = Vec::new();
+    for t in &types {
+        let id: i64 = t.get("id");
+        let items = sqlx::query("select name, code, value, label, group_name, sort, remark, status from config_items where type_id = $1 order by sort, id")
+            .bind(id)
+            .fetch_all(pool)
+            .await
+            .map_err(|e| internal("导出配置失败", e))?;
+        out.push(ExportType {
+            name: t.get("name"),
+            code: t.get("code"),
+            remark: t.get("remark"),
+            status: t.get("status"),
+            items: items
+                .iter()
+                .map(|r| ExportItem { name: r.get("name"), code: r.get("code"), value: r.get("value"), label: r.get("label"), group_name: r.get("group_name"), sort: r.get("sort"), remark: r.get("remark"), status: r.get("status") })
+                .collect(),
+        });
+    }
+    Ok(([(header::CACHE_CONTROL, "no-store")], Json(ConfigDocument { types: out })))
+}
+
+#[derive(Deserialize)]
+pub(crate) struct ImportRequest {
+    /// `skip`：已有的编码跳过；`overwrite`：已有的编码用文件里的内容覆盖
+    mode: String,
+    document: ConfigDocument,
+}
+
+#[derive(Serialize, Default)]
+struct ImportResult {
+    created_types: u32,
+    updated_types: u32,
+    skipped_types: u32,
+    created_items: u32,
+    updated_items: u32,
+    skipped_items: u32,
+}
+
+const MAX_IMPORT_TYPES: usize = 200;
+const MAX_IMPORT_ITEMS: usize = 2000;
+
+/// 导入：先把整个文件校验一遍（任何一条不合格就整体拒绝并说明是哪一条，什么都不写），
+/// 再在一个事务里写入；写到一半失败也不会留下半份配置。只给管理员。
+pub(crate) async fn api_import(State(state): State<ApiState>, headers: HeaderMap, body: Result<Json<ImportRequest>, axum::extract::rejection::JsonRejection>) -> Result<impl IntoResponse, ApiError> {
+    let admin = require_admin(&state, &headers).await?;
+    let request = parse(body)?;
+    let overwrite = match request.mode.as_str() {
+        "skip" => false,
+        "overwrite" => true,
+        _ => return Err(bad("导入方式只能是跳过或覆盖")),
+    };
+    let doc = request.document;
+    if doc.types.is_empty() {
+        return Err(bad("文件里没有配置类型"));
+    }
+    if doc.types.len() > MAX_IMPORT_TYPES || doc.types.iter().map(|t| t.items.len()).sum::<usize>() > MAX_IMPORT_ITEMS {
+        return Err(bad(format!("一次最多导入 {MAX_IMPORT_TYPES} 个类型、{MAX_IMPORT_ITEMS} 个配置项")));
+    }
+    // 先全部校验，错误带上位置
+    let mut seen_types = std::collections::HashSet::new();
+    for (ti, t) in doc.types.iter().enumerate() {
+        let at = |e: ApiError| bad(format!("第 {} 个类型「{}」：{}", ti + 1, t.code, e.1));
+        check_text("名称", &t.name, 50, true).map_err(at)?;
+        check_text("备注", &t.remark, 200, false).map_err(at)?;
+        check_status(&t.status).map_err(at)?;
+        if !valid_code(t.code.trim()) {
+            return Err(at(bad("编码只能用小写字母、数字、下划线，以字母开头，2 到 50 位")));
+        }
+        if !seen_types.insert(t.code.trim().to_string()) {
+            return Err(at(bad("类型编码在文件里重复了")));
+        }
+        let mut seen_items = std::collections::HashSet::new();
+        for (ii, item) in t.items.iter().enumerate() {
+            let at = |e: ApiError| bad(format!("类型「{}」第 {} 个配置项「{}」：{}", t.code, ii + 1, item.code, e.1));
+            let as_input = ItemInput { name: item.name.clone(), code: item.code.clone(), value: item.value.clone(), label: item.label.clone(), group_name: item.group_name.clone(), sort: item.sort, remark: item.remark.clone(), status: item.status.clone() };
+            clean_item(&as_input).map_err(at)?;
+            check_status(&item.status).map_err(at)?;
+            if !valid_code(item.code.trim()) {
+                return Err(at(bad("编码只能用小写字母、数字、下划线，以字母开头，2 到 50 位")));
+            }
+            if !seen_items.insert(item.code.trim().to_string()) {
+                return Err(at(bad("配置项编码在这个类型下重复了")));
+            }
+        }
+    }
+
+    let mut tx = state.app.pool().begin().await.map_err(|e| internal("导入配置失败", e))?;
+    let mut result = ImportResult::default();
+    let fail = |e| internal("导入配置失败", e);
+    for t in &doc.types {
+        let (name, remark, code) = (t.name.trim(), t.remark.trim(), t.code.trim());
+        let existing: Option<i64> = sqlx::query_scalar("select id from config_types where code = $1").bind(code).fetch_optional(&mut *tx).await.map_err(fail)?;
+        let type_id = match existing {
+            Some(id) if overwrite => {
+                sqlx::query("update config_types set name=$2, remark=$3, status=$4, updated_at=now(), updated_by=$5 where id=$1")
+                    .bind(id).bind(name).bind(remark).bind(&t.status).bind(&admin).execute(&mut *tx).await.map_err(fail)?;
+                result.updated_types += 1;
+                id
+            }
+            Some(id) => {
+                result.skipped_types += 1;
+                id
+            }
+            None => {
+                let id: i64 = sqlx::query_scalar("insert into config_types (name, code, remark, status, updated_by) values ($1,$2,$3,$4,$5) returning id")
+                    .bind(name).bind(code).bind(remark).bind(&t.status).bind(&admin).fetch_one(&mut *tx).await.map_err(fail)?;
+                result.created_types += 1;
+                id
+            }
+        };
+        for item in &t.items {
+            let (iname, icode, value, label, group, remark) = (item.name.trim(), item.code.trim(), item.value.trim(), item.label.trim(), item.group_name.trim(), item.remark.trim());
+            let found: Option<i64> = sqlx::query_scalar("select id from config_items where type_id = $1 and code = $2").bind(type_id).bind(icode).fetch_optional(&mut *tx).await.map_err(fail)?;
+            match found {
+                Some(id) if overwrite => {
+                    sqlx::query("update config_items set name=$2, value=$3, label=$4, group_name=$5, sort=$6, remark=$7, status=$8, updated_at=now(), updated_by=$9 where id=$1")
+                        .bind(id).bind(iname).bind(value).bind(label).bind(group).bind(item.sort).bind(remark).bind(&item.status).bind(&admin).execute(&mut *tx).await.map_err(fail)?;
+                    result.updated_items += 1;
+                }
+                Some(_) => result.skipped_items += 1,
+                None => {
+                    sqlx::query("insert into config_items (type_id, name, code, value, label, group_name, sort, remark, status, updated_by) values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)")
+                        .bind(type_id).bind(iname).bind(icode).bind(value).bind(label).bind(group).bind(item.sort).bind(remark).bind(&item.status).bind(&admin).execute(&mut *tx).await.map_err(fail)?;
+                    result.created_items += 1;
+                }
+            }
+        }
+    }
+    tx.commit().await.map_err(fail)?;
+    Ok(Json(result))
 }

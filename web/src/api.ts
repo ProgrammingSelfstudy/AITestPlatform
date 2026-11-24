@@ -759,3 +759,25 @@ export async function fetchRoleLimits(signal?: AbortSignal): Promise<Record<stri
   }
   return limits;
 }
+
+export interface ConfigDocument {
+  types: { name: string; code: string; remark?: string; status?: ConfigStatus; items?: { name: string; code: string; value: string; label?: string; group_name?: string; sort?: number; remark?: string; status?: ConfigStatus }[] }[];
+}
+
+export interface ImportResult {
+  created_types: number;
+  updated_types: number;
+  skipped_types: number;
+  created_items: number;
+  updated_items: number;
+  skipped_items: number;
+}
+
+/** 导出全部配置（也是导入文件的模板） */
+export const fetchConfigExport = (signal?: AbortSignal) => get<ConfigDocument>("/api/configs/export", signal);
+
+/** 导入：先整体校验再写入；`skip` 已有的编码跳过，`overwrite` 用文件内容覆盖。只给管理员。 */
+export async function importConfigs(document: ConfigDocument, mode: "skip" | "overwrite", userName: string): Promise<ImportResult> {
+  const response = await adminPost("/api/configs/import", { mode, document }, userName);
+  return response.json();
+}
