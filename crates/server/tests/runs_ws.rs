@@ -183,6 +183,10 @@ async fn next_message(client: &mut Client) -> ServerMsg {
         while let Some(Ok(frame)) = client.next().await {
             if let Message::Text(text) = frame {
                 if let Parsed::Known(parsed) = protocol::parse::<ServerMsg>(&text).unwrap() {
+                    // 节点上线后服务端会先下发运行参数（SetParams），和派发无关，跳过
+                    if matches!(parsed.body, ServerMsg::SetParams(_)) {
+                        continue;
+                    }
                     return parsed.body;
                 }
             }

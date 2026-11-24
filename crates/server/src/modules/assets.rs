@@ -172,7 +172,8 @@ pub(crate) async fn api_add_screenshots(
         return Err(bad(format!("这个模块的 UI 图合计不能超过 {} MB，请先删掉一些或裁小一点", MAX_TOTAL_SHOT_BYTES / 1024 / 1024)));
     }
     for (name, shot, sha) in &fresh {
-        sqlx::query("insert into module_screenshots (module_id, name, content_type, bytes, sha256, created_by) values ($1,$2,$3,$4,$5,$6)")
+        // created_at 用 clock_timestamp()：同一个事务里 now() 都一样，列表顺序就不稳定了
+        sqlx::query("insert into module_screenshots (module_id, name, content_type, bytes, sha256, created_by, created_at) values ($1,$2,$3,$4,$5,$6,clock_timestamp())")
             .bind(module)
             .bind(name)
             .bind(shot.content_type)

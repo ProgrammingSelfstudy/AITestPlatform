@@ -337,8 +337,8 @@ pub async fn create_request(pool: &PgPool, project: &str, user: Uuid, input: &Ca
             .await?;
         // 同时记进模块的图库（模块详情页能看、能删）；同一张图已经在里面就不重复存
         sqlx::query(
-            "insert into module_screenshots (module_id, name, content_type, bytes, sha256, created_by)
-             values ($1,$2,$3,$4,$5,$6) on conflict (module_id, sha256) do nothing",
+            "insert into module_screenshots (module_id, name, content_type, bytes, sha256, created_by, created_at)
+             values ($1,$2,$3,$4,$5,$6,clock_timestamp()) on conflict (module_id, sha256) do nothing",
         )
         .bind(module_id)
         .bind(format!("生成用例时上传的截图 {}", seq + 1))

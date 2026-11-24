@@ -817,6 +817,12 @@ async fn 派发消息包含租约和清理标志且不含凭证() {
         .execute(w.pool())
         .await
         .unwrap();
+    // 节点上先有这台设备（真实情况是节点连过平台、设备已登记）：没有对应设备的 app 用例建任务时会被跳过
+    sqlx::query("insert into devices (node_id, serial, platform, status) values ($1, '假设备', 'android', 'idle') on conflict do nothing")
+        .bind(w.node)
+        .execute(w.pool())
+        .await
+        .unwrap();
     let run = w.queue(&["A"]).await[0];
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
