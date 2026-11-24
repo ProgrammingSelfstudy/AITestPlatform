@@ -66,8 +66,8 @@ pub(crate) fn routes(app: AppState, paths: Paths) -> Router {
             "/api/projects/{project}/casegen-requests",
             post(crate::modules::api_create_request)
                 .route_layer(authorize_write.clone())
-                // 截图用 base64 放在 JSON 里：最多 6 张 × 3MB，再加文档，放宽到 32MB
-                .layer(axum::extract::DefaultBodyLimit::max(32 * 1024 * 1024)),
+                // 截图用 base64 放在 JSON 里：最多 100 张、合计 100MB（base64 后约 134MB），再加文档，放宽到 160MB
+                .layer(axum::extract::DefaultBodyLimit::max(160 * 1024 * 1024)),
         )
         .route("/api/casegen-requests/{id}", get(crate::modules::api_request_detail))
         .route("/api/node/casegen-requests/claim", put(crate::modules::api_claim))

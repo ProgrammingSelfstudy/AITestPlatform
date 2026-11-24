@@ -27,8 +27,10 @@ const project = "hafa";
 const MAX_MODULE_LEN = 80;
 const MAX_DOC_LEN = 200_000;
 const MAX_LINKS = 5;
-const MAX_SCREENSHOTS = 6;
+const MAX_SCREENSHOTS = 100;
 const MAX_IMAGE_BYTES = 3 * 1024 * 1024;
+/** 全部截图合计的上限（和服务端一致） */
+const MAX_TOTAL_IMAGE_BYTES = 100 * 1024 * 1024;
 const ALLOWED_IMAGE_TYPES = new Set(["image/png", "image/jpeg"]);
 
 type Tone = "pass" | "run" | "que" | "unc" | "lost" | "fail";
@@ -552,6 +554,8 @@ export default function GenerateDialog({ onClose, initialModule }: { onClose: ()
       nextErrors.screenshots = "请至少上传 1 张 UI 区域截图";
     } else if (screenshots.length > MAX_SCREENSHOTS) {
       nextErrors.screenshots = `UI 区域截图最多上传 ${MAX_SCREENSHOTS} 张`;
+    } else if (screenshots.reduce((sum, item) => sum + item.size, 0) > MAX_TOTAL_IMAGE_BYTES) {
+      nextErrors.screenshots = `截图合计不能超过 ${MAX_TOTAL_IMAGE_BYTES / 1024 / 1024}MB，请少传几张或裁小一点`;
     }
 
     if (!nodeId) {
@@ -843,7 +847,7 @@ export default function GenerateDialog({ onClose, initialModule }: { onClose: ()
               点击选择图片、拖拽到此处，或直接粘贴剪贴板截图
             </div>
             <div className="mod-dropzone-sub">
-              至少 1 张，最多 6 张；仅接受 PNG / JPEG 格式，单张不超过 3MB
+              至少 1 张，最多 100 张；仅接受 PNG / JPEG 格式，单张不超过 3MB，合计不超过 100MB
             </div>
           </div>
 

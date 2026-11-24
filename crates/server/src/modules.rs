@@ -25,8 +25,10 @@ use crate::users::{self, BrowserUser};
 pub const MAX_DOC_CHARS: usize = 200_000;
 pub const MAX_LINKS: usize = 5;
 pub const MAX_LINK_CHARS: usize = 2000;
-pub const MAX_SHOTS: usize = 6;
+pub const MAX_SHOTS: usize = 100;
 pub const MAX_SHOT_BYTES: usize = 3 * 1024 * 1024;
+/// 全部截图合计的上限（解码后）：100 张都到 3MB 会有 300MB，一个请求扛不住，合计限制在 100MB
+pub const MAX_TOTAL_SHOT_BYTES: usize = 100 * 1024 * 1024;
 const PNG_MAGIC: &[u8] = b"\x89PNG\r\n\x1a\n";
 const JPEG_MAGIC: &[u8] = b"\xff\xd8\xff";
 
@@ -185,6 +187,10 @@ pub fn validate(input: &CasegenInput) -> Res<Validated> {
         return invalid(format!("UI 区域截图最多 {MAX_SHOTS} 张"));
     }
     let shots = input.screenshots.iter().enumerate().map(|(i, s)| decode_shot(i, s)).collect::<Res<Vec<_>>>()?;
+    let total: usize = shots.iter().map(|s| s.bytes.len()).sum();
+    if total > MAX_TOTAL_SHOT_BYTES {
+        return invalid(format!("截图合计 {} MB，超过 {} MB 的上限，请少传几张或裁小一点", total.div_ceil(1024 * 1024), MAX_TOTAL_SHOT_BYTES / 1024 / 1024));
+    }
     Ok(Validated { module, doc, links, shots })
 }
 
@@ -1016,6 +1022,25 @@ mod tests {
         assert!(message(&i).contains("最多"));
         i.screenshots = vec![ShotInput { data_b64: b64(b"\xff\xd8\xff\xe0jpeg") }];
         assert!(validate(&i).is_ok(), "JPEG 应通过");
+    }
+
+    #[test]
+    fn 截图最多一百张_合计不超过一百兆() {
+        assert_eq!(MAX_SHOTS, 100);
+        // 100 张小图：通过
+        let mut i = input();
+        i.screenshots = (0..MAX_SHOTS).map(|_| ShotInput { data_b64: b64(PNG) }).collect();
+        assert!(validate(&i).is_ok(), "100 张应通过");
+        // 每张都没超过单张上限（3MB），但 40 张 × 3MB = 120MB 超过合计上限
+        let mut shot = PNG.to_vec();
+        shot.resize(MAX_SHOT_BYTES, 0);
+        let one = ShotInput { data_b64: b64(&shot) };
+        i.screenshots = (0..40).map(|_| ShotInput { data_b64: one.data_b64.clone() }).collect();
+        let text = message(&i);
+        assert!(text.contains("合计") && text.contains("100 MB"), "{text}");
+        // 30 张 × 3MB = 90MB：在合计上限内
+        i.screenshots.truncate(30);
+        assert!(validate(&i).is_ok(), "90MB 应通过");
     }
 
     #[test]
