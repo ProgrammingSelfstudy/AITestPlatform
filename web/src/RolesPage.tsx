@@ -5,6 +5,7 @@ import {
   fetchNodeRoles,
   fetchNodes,
   initNodeRoles,
+  ROLE_SLOT_LIMIT,
   ROLE_SOURCES,
   saveNodeRoles,
   releaseNode,
@@ -18,7 +19,7 @@ import {
   type RoleView,
 } from "./api";
 import { readReviewToken, rememberReviewToken, writeTokenAction } from "./reviewLogic";
-import AppsPanel from "./AppsPanel";
+import AppsPanel, { type AppRoleDraft } from "./AppsPanel";
 import IdentityHint from "./IdentityHint";
 import { NEED_LOGIN_MESSAGE, useRememberedUserName } from "./identity";
 import ReviewTokenDialog from "./ReviewTokenDialog";
@@ -252,23 +253,6 @@ function KeyIcon() {
       <path d="M8.5 8H14.5M12 8v2.2M14 8v1.6" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
     </svg>
   );
-}
-
-function pipeAvailClass(status: CheckStatus): string {
-  switch (status) {
-    case "ok":
-      return "is-ok";
-    case "checking":
-      return "is-run";
-    case "unchecked":
-      return "is-pending";
-    case "not_logged_in":
-      return "is-warn";
-    case "quota_exhausted":
-      return "is-lost";
-    case "failed":
-      return "is-bad";
-  }
 }
 
 export default function RolesPage() {
@@ -517,6 +501,11 @@ export default function RolesPage() {
   const watchedModels = Form.useWatch("models", form);
   const watchedDefaultModel = Form.useWatch("defaultModel", form) ?? "";
 
+  /** 任何一个可用来源支持这个岗位就能选；选了之后来源会自动切过去 */
+  const slotFull = (slot: ModelRole["slot"]) =>
+    [...serverRoles, ...draftNewRoles].filter((r) => r.slot === slot && r.id !== selectedRoleId).length >= ROLE_SLOT_LIMIT;
+  const slotSupported = (slot: ModelRole["slot"]) =>
+    !slotFull(slot) && ROLE_SOURCES.some((item) => item.available && allowedSlotsForSource(item.value).includes(slot));
   const allowedSlots = useMemo(() => allowedSlotsForSource(watchedSource), [watchedSource]);
   const selectedSourceMeta = useMemo(() => findSourceMeta(watchedSource), [watchedSource]);
   const showApiKeyField = Boolean(selectedSourceMeta?.needsKey);
@@ -579,15 +568,6 @@ export default function RolesPage() {
     };
   }, [serverRoles]);
 
-  const executorRoles = useMemo(
-    () => serverRoles.filter((role) => role.slot === "executor"),
-    [serverRoles],
-  );
-  const judgeRoles = useMemo(
-    () => serverRoles.filter((role) => role.slot === "judge"),
-    [serverRoles],
-  );
-
   // 检测日志：只展示 roles 里真实有检测记录或正在检测的角色，绝不编造
   const checkLogEntries = useMemo(() => {
     return serverRoles
@@ -628,6 +608,16 @@ export default function RolesPage() {
       }
     }
     setDraftsById((prev) => ({ ...prev, [selectedRoleId]: syncedValues }));
+  }
+
+  /** 选的岗位当前来源不支持时，自动换成第一个支持它的来源（例如在 Codex 下点「判定员」就切到 Claude） */
+  function handleSlotChange(nextSlot: ModelRole["slot"]) {
+    const currentSource = form.getFieldValue("source") as string | undefined;
+    if (currentSource && allowedSlotsForSource(currentSource).includes(nextSlot)) return;
+    const target = ROLE_SOURCES.find((item) => item.available && allowedSlotsForSource(item.value).includes(nextSlot));
+    if (!target) return;
+    form.setFieldsValue({ source: target.value, slot: nextSlot });
+    handleSourceChange(target.value);
   }
 
   function handleSourceChange(nextSource: string) {
@@ -674,21 +664,31 @@ export default function RolesPage() {
   }
 
   function handleAddRole() {
+    addDraftRole();
+  }
+
+  /** 环境检查通过后「用这些模型新增角色」：预填来源和模型，落到右边同一个编辑区里，由用户补全后保存 */
+  function handleDraftFromApp(draft: AppRoleDraft) {
+    addDraftRole(draft);
+    document.querySelector('[aria-label="角色配置编辑"]')?.scrollIntoView({ behavior: "smooth", block: "start" });
+  }
+
+  function addDraftRole(prefill?: AppRoleDraft) {
     if (isNodeOffline || !canQueryRoles || busy) return;
     setActionError(null);
     setActionNotice(null);
     // 已有的和还没保存的新建角色 id 都要避开，不然两个草稿会撞 id
     const existingIds = new Set([...serverRoles.map((role) => role.id), ...draftNewRoles.map((draftRole) => draftRole.id)]);
-    const defaultSource = ROLE_SOURCES.find((item) => item.available)?.value ?? "codex_exec";
-    const defaultSlot = allowedSlotsForSource(defaultSource)[0];
+    const defaultSource = prefill?.source ?? ROLE_SOURCES.find((item) => item.available)?.value ?? "codex_exec";
+    const defaultSlot = prefill?.slot ?? allowedSlotsForSource(defaultSource)[0];
     const newId = generateRoleId(existingIds, defaultSource);
     const fresh: ModelRole = {
       id: newId,
       slot: defaultSlot,
-      name: "",
+      name: prefill?.name ?? "",
       source: defaultSource,
-      default: { model: "", effort: null },
-      models: [{ model: "", efforts: [] }],
+      default: prefill?.default ?? { model: "", effort: null },
+      models: prefill?.models ?? [{ model: "", efforts: [] }],
     };
     setDraftNewRoles((prev) => [...prev, fresh]);
     setSelectedRoleId(newId);
@@ -838,15 +838,6 @@ export default function RolesPage() {
     await executeWrite({ kind: "save", payload, createdIds });
   }
 
-  /** 从「选应用」面板创建角色：和节点上现有的角色一起整体提交（走审核口令流程），新角色是第一个选中的 */
-  function handleCreateFromApp(created: RoleInput[]) {
-    if (busy || created.length === 0) return;
-    setActionError(null);
-    setActionNotice(null);
-    const payload: RoleInput[] = [...serverRoles.map(toRoleInput), ...created];
-    void executeWrite({ kind: "save", payload, createdIds: created.map((item) => item.id) });
-  }
-
   function handleCheckCurrent() {
     if (!activeServerRole || isEditingNewDraft || isNodeOffline || busy) return;
     setActionError(null);
@@ -919,7 +910,6 @@ export default function RolesPage() {
                 ? { tone: "run", text: "检测进行中" }
                 : { tone: "pass", text: "在线同步中" };
 
-  const pipelineReady = stats.executorsOk > 0 && stats.judgesOk > 0;
   const activeRoleIsDirty = Boolean(selectedRoleId && draftsById[selectedRoleId]);
 
   return (
@@ -1126,7 +1116,7 @@ export default function RolesPage() {
         online={!isNodeOffline}
         existingRoles={serverRoles}
         busy={busy}
-        onCreateRoles={handleCreateFromApp}
+        onDraftRole={handleDraftFromApp}
         readOnlyReason={readOnlyReason}
       />
 
@@ -1265,167 +1255,6 @@ export default function RolesPage() {
 
           {/* 右栏：流程管线 + 统计块 + 编辑表单 + 类终端检测日志 */}
           <main className="roles-main">
-            {/* 右栏上方：流程管线与 4 个统计块 */}
-            <section className="roles-panel" aria-label="角色管线与状态统计">
-              <div className="roles-panel-head">
-                <div className="roles-panel-title-wrap">
-                  <h2 className="roles-panel-title">执行管线 · 执行员 → 判定员</h2>
-                  <span className="roles-panel-sub">按岗位分组展示各角色当前连通状态</span>
-                </div>
-                <span
-                  className={`roles-status-badge ${
-                    pipelineReady
-                      ? "roles-tone-pass"
-                      : stats.abnormal > 0
-                        ? "roles-tone-fail"
-                        : "roles-tone-que"
-                  }`}
-                >
-                  <span className="roles-status-dot" aria-hidden="true" />
-                  {pipelineReady ? "双岗均可用" : stats.abnormal > 0 ? "管线存在异常" : "待完成检测"}
-                </span>
-              </div>
-
-              <div className="roles-flow-body">
-                <div className="roles-pipeline" role="group" aria-label="执行员到判定员流程图">
-                  {/* 执行员分组 */}
-                  <div className="roles-pipe-stage">
-                    <div className="roles-pipe-stage-head">
-                      <span className="roles-slot-pill roles-slot-executor">执行员角色</span>
-                      <span className="roles-pipe-stage-count">
-                        可用 {stats.executorsOk} / {stats.executors}
-                      </span>
-                    </div>
-                    {executorRoles.length === 0 ? (
-                      <div className="roles-pipe-empty">暂未配置执行员角色</div>
-                    ) : (
-                      <div className="roles-pipe-nodes">
-                        {executorRoles.map((role) => {
-                          const meta = CHECK_META[role.check.status];
-                          return (
-                            <button
-                              key={role.id}
-                              type="button"
-                              onClick={() => setSelectedRoleId(role.id)}
-                              className={`roles-pipe-node${selectedRoleId === role.id ? " is-selected" : ""}`}
-                            >
-                              <div className="roles-pipe-node-top">
-                                <span className="roles-pipe-node-name" title={role.name}>
-                                  {role.name}
-                                </span>
-                                <span className={`roles-pipe-node-avail ${pipeAvailClass(role.check.status)}`}>
-                                  {meta.available ? "可用" : `不可用 · ${meta.text}`}
-                                </span>
-                              </div>
-                              <span className="roles-pipe-node-meta" title={role.default.model}>
-                                {role.default.model || "未设默认模型"}
-                                {role.default.effort ? ` · ${role.default.effort}` : ""}
-                              </span>
-                            </button>
-                          );
-                        })}
-                      </div>
-                    )}
-                  </div>
-
-                  {/* 流向箭头 */}
-                  <div className="roles-pipe-bridge" aria-hidden="true">
-                    <div className={`roles-pipe-bridge-line${pipelineReady ? " is-ready" : ""}`}>
-                      <svg width="48" height="16" viewBox="0 0 48 16" fill="none">
-                        <path
-                          d="M2 8h40"
-                          stroke="currentColor"
-                          strokeWidth="1.5"
-                          strokeDasharray="4 3"
-                          strokeLinecap="round"
-                        />
-                        <path
-                          d="M38 3.5L44 8l-6 4.5"
-                          stroke="currentColor"
-                          strokeWidth="1.5"
-                          strokeLinecap="round"
-                          strokeLinejoin="round"
-                        />
-                      </svg>
-                    </div>
-                    <span className="roles-pipe-bridge-label">提交判定</span>
-                  </div>
-
-                  {/* 判定员分组 */}
-                  <div className="roles-pipe-stage">
-                    <div className="roles-pipe-stage-head">
-                      <span className="roles-slot-pill roles-slot-judge">判定员角色</span>
-                      <span className="roles-pipe-stage-count">
-                        可用 {stats.judgesOk} / {stats.judges}
-                      </span>
-                    </div>
-                    {judgeRoles.length === 0 ? (
-                      <div className="roles-pipe-empty">暂未配置判定员角色</div>
-                    ) : (
-                      <div className="roles-pipe-nodes">
-                        {judgeRoles.map((role) => {
-                          const meta = CHECK_META[role.check.status];
-                          return (
-                            <button
-                              key={role.id}
-                              type="button"
-                              onClick={() => setSelectedRoleId(role.id)}
-                              className={`roles-pipe-node${selectedRoleId === role.id ? " is-selected" : ""}`}
-                            >
-                              <div className="roles-pipe-node-top">
-                                <span className="roles-pipe-node-name" title={role.name}>
-                                  {role.name}
-                                </span>
-                                <span className={`roles-pipe-node-avail ${pipeAvailClass(role.check.status)}`}>
-                                  {meta.available ? "可用" : `不可用 · ${meta.text}`}
-                                </span>
-                              </div>
-                              <span className="roles-pipe-node-meta" title={role.default.model}>
-                                {role.default.model || "未设默认模型"}
-                                {role.default.effort ? ` · ${role.default.effort}` : ""}
-                              </span>
-                            </button>
-                          );
-                        })}
-                      </div>
-                    )}
-                  </div>
-                </div>
-
-                {/* 4 个统计块 */}
-                <div className="roles-stats-grid" role="group" aria-label="角色统计指标">
-                  <div className="roles-stat-tile">
-                    <span className="roles-stat-label">角色总数</span>
-                    <span className="roles-stat-num">{stats.total}</span>
-                    <span className="roles-stat-note">
-                      执行员 {stats.executors} · 判定员 {stats.judges}
-                    </span>
-                  </div>
-                  <div className="roles-stat-tile">
-                    <span className="roles-stat-label">可用</span>
-                    <span className={`roles-stat-num${stats.ok > 0 ? " is-pass" : ""}`}>
-                      {stats.ok}
-                    </span>
-                    <span className="roles-stat-note">最近一次检测通过</span>
-                  </div>
-                  <div className="roles-stat-tile">
-                    <span className="roles-stat-label">未检测</span>
-                    <span className="roles-stat-num is-que">{stats.unchecked}</span>
-                    <span className="roles-stat-note">
-                      {stats.checking > 0 ? `另有 ${stats.checking} 个检测中` : "尚未发起连通检测"}
-                    </span>
-                  </div>
-                  <div className={`roles-stat-tile${stats.abnormal > 0 ? " is-alert" : ""}`}>
-                    <span className="roles-stat-label">异常</span>
-                    <span className={`roles-stat-num${stats.abnormal > 0 ? " is-fail" : ""}`}>
-                      {stats.abnormal}
-                    </span>
-                    <span className="roles-stat-note">失败 / 未登录 / 额度用完</span>
-                  </div>
-                </div>
-              </div>
-            </section>
-
             {/* 右栏中部：选中角色编辑表单 */}
             <section className="roles-panel" aria-label="角色配置编辑">
               <div className="roles-panel-head">
@@ -1527,31 +1356,32 @@ export default function RolesPage() {
                           extra={
                             allowedSlots.length === 1
                               ? `当前来源仅支持担任${SLOT_LABEL[allowedSlots[0]]}`
-                              : "选择该角色在测试流程中的岗位"
+                              : `选择该角色在测试流程中的岗位（每个岗位最多 ${ROLE_SLOT_LIMIT} 个，满了会置灰）`
                           }
                         >
                           <Segmented<ModelRole["slot"]>
                             block
+                            onChange={handleSlotChange}
                             options={[
                               {
                                 value: "executor",
                                 label: "执行员",
-                                disabled: !allowedSlots.includes("executor"),
+                                disabled: !slotSupported("executor"),
                               },
                               {
                                 value: "judge",
                                 label: "判定员",
-                                disabled: !allowedSlots.includes("judge"),
+                                disabled: !slotSupported("judge"),
                               },
                               {
                                 value: "case_writer",
                                 label: "测试用例",
-                                disabled: !allowedSlots.includes("case_writer"),
+                                disabled: !slotSupported("case_writer"),
                               },
                               {
                                 value: "planner",
                                 label: "管理员",
-                                disabled: !allowedSlots.includes("planner"),
+                                disabled: !slotSupported("planner"),
                               },
                             ]}
                           />

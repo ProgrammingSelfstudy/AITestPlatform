@@ -2497,3 +2497,65 @@ async fn 认领节点_没主人才能认领_别人的不能抢_要先说明是�
     let owner: Uuid = sqlx::query_scalar("select owner_user_id from nodes where id = $1").bind(taken).fetch_one(state.pool()).await.unwrap();
     assert_eq!(owner, other);
 }
+
+#[tokio::test]
+async fn 每个岗位最多三个角色() {
+    let world = World::new().await;
+    let path = format!("/api/nodes/{}/roles", world.node);
+    let post = |roles: Vec<Value>| {
+        let mut headers = review_headers(REVIEW_TOKEN);
+        headers.push(("x-user-name", USER_NAME));
+        let (app, path) = (world.app.clone(), path.clone());
+        async move { request(&app, Method::POST, &path, &headers, set_roles_body(json!(roles))).await }
+    };
+    let judge = |id: &str| role_json(id, "judge", "agy", "m");
+    // 3 个判定员：校验通过（节点离线所以 409）；4 个：直接 400
+    let (status, _, bytes) = post(vec![role_json("e", "executor", "codex_exec", "m"), judge("j1"), judge("j2"), judge("j3")]).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{}", text(&bytes));
+    let (status, _, bytes) = post(vec![role_json("e", "executor", "codex_exec", "m"), judge("j1"), judge("j2"), judge("j3"), judge("j4")]).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{}", text(&bytes));
+}
+
+#[tokio::test]
+async fn 参数配置_一级列表能搜索分页_二级详情带配置项() {
+    let world = World::new().await;
+    // 所有人都能看，不需要身份
+    let (status, headers, bytes) = request(&world.app, Method::GET, "/api/configs", &[], "").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers[header::CACHE_CONTROL], "no-store");
+    let all = json_body(&bytes);
+    assert_eq!(all["total"], 3);
+    let codes: Vec<_> = all["rows"].as_array().unwrap().iter().map(|r| r["code"].as_str().unwrap().to_string()).collect();
+    assert_eq!(codes, ["role_limit", "device_retry", "stuck_detect"]);
+    assert_eq!(all["rows"][0]["item_count"], 4);
+
+    // 按编码、名称搜索；% 和 _ 当普通字符，不当通配符
+    let (_, _, bytes) = request(&world.app, Method::GET, "/api/configs?code=retry", &[], "").await;
+    assert_eq!(json_body(&bytes)["total"], 1);
+    let (_, _, bytes) = request(&world.app, Method::GET, "/api/configs?name=%E5%8D%A1%E4%BD%8F", &[], "").await;
+    assert_eq!(json_body(&bytes)["rows"][0]["code"], "stuck_detect");
+    let (_, _, bytes) = request(&world.app, Method::GET, "/api/configs?code=%25", &[], "").await;
+    assert_eq!(json_body(&bytes)["total"], 0, "% 不是通配符");
+
+    // 分页：每页 2 条，第 2 页只剩 1 条；每页条数超上限会被收到 100
+    let (_, _, bytes) = request(&world.app, Method::GET, "/api/configs?page=2&page_size=2", &[], "").await;
+    let page = json_body(&bytes);
+    assert_eq!((page["total"].clone(), page["rows"].as_array().unwrap().len()), (json!(3), 1));
+    let (_, _, bytes) = request(&world.app, Method::GET, "/api/configs?page_size=100000", &[], "").await;
+    assert_eq!(json_body(&bytes)["page_size"], 100);
+
+    // 二级详情：类型 + 配置项（按排序），配置项分页
+    let (status, _, bytes) = request(&world.app, Method::GET, "/api/configs/role_limit", &[], "").await;
+    assert_eq!(status, StatusCode::OK);
+    let detail = json_body(&bytes);
+    assert_eq!(detail["type"]["name"], "岗位角色上限");
+    assert_eq!(detail["items"]["total"], 4);
+    let first = &detail["items"]["rows"][0];
+    assert_eq!((first["code"].clone(), first["value"].clone()), (json!("executor"), json!("3")));
+    let (_, _, bytes) = request(&world.app, Method::GET, "/api/configs/role_limit?page=2&page_size=3", &[], "").await;
+    assert_eq!(json_body(&bytes)["items"]["rows"].as_array().unwrap().len(), 1);
+
+    // 不存在的类型：404
+    let (status, _, _) = request(&world.app, Method::GET, "/api/configs/nope", &[], "").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}

@@ -1,8 +1,8 @@
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
-import type { AppView, RoleInput, RoleView } from "../src/api";
-import AppsPanel from "../src/AppsPanel";
+import type { AppView, RoleView } from "../src/api";
+import AppsPanel, { type AppRoleDraft } from "../src/AppsPanel";
 
 const fetchMock = vi.fn<typeof fetch>();
 const NODE = "aaaaaaaa-0000-0000-0000-000000000001";
@@ -40,8 +40,8 @@ function serve(apps: AppView[], online = true) {
 
 const existing: RoleView[] = [];
 
-function mount(onCreate: (roles: RoleInput[]) => void = () => {}, roles: RoleView[] = existing, busy = false, readOnlyReason?: string) {
-  return render(<AppsPanel nodeId={NODE} userName="小明" online existingRoles={roles} busy={busy} onCreateRoles={onCreate} readOnlyReason={readOnlyReason} />);
+function mount(onDraft: (draft: AppRoleDraft) => void = () => {}, roles: RoleView[] = existing, busy = false, readOnlyReason?: string) {
+  return render(<AppsPanel nodeId={NODE} userName="小明" online existingRoles={roles} busy={busy} onDraftRole={onDraft} readOnlyReason={readOnlyReason} />);
 }
 
 const scanCalls = () => fetchMock.mock.calls.filter(([, init]) => init?.method === "POST");
@@ -91,78 +91,54 @@ test("没装或登录方式不对：不能继续创建角色，并给出原因",
   await screen.findAllByText("未安装");
   await user.click(screen.getByText("Gemini").closest("button")!);
   expect(await screen.findByText(/本机没有找到 Gemini，不能继续/)).toBeInTheDocument();
-  expect(screen.queryByRole("button", { name: /创建角色/ })).not.toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: /新增角色/ })).not.toBeInTheDocument();
   await user.click(screen.getByText("Claude").closest("button")!);
   expect(await screen.findByText(/登录方式不对，不能继续/)).toBeInTheDocument();
   expect(screen.getAllByText(/不使用 API Key/).length).toBeGreaterThan(0);
 });
 
-test("选模型创建执行员角色：只含勾选的模型，默认强度取该模型的默认档位", async () => {
+test("环境检查通过后，点按钮把来源和全部检查到的模型带去「新增角色」编辑区", async () => {
   serve([codex]);
-  const onCreate = vi.fn<(roles: RoleInput[]) => void>();
+  const onDraft = vi.fn<(draft: AppRoleDraft) => void>();
   const user = userEvent.setup();
-  mount(onCreate);
+  mount(onDraft);
   await screen.findByText("检测到并可用");
   await user.click(screen.getByText("Codex").closest("button")!);
-  await screen.findByText("选模型并创建角色");
-  // 没勾选就创建：中文提示，不调用
-  await user.click(screen.getByRole("button", { name: /创建角色/ }));
-  expect(await screen.findByText("请至少勾选一个模型")).toBeInTheDocument();
-  expect(onCreate).not.toHaveBeenCalled();
-  // 只勾 GPT-B：默认模型自动选它，强度取它自己的默认档位 medium
-  await user.click(screen.getByRole("checkbox", { name: /GPT-B/ }));
-  await user.click(screen.getByRole("button", { name: /创建角色/ }));
-  expect(onCreate).toHaveBeenCalledTimes(1);
-  expect(onCreate.mock.calls[0][0]).toEqual([
-    { id: "codex_exec-executor", slot: "executor", name: "Codex 执行员", source: "codex_exec", default: { model: "gpt-b", effort: "medium" }, models: [{ model: "gpt-b", efforts: ["low", "medium"] }] },
-  ]);
+  // 面板里不再有第 3 步的表单
+  expect(await screen.findByRole("button", { name: /用这些模型新增角色/ })).toBeInTheDocument();
+  expect(screen.queryByText("选模型并创建角色")).not.toBeInTheDocument();
+  await user.click(screen.getByRole("button", { name: /用这些模型新增角色/ }));
+  expect(onDraft).toHaveBeenCalledTimes(1);
+  expect(onDraft.mock.calls[0][0]).toEqual({
+    source: "codex_exec",
+    slot: "executor",
+    name: "研发流程测试",
+    models: [{ model: "gpt-a", efforts: ["low", "high", "max"] }, { model: "gpt-b", efforts: ["low", "medium"] }],
+    default: { model: "gpt-a", effort: "low" },
+  });
 });
 
-test("岗位按来源限制；agy 的模型没有强度；角色 id 和现有角色不重复", async () => {
+test("岗位按来源给默认值：Gemini、Claude 默认判定员；没有强度的模型 effort 为空", async () => {
   serve([agy, claude]);
-  const onCreate = vi.fn<(roles: RoleInput[]) => void>();
+  const onDraft = vi.fn<(draft: AppRoleDraft) => void>();
   const user = userEvent.setup();
-  const taken = [{ id: "agy-judge", slot: "judge", name: "x", source: "agy", default: { model: "m", effort: null }, models: [], key_configured: false, check: { status: "ok", detail: null, checked_at: null } }] as RoleView[];
-  mount(onCreate, taken);
+  mount(onDraft);
   await screen.findAllByText("检测到并可用");
   await user.click(screen.getByText("Gemini").closest("button")!);
-  await screen.findByText("选模型并创建角色");
-  // agy 只能当判定员：岗位选项里没有执行员
-  const slots = screen.getByText("岗位").parentElement!;
-  expect(within(slots).queryByText("执行员")).not.toBeInTheDocument();
-  expect(within(slots).getByText("判定员")).toBeInTheDocument();
-  expect(screen.getByText("强度已包含在模型名里")).toBeInTheDocument();
-  await user.click(screen.getByRole("checkbox", { name: /Gemini X/ }));
-  await user.click(screen.getByRole("button", { name: /创建角色/ }));
-  const role = onCreate.mock.calls[0][0][0];
-  expect(role.id).toBe("agy-judge-2");
-  expect(role.default).toEqual({ model: "gemini-x-high", effort: null });
-});
-
-test("Claude 没有模型列表：说明原因，允许手动添加模型名", async () => {
-  serve([claude]);
-  const onCreate = vi.fn<(roles: RoleInput[]) => void>();
-  const user = userEvent.setup();
-  mount(onCreate);
-  await screen.findByText("检测到并可用");
+  await user.click(await screen.findByRole("button", { name: /用这些模型新增角色/ }));
+  expect(onDraft.mock.calls[0][0]).toMatchObject({ source: "agy", slot: "judge", default: { model: "gemini-x-high", effort: null } });
   await user.click(screen.getByText("Claude").closest("button")!);
-  expect(await screen.findByText(/Claude 命令行不能列出模型/)).toBeInTheDocument();
-  await user.type(screen.getByLabelText("手动添加模型名"), "my-full-model-name{Enter}");
-  expect(screen.getByRole("checkbox", { name: /my-full-model-name/ })).toBeChecked();
-  await user.click(screen.getByRole("button", { name: /创建角色/ }));
-  const role = onCreate.mock.calls[0][0][0];
-  expect(role.models).toEqual([{ model: "my-full-model-name", efforts: [] }]);
-  expect(role.default.model).toBe("my-full-model-name");
+  await user.click(await screen.findByRole("button", { name: /用这些模型新增角色/ }));
+  expect(onDraft.mock.calls[1][0]).toMatchObject({ source: "claude_cli", slot: "judge" });
 });
 
-test("父页面正在保存时创建按钮禁用", async () => {
+test("父页面正在保存时按钮禁用", async () => {
   serve([codex]);
   const user = userEvent.setup();
   mount(() => {}, existing, true);
   await screen.findByText("检测到并可用");
   await user.click(screen.getByText("Codex").closest("button")!);
-  await screen.findByText("选模型并创建角色");
-  expect(screen.getByRole("button", { name: /正在保存/ })).toBeDisabled();
+  expect(await screen.findByRole("button", { name: /用这些模型新增角色/ })).toBeDisabled();
 });
 
 test("只读（不是节点主人或没填名字）：能看到上次的检查结果，但不触发检查、不能创建角色", async () => {
@@ -176,7 +152,7 @@ test("只读（不是节点主人或没填名字）：能看到上次的检查�
   expect(await screen.findByText(/已用 ChatGPT 登录/)).toBeInTheDocument();
   expect(scanCalls()).toHaveLength(0);
   expect(screen.queryByRole("button", { name: /重新检查/ })).not.toBeInTheDocument();
-  expect(screen.queryByRole("button", { name: /创建角色/ })).not.toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: /新增角色/ })).not.toBeInTheDocument();
   expect(screen.getByText(/只有节点主人能用这些模型创建角色/)).toBeInTheDocument();
 });
 

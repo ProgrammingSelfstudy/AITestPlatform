@@ -240,6 +240,9 @@ export interface Models {
   roles: ModelRole[];
 }
 
+/** 每个岗位最多几个角色（和 crates/protocol 的 RoleSlot::MAX_PER_SLOT 保持一致，服务端保存时也会校验） */
+export const ROLE_SLOT_LIMIT = 3;
+
 /** 模型来源。除 deepseek 外都是本机会员登录，只有 deepseek 用 API Key（规则 1）。 */
 export const ROLE_SOURCES: { value: string; label: string; needsKey: boolean; available: boolean; hint: string }[] = [
   { value: "codex_exec", label: "Codex（本机 ChatGPT 登录）", needsKey: false, available: true, hint: "只能当执行员" },
@@ -647,3 +650,54 @@ export async function confirmProposal(id: string, token: string, userName: strin
 export async function dismissProposal(id: string, userName: string): Promise<void> {
   await post(`/api/admin/proposals/${encodeURIComponent(id)}/dismiss`, {}, "", userHeaders(userName));
 }
+
+// ---------------------------------------------------------------- 参数配置（P1 只读）
+
+export type ConfigStatus = "normal" | "disabled";
+
+export interface ConfigType {
+  id: number;
+  name: string;
+  code: string;
+  remark: string;
+  status: ConfigStatus;
+  item_count: number;
+  updated_at: string;
+  updated_by: string | null;
+}
+
+export interface ConfigItem {
+  id: number;
+  name: string;
+  code: string;
+  value: string;
+  label: string;
+  group_name: string;
+  sort: number;
+  remark: string;
+  status: ConfigStatus;
+  updated_at: string;
+  updated_by: string | null;
+}
+
+export interface Paged<T> {
+  total: number;
+  page: number;
+  page_size: number;
+  rows: T[];
+}
+
+export interface ConfigTypeDetail {
+  type: ConfigType;
+  items: Paged<ConfigItem>;
+}
+
+export const fetchConfigTypes = (query: { name?: string; code?: string; page: number; pageSize: number }, signal?: AbortSignal) => {
+  const params = new URLSearchParams({ page: String(query.page), page_size: String(query.pageSize) });
+  if (query.name?.trim()) params.set("name", query.name.trim());
+  if (query.code?.trim()) params.set("code", query.code.trim());
+  return get<Paged<ConfigType>>(`/api/configs?${params}`, signal);
+};
+
+export const fetchConfigDetail = (code: string, page: number, pageSize: number, signal?: AbortSignal) =>
+  get<ConfigTypeDetail>(`/api/configs/${encodeURIComponent(code)}?page=${page}&page_size=${pageSize}`, signal);

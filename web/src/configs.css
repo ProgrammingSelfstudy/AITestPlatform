@@ -1,0 +1,9 @@
+/* 参数配置：一级列表和二级详情 */
+.config-page { display: flex; flex-direction: column; gap: var(--space-4); }
+.config-page .page-heading { margin-bottom: 0; }
+.config-search { row-gap: 12px; }
+.config-toolbar { display: flex; gap: 8px; flex-wrap: wrap; }
+.config-error { color: var(--text-primary); border: 1px solid var(--border-hairline); border-radius: var(--radius-sm); padding: 10px 14px; }
+.config-crumb { display: flex; align-items: center; gap: 8px; font-size: 18px; }
+.config-crumb a { color: var(--accent, #2563eb); text-decoration: none; }
+.config-crumb strong { font-weight: 600; color: var(--text-primary); }

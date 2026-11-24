@@ -116,6 +116,11 @@ pub enum RoleSlot {
     Planner,
 }
 
+impl RoleSlot {
+    /// 一个节点上每个岗位最多配几个角色（前端 `web/src/api.ts` 的 `ROLE_SLOT_LIMIT` 要同步）。
+    pub const MAX_PER_SLOT: usize = 3;
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RoleDefault {
     pub model: String,

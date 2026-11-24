@@ -6,13 +6,16 @@ import ScriptsPage from "./ScriptsPage";
 import AdminPage from "./AdminPage";
 import RolesPage from "./RolesPage";
 import ModulesPage from "./ModulesPage";
+import ConfigsPage from "./ConfigsPage";
+import ConfigDetailPage from "./ConfigDetailPage";
 import ModuleDetailPage from "./ModuleDetailPage";
 import RunPage from "./RunPage";
 import { TaskPage, TasksPage } from "./TasksPage";
 import "./styles.css";
+import "./configs.css";
 
 type Mode = "light" | "dark";
-type Route = { page: "nodes" | "tasks" | "scripts" | "roles" | "modules" | "admin" | "missing" } | { page: "task" | "run" | "module"; id: string };
+type Route = { page: "nodes" | "tasks" | "scripts" | "roles" | "modules" | "configs" | "admin" | "missing" } | { page: "task" | "run" | "module" | "config"; id: string };
 
 function readRoute(): Route {
   const hash = window.location.hash;
@@ -21,7 +24,10 @@ function readRoute(): Route {
   if (hash === "#/scripts") return { page: "scripts" };
   if (hash === "#/roles") return { page: "roles" };
   if (hash === "#/modules") return { page: "modules" };
+  if (hash === "#/configs") return { page: "configs" };
   if (hash === "#/admin") return { page: "admin" };
+  const configMatch = /^#\/configs\/([A-Za-z0-9_-]+)$/.exec(hash);
+  if (configMatch) return { page: "config", id: configMatch[1] };
   const moduleMatch = /^#\/modules\/([a-z0-9-]+)$/i.exec(hash);
   if (moduleMatch) return { page: "module", id: moduleMatch[1] };
   const match = /^#\/(tasks|runs)\/([a-z0-9-]+)$/i.exec(hash);
@@ -46,6 +52,8 @@ const BREADCRUMB: Record<Route["page"], string> = {
   scripts: "回归脚本",
   roles: "角色与模型",
   modules: "模块",
+  configs: "参数配置",
+  config: "配置详情",
   admin: "管理员",
   module: "模块详情",
   task: "任务详情",
@@ -128,8 +136,9 @@ function Shell({ mode, onToggle }: { mode: Mode; onToggle: () => void }) {
   const scripts = route.page === "scripts";
   const roles = route.page === "roles";
   const modules = route.page === "modules" || route.page === "module";
+  const configs = route.page === "configs" || route.page === "config";
   const admin = route.page === "admin";
-  const tasks = !nodes && !scripts && !roles && !modules && !admin && route.page !== "missing";
+  const tasks = !nodes && !scripts && !roles && !modules && !configs && !admin && route.page !== "missing";
 
   return (
     <div className="app-shell">
@@ -186,6 +195,17 @@ function Shell({ mode, onToggle }: { mode: Mode; onToggle: () => void }) {
               </svg>
               <span>角色与模型</span>
             </a>
+            <a href="#/configs" aria-current={configs ? "page" : undefined}>
+              <svg className="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
+                <line x1="4" y1="6" x2="20" y2="6" />
+                <line x1="4" y1="12" x2="20" y2="12" />
+                <line x1="4" y1="18" x2="20" y2="18" />
+                <circle cx="9" cy="6" r="2" fill="currentColor" />
+                <circle cx="15" cy="12" r="2" fill="currentColor" />
+                <circle cx="8" cy="18" r="2" fill="currentColor" />
+              </svg>
+              <span>参数配置</span>
+            </a>
           </nav>
         </div>
         <div className="sidebar-note">
@@ -235,6 +255,8 @@ function Shell({ mode, onToggle }: { mode: Mode; onToggle: () => void }) {
           {route.page === "scripts" && <ScriptsPage />}
           {route.page === "roles" && <RolesPage />}
           {route.page === "modules" && <ModulesPage />}
+          {route.page === "configs" && <ConfigsPage />}
+          {route.page === "config" && <ConfigDetailPage key={route.id} code={route.id} />}
           {route.page === "admin" && <AdminPage />}
           {route.page === "module" && <ModuleDetailPage key={route.id} id={route.id} />}
           {route.page === "task" && <TaskPage key={route.id} id={route.id} />}

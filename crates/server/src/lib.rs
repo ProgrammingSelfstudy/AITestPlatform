@@ -6,6 +6,7 @@ pub mod accounts;
 mod admin;
 mod api;
 pub mod cases;
+mod configs;
 mod evidence_sign;
 mod files;
 pub mod modules;
