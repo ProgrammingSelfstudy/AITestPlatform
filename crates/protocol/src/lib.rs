@@ -647,12 +647,57 @@ pub enum ServerMsg {
     ScanApp { source: ModelSource },
     /// 请这个节点上的管理员角色回答一句话。**用的是节点主人自己的模型和额度**（规则 9）
     AdminAsk(AdminAsk),
+    /// 平台参数配置里和执行节点有关的取值：节点上线时和配置变化时下发
+    SetParams(SetParams),
+}
+
+/// 执行节点用的运行参数，来自服务端的「参数配置」。取值范围由这里统一限制，
+/// 配置写坏了或旧节点没收到时都退回默认值（`Default`）。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SetParams {
+    /// 设备命令失败、dump 为空时最多尝试几次（含第一次）。项目规则：不超过 3 次。
+    pub device_retry: u32,
+    /// 卡住检测：连续多少次页面不变或动作重复判卡住
+    pub stuck_n: u32,
+    /// 卡住检测：记住最近多少个页面签名和动作
+    pub stuck_keep: u32,
+}
+
+impl SetParams {
+    pub const RETRY_RANGE: std::ops::RangeInclusive<u32> = 1..=3;
+    pub const STUCK_N_RANGE: std::ops::RangeInclusive<u32> = 2..=10;
+    pub const KEEP_MAX: u32 = 50;
+
+    /// 把任意取值收进合法范围：重试次数不超过 3（项目规则），`stuck_keep` 不能小于 `stuck_n`。
+    pub fn clamped(device_retry: u32, stuck_n: u32, stuck_keep: u32) -> Self {
+        let stuck_n = stuck_n.clamp(*Self::STUCK_N_RANGE.start(), *Self::STUCK_N_RANGE.end());
+        Self {
+            device_retry: device_retry.clamp(*Self::RETRY_RANGE.start(), *Self::RETRY_RANGE.end()),
+            stuck_n,
+            stuck_keep: stuck_keep.clamp(stuck_n, Self::KEEP_MAX),
+        }
+    }
+}
+
+impl Default for SetParams {
+    fn default() -> Self {
+        Self { device_retry: 3, stuck_n: 3, stuck_keep: 6 }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn 运行参数收进合法范围_重试不超过三次() {
+        assert_eq!(SetParams::default(), SetParams::clamped(3, 3, 6));
+        assert_eq!(SetParams::clamped(99, 1, 1), SetParams { device_retry: 3, stuck_n: 2, stuck_keep: 2 });
+        assert_eq!(SetParams::clamped(0, 99, 99), SetParams { device_retry: 1, stuck_n: 10, stuck_keep: 50 });
+        let wire = serde_json::to_value(ServerMsg::SetParams(SetParams::default())).unwrap();
+        assert_eq!(wire["type"], "set_params");
+    }
 
     fn caps() -> Caps {
         Caps {

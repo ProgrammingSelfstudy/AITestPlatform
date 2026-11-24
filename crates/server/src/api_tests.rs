@@ -2744,3 +2744,55 @@ async fn 参数配置_导入导出_整体校验_跳过或覆盖() {
     }
     assert_eq!(import("root", admin_token, json!({"mode": "merge", "document": doc("1")})).await.0, StatusCode::BAD_REQUEST);
 }
+
+#[tokio::test]
+async fn 参数配置_节点运行参数读配置_已知配置写入时就限制取值() {
+    let temp = TempPaths::with_config();
+    let state = test_state(config()).await;
+    let app = temp.app(state.clone());
+    let pool = state.pool();
+    let password = Uuid::new_v4().to_string();
+    assert_eq!(post_credentials(&app, "/api/users", "root", &password).await.0, StatusCode::CREATED);
+    sqlx::query("update users set is_admin = true where name = 'root'").execute(pool).await.unwrap();
+    let token = login_token(&app, "root", &password).await;
+
+    // 种子就是默认值
+    assert_eq!(crate::configs::runtime_params(pool).await, protocol::SetParams::default());
+
+    // 管理员改：重试 2 次、卡住 5 次、保留 12 条 → 节点参数跟着变
+    let update = |item_code: &'static str, type_code: &'static str, value: &'static str| {
+        let (app, token) = (app.clone(), token.clone());
+        let pool = pool.clone();
+        async move {
+            let id: i64 = sqlx::query_scalar("select i.id from config_items i join config_types t on t.id = i.type_id where t.code = $1 and i.code = $2")
+                .bind(type_code).bind(item_code).fetch_one(&pool).await.unwrap();
+            let mut headers = WRITE_HEADERS.to_vec();
+            headers.push(("x-user-name", "root"));
+            headers.push(("x-user-token", token.as_str()));
+            let path = format!("/api/configs/{type_code}/items/{id}/update");
+            let (status, _, bytes) = request(&app, Method::POST, &path, &headers, json!({"name": "x", "value": value}).to_string()).await;
+            (status, text(&bytes).to_string())
+        }
+    };
+    assert_eq!(update("max_attempts", "device_retry", "2").await.0, StatusCode::NO_CONTENT);
+    assert_eq!(update("stuck_n", "stuck_detect", "5").await.0, StatusCode::NO_CONTENT);
+    assert_eq!(update("keep", "stuck_detect", "12").await.0, StatusCode::NO_CONTENT);
+    assert_eq!(crate::configs::runtime_params(pool).await, protocol::SetParams { device_retry: 2, stuck_n: 5, stuck_keep: 12 });
+
+    // 重试次数超过项目规则的 3 次、不是整数、卡住次数太小：写入时就 400，库里不变
+    for (item, ty, value) in [("max_attempts", "device_retry", "4"), ("max_attempts", "device_retry", "abc"), ("stuck_n", "stuck_detect", "1"), ("judge", "role_limit", "0")] {
+        let (status, message) = update(item, ty, value).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{item}={value}");
+        assert!(message.contains("整数"), "{message}");
+    }
+    assert_eq!(crate::configs::runtime_params(pool).await.device_retry, 2);
+
+    // 绕过接口直接写坏数据库、或停用类型：读取时仍然收进范围 / 回到默认，重试永远不超过 3
+    sqlx::query("update config_items set value = '99' where code = 'max_attempts'").execute(pool).await.unwrap();
+    assert_eq!(crate::configs::runtime_params(pool).await.device_retry, 3);
+    sqlx::query("update config_items set value = '1' where code = 'keep'").execute(pool).await.unwrap();
+    let params = crate::configs::runtime_params(pool).await;
+    assert!(params.stuck_keep >= params.stuck_n, "{params:?}");
+    sqlx::query("update config_types set status = 'disabled' where code = 'stuck_detect'").execute(pool).await.unwrap();
+    assert_eq!(crate::configs::runtime_params(pool).await.stuck_n, 3, "类型停用回到默认");
+}

@@ -24,6 +24,10 @@ async fn main() -> anyhow::Result<()> {
         bail!("请设置环境变量 HAFA_SERIAL（要操作的设备序列号）");
     }
     let cfg = ServerConfig::from_env().map_err(anyhow::Error::msg)?;
+    // 设备命令重试次数来自参数配置，由节点通过环境变量传进来；没给就用默认，写多大都不超过 3 次
+    if let Some(n) = std::env::var("HAFA_DEVICE_RETRY").ok().and_then(|v| v.parse().ok()) {
+        device::set_max_attempts(n);
+    }
     tracing::info!(%serial, case = %cfg.case_id, max_steps = cfg.max_steps, "设备 MCP 服务启动");
 
     let server = DeviceServer::new(Arc::new(Android::new(serial)), cfg).context("初始化轨迹目录失败")?;

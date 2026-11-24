@@ -5,6 +5,7 @@
 
 pub mod casegen_run;
 pub mod real;
+pub mod params;
 pub mod roles;
 mod recorder;
 pub mod runner;
@@ -477,6 +478,10 @@ async fn session<D: Devices, E: RunExecutor>(cfg: &NodeConfig, devices: &D, runn
                             if let Err(e) = ws.send(envelope_text(&Envelope::new(NodeMsg::RolesReport(roles.report())))).await {
                                 return lost(true, format!("上报角色摘要失败：{e}"));
                             }
+                        }
+                        ServerMsg::SetParams(params) => {
+                            let applied = params::apply(params);
+                            tracing::info!(device_retry = applied.device_retry, stuck_n = applied.stuck_n, stuck_keep = applied.stuck_keep, "已更新运行参数");
                         }
                         ServerMsg::CheckRole { role_id } => {
                             if let Some((source, model)) = roles.begin_check(&role_id) {

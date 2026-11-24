@@ -208,7 +208,7 @@ impl RealExecutor {
                 ("HAFA_APP_PACKAGE".into(), c.package.clone()),
                 ("HAFA_APP_ACTIVITY".into(), c.activity.clone()),
                 ("HAFA_BOTTOM_SHIFT".into(), bottom_shift.to_string()),
-            ]).collect(),
+            ]).chain(crate::params::mcp_env()).collect(),
         };
         let mut o = CodexOpts::new(mcp, DEVICE_TOOLS.iter().map(|t| t.to_string()).collect());
         o.model = a.executor.model.clone();

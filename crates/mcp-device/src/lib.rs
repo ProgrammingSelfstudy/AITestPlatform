@@ -40,6 +40,9 @@ pub struct ServerConfig {
     pub model: String,
     pub max_steps: u32,
     pub high_risk: Vec<String>,
+    /// 卡住检测：连续几次相同判卡住、记住最近几条（节点按参数配置传进来）
+    pub stuck_n: usize,
+    pub stuck_keep: usize,
     /// 被测应用的包名 / 启动 Activity；没配置时 `launch_app` / `restart_app` 明确报错
     pub package: Option<String>,
     pub activity: Option<String>,
@@ -69,6 +72,8 @@ impl ServerConfig {
             model: get("HAFA_MODEL").unwrap_or_default(),
             max_steps: num("HAFA_MAX_STEPS", 40) as u32,
             high_risk,
+            stuck_n: num("HAFA_STUCK_N", guard::DEFAULT_STUCK_N as u64) as usize,
+            stuck_keep: num("HAFA_STUCK_KEEP", guard::DEFAULT_KEEP as u64) as usize,
             package: get("HAFA_APP_PACKAGE"),
             activity: get("HAFA_APP_ACTIVITY"),
             human_timeout: Duration::from_secs(num("HAFA_HUMAN_TIMEOUT", 1800)),
@@ -111,7 +116,7 @@ impl DeviceServer {
         for (v, p) in &cfg.secrets {
             trace.add_secret(v, p);
         }
-        let mut guard = Guard::new(cfg.max_steps, cfg.high_risk.clone());
+        let mut guard = Guard::new(cfg.max_steps, cfg.high_risk.clone()).with_stuck(cfg.stuck_n, cfg.stuck_keep);
         // 续跑：接着已有轨迹的步数计数，但不带旧的页面签名（避免误判卡住）
         for _ in 0..trace.counted_steps() {
             guard.record(String::new(), None);

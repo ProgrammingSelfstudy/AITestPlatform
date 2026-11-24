@@ -346,6 +346,13 @@ impl AppState {
         }
     }
 
+    /// 给所有在线节点各发一条消息（发不出去的忽略：节点下次上线时会重新收到）。
+    pub async fn broadcast(&self, msg: ServerMsg) {
+        for conn in self.0.conns.lock().await.values() {
+            let _ = conn.tx.send(msg.clone());
+        }
+    }
+
     /// 取消一个 run：先在库里取消（释放设备），再通知它所在的节点停下来。节点不在线时库里照样取消。
     pub async fn cancel_run(&self, run_id: Uuid) -> Result<(), runs::RunError> {
         let node: Option<Uuid> = sqlx::query_scalar("select node_id from runs where id = $1").bind(run_id).fetch_optional(&self.0.pool).await?;
@@ -777,6 +784,11 @@ async fn handle_socket(mut socket: WebSocket, st: AppState) {
         }
     };
     if !send(&mut socket, ServerMsg::Welcome(Welcome { node_id, node_secret, heartbeat_s: cfg.heartbeat_s, resume, ack_run_updates: true })).await {
+        let _ = st.mark_offline(node_id, conn_id).await;
+        return;
+    }
+    // 把参数配置里和节点有关的取值（设备命令重试、卡住检测）发给节点；老节点不认这条消息会忽略
+    if !send(&mut socket, ServerMsg::SetParams(configs::runtime_params(st.pool()).await)).await {
         let _ = st.mark_offline(node_id, conn_id).await;
         return;
     }

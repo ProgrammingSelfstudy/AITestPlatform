@@ -323,6 +323,7 @@ pub(crate) async fn api_update_type(State(state): State<ApiState>, headers: Head
     if done.rows_affected() == 0 {
         return Err((StatusCode::NOT_FOUND, "没有这个配置类型".to_string()));
     }
+    push_params(&state).await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -342,6 +343,7 @@ pub(crate) async fn api_delete_type(State(state): State<ApiState>, headers: Head
         .execute(state.app.pool())
         .await
         .map_err(|e| internal("删除配置类型失败", e))?;
+    push_params(&state).await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -391,6 +393,7 @@ pub(crate) async fn api_create_item(State(state): State<ApiState>, headers: Head
         return Err(bad("编码只能用小写字母、数字、下划线，以字母开头，2 到 50 位"));
     }
     let status = check_status(&input.status)?;
+    check_known_value(&code, &item_code, &clean.value)?;
     let id = type_id(&state, &code).await?;
     let created = sqlx::query_scalar::<_, i64>(
         "insert into config_items (type_id, name, code, value, label, group_name, sort, remark, status, updated_by)
@@ -401,7 +404,10 @@ pub(crate) async fn api_create_item(State(state): State<ApiState>, headers: Head
     .fetch_one(state.app.pool())
     .await;
     match created {
-        Ok(item) => Ok((StatusCode::CREATED, Json(serde_json::json!({ "id": item })))),
+        Ok(item) => {
+            push_params(&state).await;
+            Ok((StatusCode::CREATED, Json(serde_json::json!({ "id": item }))))
+        }
         Err(sqlx::Error::Database(e)) if e.is_unique_violation() => Err((StatusCode::CONFLICT, "这个类型下已经有同编码的配置项".to_string())),
         Err(e) => Err(internal("新增配置项失败", e)),
     }
@@ -413,6 +419,13 @@ pub(crate) async fn api_update_item(State(state): State<ApiState>, headers: Head
     let clean = clean_item(&input)?;
     let status = check_status(&input.status)?;
     let id = type_id(&state, &code).await?;
+    let item_code: String = sqlx::query_scalar("select code from config_items where id = $2 and type_id = $1")
+        .bind(id).bind(item)
+        .fetch_optional(state.app.pool())
+        .await
+        .map_err(|e| internal("查询配置项失败", e))?
+        .ok_or((StatusCode::NOT_FOUND, "没有这个配置项".to_string()))?;
+    check_known_value(&code, &item_code, &clean.value)?;
     let done = sqlx::query(
         "update config_items set name=$3, value=$4, label=$5, group_name=$6, sort=$7, remark=$8, status=$9, updated_at=now(), updated_by=$10
          where id=$2 and type_id=$1",
@@ -425,6 +438,7 @@ pub(crate) async fn api_update_item(State(state): State<ApiState>, headers: Head
     if done.rows_affected() == 0 {
         return Err((StatusCode::NOT_FOUND, "没有这个配置项".to_string()));
     }
+    push_params(&state).await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -439,6 +453,7 @@ pub(crate) async fn api_delete_item(State(state): State<ApiState>, headers: Head
     if done.rows_affected() == 0 {
         return Err((StatusCode::NOT_FOUND, "没有这个配置项".to_string()));
     }
+    push_params(&state).await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -580,6 +595,7 @@ pub(crate) async fn api_import(State(state): State<ApiState>, headers: HeaderMap
             let at = |e: ApiError| bad(format!("类型「{}」第 {} 个配置项「{}」：{}", t.code, ii + 1, item.code, e.1));
             let as_input = ItemInput { name: item.name.clone(), code: item.code.clone(), value: item.value.clone(), label: item.label.clone(), group_name: item.group_name.clone(), sort: item.sort, remark: item.remark.clone(), status: item.status.clone() };
             clean_item(&as_input).map_err(at)?;
+            check_known_value(t.code.trim(), item.code.trim(), &item.value).map_err(at)?;
             check_status(&item.status).map_err(at)?;
             if !valid_code(item.code.trim()) {
                 return Err(at(bad("编码只能用小写字母、数字、下划线，以字母开头，2 到 50 位")));
@@ -633,5 +649,53 @@ pub(crate) async fn api_import(State(state): State<ApiState>, headers: HeaderMap
         }
     }
     tx.commit().await.map_err(fail)?;
+    push_params(&state).await;
     Ok(Json(result))
+}
+
+/// 执行节点用的运行参数：读 `device_retry`、`stuck_detect` 类型下的配置项。
+/// 类型或配置项停用、没有、不是整数时，该项用默认值；最后统一收进合法范围（重试不超过 3 次）。
+pub(crate) async fn runtime_params(pool: &sqlx::PgPool) -> protocol::SetParams {
+    let default = protocol::SetParams::default();
+    let rows: Vec<(String, String, String)> = sqlx::query_as(
+        "select t.code, i.code, i.value from config_items i join config_types t on t.id = i.type_id
+         where t.code in ('device_retry', 'stuck_detect') and t.status = 'normal' and i.status = 'normal'",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+    let value = |type_code: &str, item_code: &str, fallback: u32| {
+        rows.iter()
+            .find(|(t, i, _)| t == type_code && i == item_code)
+            .and_then(|(_, _, v)| v.trim().parse::<u32>().ok())
+            .unwrap_or(fallback)
+    };
+    protocol::SetParams::clamped(
+        value("device_retry", "max_attempts", default.device_retry),
+        value("stuck_detect", "stuck_n", default.stuck_n),
+        value("stuck_detect", "keep", default.stuck_keep),
+    )
+}
+
+/// 配置变了：把最新的运行参数发给所有在线节点（离线的节点下次上线时会收到）。
+async fn push_params(state: &ApiState) {
+    let params = runtime_params(state.app.pool()).await;
+    state.app.broadcast(protocol::ServerMsg::SetParams(params)).await;
+}
+
+/// 已知配置的取值范围：写入时就拒绝不合理的值，省得写进去才发现没生效。
+/// 其余自定义的配置项不限制取值。
+fn check_known_value(type_code: &str, item_code: &str, value: &str) -> Result<(), ApiError> {
+    use protocol::SetParams as P;
+    let (label, min, max) = match (type_code, item_code) {
+        ("role_limit", "executor" | "judge" | "case_writer" | "planner") => ("岗位角色上限", 1, 20),
+        ("device_retry", "max_attempts") => ("设备命令重试次数", *P::RETRY_RANGE.start(), *P::RETRY_RANGE.end()),
+        ("stuck_detect", "stuck_n") => ("卡住判定次数", *P::STUCK_N_RANGE.start(), *P::STUCK_N_RANGE.end()),
+        ("stuck_detect", "keep") => ("卡住检测保留记录数", *P::STUCK_N_RANGE.start(), P::KEEP_MAX),
+        _ => return Ok(()),
+    };
+    match value.trim().parse::<u32>() {
+        Ok(n) if (min..=max).contains(&n) => Ok(()),
+        _ => Err(bad(format!("{label}要是 {min} 到 {max} 的整数"))),
+    }
 }

@@ -14,10 +14,10 @@ pub const DEFAULT_HIGH_RISK: [&str; 12] = [
     "Top up", "Purchase",
 ];
 
-/// 记多少个最近的页面签名 / 动作；卡住只看最后 3 个，多留几个方便排查。
-const KEEP: usize = 6;
-/// 连续多少次页面不变 / 动作重复判卡住。
-const STUCK_N: usize = 3;
+/// 默认记多少个最近的页面签名 / 动作；卡住只看最后几个，多留几个方便排查。
+pub const DEFAULT_KEEP: usize = 6;
+/// 默认连续多少次页面不变 / 动作重复判卡住。
+pub const DEFAULT_STUCK_N: usize = 3;
 
 // ---------------------------------------------------------------- 页面指纹
 
@@ -114,11 +114,24 @@ pub struct Guard {
     actions: VecDeque<String>,
     finished: Option<String>,
     need_human: Option<String>,
+    stuck_n: usize,
+    keep: usize,
 }
 
 impl Guard {
     pub fn new(max_steps: u32, high_risk: Vec<String>) -> Self {
-        Self { max_steps, steps: 0, high_risk, sigs: VecDeque::new(), actions: VecDeque::new(), finished: None, need_human: None }
+        Self {
+            max_steps, steps: 0, high_risk, sigs: VecDeque::new(), actions: VecDeque::new(), finished: None, need_human: None,
+            stuck_n: DEFAULT_STUCK_N, keep: DEFAULT_KEEP,
+        }
+    }
+
+    /// 改卡住检测的阈值（来自参数配置）：连续 `stuck_n` 次相同判卡住，记住最近 `keep` 条；
+    /// 至少 2 次才判卡住，`keep` 不能小于 `stuck_n`，否则永远凑不够。
+    pub fn with_stuck(mut self, stuck_n: usize, keep: usize) -> Self {
+        self.stuck_n = stuck_n.max(2);
+        self.keep = keep.max(self.stuck_n);
+        self
     }
 
     pub fn steps(&self) -> u32 {
@@ -194,27 +207,27 @@ impl Guard {
     pub fn record(&mut self, action: String, page_sig: Option<u64>) {
         self.actions.push_back(action);
         self.sigs.push_back(page_sig);
-        while self.actions.len() > KEEP {
+        while self.actions.len() > self.keep {
             self.actions.pop_front();
         }
-        while self.sigs.len() > KEEP {
+        while self.sigs.len() > self.keep {
             self.sigs.pop_front();
         }
         self.steps += 1;
     }
 
-    /// 卡住检测：连续 3 步页面控件树不变，或连续 3 次相同动作。
+    /// 卡住检测：连续 `stuck_n` 步页面控件树不变，或连续 `stuck_n` 次相同动作（默认 3）。
     pub fn stuck(&self) -> Option<String> {
         if let Some(Some(last)) = self.sigs.back()
-            && self.sigs.len() >= STUCK_N
-            && self.sigs.iter().rev().take(STUCK_N).all(|sig| *sig == Some(*last))
+            && self.sigs.len() >= self.stuck_n
+            && self.sigs.iter().rev().take(self.stuck_n).all(|sig| *sig == Some(*last))
         {
-            return Some("连续 3 步页面控件树没有变化，疑似卡住".into());
+            return Some(format!("连续 {} 步页面控件树没有变化，疑似卡住", self.stuck_n));
         }
-        if self.actions.len() >= STUCK_N {
+        if self.actions.len() >= self.stuck_n {
             let last = &self.actions[self.actions.len() - 1];
-            if self.actions.iter().rev().take(STUCK_N).all(|a| a == last) {
-                return Some(format!("连续 3 次重复动作: {last}"));
+            if self.actions.iter().rev().take(self.stuck_n).all(|a| a == last) {
+                return Some(format!("连续 {} 次重复动作: {last}", self.stuck_n));
             }
         }
         None
@@ -287,6 +300,30 @@ mod tests {
         assert_eq!(g.stuck(), None, "只有两步不算");
         g.record("tap:C".into(), Some(1));
         assert!(g.stuck().unwrap().contains("页面控件树没有变化"));
+    }
+
+    #[test]
+    fn 卡住阈值能配置_最少两次_记录数不小于阈值() {
+        // 阈值改成 5：连续 4 步不变不算，第 5 步才判卡住，提示里写的是配置的次数
+        let mut g = Guard::new(40, vec![]).with_stuck(5, 10);
+        for i in 0..4 {
+            g.record(format!("tap:{i}"), Some(1));
+        }
+        assert_eq!(g.stuck(), None);
+        g.record("tap:4".into(), Some(1));
+        assert!(g.stuck().unwrap().contains("连续 5 步"));
+        // 阈值小于 2 按 2 算；记录数小于阈值时按阈值算，否则永远凑不够
+        let mut g = Guard::new(40, vec![]).with_stuck(0, 0);
+        g.record("a".into(), Some(1));
+        assert_eq!(g.stuck(), None, "1 次不能算卡住");
+        g.record("b".into(), Some(1));
+        assert!(g.stuck().is_some());
+        // 记录数上限：保留最近 keep 条
+        let mut g = Guard::new(40, vec![]).with_stuck(3, 4);
+        for i in 0..10 {
+            g.record(format!("a{i}"), Some(i));
+        }
+        assert_eq!((g.sigs.len(), g.actions.len()), (4, 4));
     }
 
     #[test]

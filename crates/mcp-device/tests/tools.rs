@@ -108,6 +108,7 @@ fn cfg(dir: &std::path::Path, max_steps: u32) -> ServerConfig {
     ServerConfig {
         run_dir: dir.into(), case_id: "TC-T".into(), platform: "android".into(), model: "fake".into(), max_steps,
         high_risk: mcp_device::guard::DEFAULT_HIGH_RISK.iter().map(|s| s.to_string()).collect(),
+        stuck_n: mcp_device::guard::DEFAULT_STUCK_N, stuck_keep: mcp_device::guard::DEFAULT_KEEP,
         package: None, activity: None, human_timeout: Duration::from_secs(5), settle: Duration::ZERO, secrets: vec![],
     }
 }

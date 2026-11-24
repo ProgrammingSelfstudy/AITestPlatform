@@ -16,8 +16,20 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::process::Command;
 
-/// 重试上限（设备命令失败 / dump 为空）。项目规则：不超过 3 次。
+/// 重试次数的硬上限（设备命令失败 / dump 为空）。项目规则：不超过 3 次，配置也不能超过它。
 pub const MAX_ATTEMPTS: u32 = 3;
+
+static ATTEMPTS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(MAX_ATTEMPTS);
+
+/// 运行时设置重试次数（来自参数配置）；收进 1 到 `MAX_ATTEMPTS`，写多大都不会超过 3 次。
+pub fn set_max_attempts(n: u32) {
+    ATTEMPTS.store(n.clamp(1, MAX_ATTEMPTS), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// 当前重试次数（含第一次尝试）。
+pub fn max_attempts() -> u32 {
+    ATTEMPTS.load(std::sync::atomic::Ordering::Relaxed).clamp(1, MAX_ATTEMPTS)
+}
 
 #[derive(Debug, Error)]
 pub enum DeviceError {
@@ -194,10 +206,10 @@ async fn run_adb(serial: Option<&str>, args: &[&str]) -> Result<Vec<u8>> {
     }
 }
 
-/// 带重试的 adb 调用：最多 `MAX_ATTEMPTS` 次，最后一次的原始错误原样返回。
+/// 带重试的 adb 调用：最多 `max_attempts()` 次，最后一次的原始错误原样返回。
 async fn run_adb_retry(serial: &str, args: &[&str]) -> Result<Vec<u8>> {
     let mut last = None;
-    for attempt in 1..=MAX_ATTEMPTS {
+    for attempt in 1..=max_attempts() {
         match run_adb(Some(serial), args).await {
             Ok(o) => return Ok(o),
             Err(e) => {
@@ -267,7 +279,7 @@ fn focus_preview(raw: &[u8]) -> Option<String> {
 }
 
 async fn dump_with<F: Future<Output = Result<Vec<u8>>>>(mut adb: impl FnMut(&'static [&'static str]) -> F) -> Result<Vec<Element>> {
-    let mut delays = DUMP_BACKOFF_MS.into_iter().take(MAX_ATTEMPTS as usize - 1);
+    let mut delays = DUMP_BACKOFF_MS.into_iter().take(max_attempts() as usize - 1);
     let mut attempt = 1;
     let raw = loop {
         let result = adb(&["exec-out", "uiautomator", "dump", "/dev/tty"]).await;
@@ -296,7 +308,7 @@ async fn dump_with<F: Future<Output = Result<Vec<u8>>>>(mut adb: impl FnMut(&'st
         _ => None,
     }.unwrap_or_else(|| "mCurrentFocus=诊断不可用".into());
     let diag = format!("adb 输出前 200 字节：{}；{focus}", dump_preview(&raw));
-    Err(DeviceError::EmptyDump { attempts: MAX_ATTEMPTS, diag })
+    Err(DeviceError::EmptyDump { attempts: max_attempts(), diag })
 }
 
 /// 一台 Android 设备。
