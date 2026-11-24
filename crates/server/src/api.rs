@@ -241,13 +241,14 @@ fn role_valid(role: &RoleConfig) -> bool {
         })
 }
 
-/// 一组角色是否合法：id 不重复、每个角色合法、两个岗位都至少一个、每个岗位不超过上限。
-fn roles_valid(roles: &[RoleConfig], limit: impl Fn(RoleSlot) -> usize) -> bool {
+/// 一组角色是否合法：id 不重复、每个角色合法、每个岗位不超过上限；`require_both` 为真时执行员和判定员都至少一个。
+/// 模型配置文件要求两个岗位都有；节点上的角色可以一个一个配置，所以保存时不要求，派任务时才检查。
+fn roles_valid(roles: &[RoleConfig], require_both: bool, limit: impl Fn(RoleSlot) -> usize) -> bool {
     let unique = roles.iter().enumerate().all(|(i, r)| roles[..i].iter().all(|o| o.id != r.id));
     let within_limit = [RoleSlot::Executor, RoleSlot::Judge, RoleSlot::CaseWriter, RoleSlot::Planner]
         .iter()
         .all(|slot| roles.iter().filter(|r| r.slot == *slot).count() <= limit(*slot));
-    unique && within_limit && roles.iter().all(role_valid) && [RoleSlot::Executor, RoleSlot::Judge].iter().all(|slot| roles.iter().any(|r| r.slot == *slot))
+    unique && within_limit && roles.iter().all(role_valid) && (!require_both || [RoleSlot::Executor, RoleSlot::Judge].iter().all(|slot| roles.iter().any(|r| r.slot == *slot)))
 }
 
 /// 请求没写角色时用该岗位的第一个角色。
@@ -257,7 +258,7 @@ fn pick<'a>(roles: &'a [RoleConfig], slot: RoleSlot, role: Option<&str>) -> Opti
 
 impl Models {
     fn valid(&self) -> bool {
-        roles_valid(&self.roles, |_| RoleSlot::MAX_PER_SLOT)
+        roles_valid(&self.roles, true, |_| RoleSlot::MAX_PER_SLOT)
     }
 }
 
@@ -384,8 +385,15 @@ async fn set_node_roles(
         (RoleSlot::Planner, crate::configs::role_limit(pool, "planner", RoleSlot::MAX_PER_SLOT).await),
     ];
     let limit = |slot: RoleSlot| limits.iter().find(|(s, _)| *s == slot).map_or(RoleSlot::MAX_PER_SLOT, |(_, n)| *n);
-    if !roles_valid(&configs, limit) {
-        return Err(bad_request("角色配置无效：id 不能重复，执行员和判定员各至少一个，每个岗位的角色数不能超过参数配置里的上限，来源要和岗位匹配且已有运行器，默认模型要在模型列表里"));
+    if !roles_valid(&configs, false, limit) {
+        // 先挑能说清楚的原因（岗位超过上限）；其余再给笼统提示
+        if let Some((slot, name)) = [(RoleSlot::Executor, "执行员"), (RoleSlot::Judge, "判定员"), (RoleSlot::CaseWriter, "测试用例"), (RoleSlot::Planner, "管理员")]
+            .into_iter()
+            .find(|(slot, _)| configs.iter().filter(|r| r.slot == *slot).count() > limit(*slot))
+        {
+            return Err(bad_request(format!("{name}最多 {} 个（上限在参数配置里设置），请先删掉多余的", limit(slot))));
+        }
+        return Err(bad_request("角色配置无效：id 不能重复，来源要和岗位匹配且已有运行器，默认模型要在模型列表里"));
     }
     push_roles(&state, node, request.roles).await
 }

@@ -303,7 +303,7 @@ async fn 创建和取消缺少或用错口令均返回空体403() {
 #[tokio::test]
 async fn 未配置或过短口令时创建和取消始终返回空体403() {
     let temp = TempPaths::new();
-    for token in [None, Some("short-token")] {
+    for token in [None, Some("123")] {
         let app = temp.app(with_token(lazy_state(), token));
         let headers = review_headers(token.unwrap_or(REVIEW_TOKEN));
         for path in [CREATE_ROUTE, BAD_CANCEL_ROUTE] {
@@ -520,7 +520,7 @@ async fn 角色接口_离线不返回角色_保存先校验再转发() {
     let (status, headers, bytes) = request(&world.app, Method::GET, &path, &user_headers(USER_NAME), "").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(headers[header::CACHE_CONTROL], "no-store");
-    assert_eq!(json_body(&bytes), json!({"online": false, "roles": [], "mine": true, "name_problem": null}));
+    assert_eq!(json_body(&bytes), json!({"online": false, "roles": [], "mine": true, "name_problem": null, "unowned": false}));
     // 保存：无效配置先被拒（400），不会因为节点离线而掩盖
     let post = |body: String| {
         let mut headers = review_headers(REVIEW_TOKEN);
@@ -533,7 +533,6 @@ async fn 角色接口_离线不返回角色_保存先校验再转发() {
     let exec = role_json("e", "executor", "codex_exec", "m");
     let judge = role_json("j", "judge", "agy", "m");
     for (roles, why) in [
-        (json!([exec]), "缺判定员"),
         (json!([exec, role_json("j", "judge", "deepseek", "m")]), "还没有运行器的来源"),
         (json!([exec, role_json("j", "judge", "codex_exec", "m")]), "来源和岗位不匹配"),
         (json!([exec, judge, role_json("j", "judge", "agy", "m")]), "id 重复"),
@@ -545,6 +544,12 @@ async fn 角色接口_离线不返回角色_保存先校验再转发() {
     let (status, _, bytes) = post(set_roles_body(json!([exec, judge]))).await;
     assert_eq!(status, StatusCode::CONFLICT);
     assert!(text(&bytes).contains("节点离线"));
+    // 角色可以一个一个配置：只有执行员、只有判定员、清空，保存时都不挡（都走到节点离线这一步）；
+    // 两个岗位都要有，是派任务的时候才检查
+    for (roles, what) in [(json!([exec]), "只有执行员"), (json!([judge]), "只有判定员"), (json!([]), "清空")] {
+        let (status, _, bytes) = post(set_roles_body(roles)).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{what}：{}", text(&bytes));
+    }
     // 检测：节点上没有这个角色 404；有但离线 409
     let check = |role: &str| {
         let mut h = review_headers(REVIEW_TOKEN);
@@ -2346,7 +2351,7 @@ async fn 浏览器发起人_有密码须带同名会话_公开查看和无密码
     let roles = format!("/api/nodes/{node}/roles");
     let (status, _, body) = request(&app, Method::GET, &roles, &no_session, "").await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(json_body(&body), json!({ "online": false, "roles": [], "mine": false, "name_problem": users::NEED_LOGIN_MESSAGE }));
+    assert_eq!(json_body(&body), json!({ "online": false, "roles": [], "mine": false, "name_problem": users::NEED_LOGIN_MESSAGE, "unowned": false }));
     let (status, _, body) = request(&app, Method::GET, &roles, &owner_session, "").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(json_body(&body)["mine"], true);
@@ -2795,4 +2800,33 @@ async fn 参数配置_节点运行参数读配置_已知配置写入时就限制
     assert!(params.stuck_keep >= params.stuck_n, "{params:?}");
     sqlx::query("update config_types set status = 'disabled' where code = 'stuck_detect'").execute(pool).await.unwrap();
     assert_eq!(crate::configs::runtime_params(pool).await.stuck_n, 3, "类型停用回到默认");
+}
+
+#[tokio::test]
+async fn 参数配置_流程模板的值要是岗位到角色名的_json() {
+    let temp = TempPaths::with_config();
+    let state = test_state(config()).await;
+    let app = temp.app(state.clone());
+    let password = Uuid::new_v4().to_string();
+    assert_eq!(post_credentials(&app, "/api/users", "root", &password).await.0, StatusCode::CREATED);
+    sqlx::query("update users set is_admin = true where name = 'root'").execute(state.pool()).await.unwrap();
+    let token = login_token(&app, "root", &password).await;
+    let post = |path: &'static str, body: Value| {
+        let (app, token) = (app.clone(), token.clone());
+        async move {
+            let mut headers = WRITE_HEADERS.to_vec();
+            headers.push(("x-user-name", "root"));
+            headers.push(("x-user-token", token.as_str()));
+            request(&app, Method::POST, path, &headers, body.to_string()).await.0
+        }
+    };
+    assert_eq!(post("/api/configs", json!({"name": "流程模板", "code": "flow_template"})).await, StatusCode::CREATED);
+    let item = |code: &str, value: &str| json!({"name": "流程", "code": code, "value": value});
+    // 合法：岗位只能是 executor / judge / case_writer / planner，角色名非空
+    assert_eq!(post("/api/configs/flow_template/items", item("ok_flow", r#"{"case_writer":"用例","judge":"找茬"}"#)).await, StatusCode::CREATED);
+    // 不合法：不是 JSON、不是对象、空对象、未知岗位、角色名为空或不是字符串
+    for (n, value) in ["不是json", "[1,2]", "{}", r#"{"boss":"x"}"#, r#"{"judge":""}"#, r#"{"judge":3}"#].into_iter().enumerate() {
+        let code: &'static str = Box::leak(format!("bad_flow_{n}").into_boxed_str());
+        assert_eq!(post("/api/configs/flow_template/items", item(code, value)).await, StatusCode::BAD_REQUEST, "{value}");
+    }
 }

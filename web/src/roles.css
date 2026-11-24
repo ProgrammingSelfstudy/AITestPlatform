@@ -506,6 +506,17 @@
   align-items: start;
 }
 
+/* 右侧编辑区收起时的提示：左边竖排的角色卡不变 */
+.roles-collapsed-hint {
+  background: var(--bg-surface);
+  border: 1px dashed var(--border-hairline);
+  border-radius: var(--radius-md);
+  padding: var(--space-6) var(--space-4);
+  text-align: center;
+  font-size: 13px;
+  color: var(--text-muted);
+}
+
 /* 左栏：角色实体卡列 */
 
 .roles-sidebar {
@@ -789,6 +800,11 @@
   flex-direction: column;
   gap: var(--space-4);
   min-width: 0;
+}
+
+/* display: flex 会盖掉 hidden 属性，收起编辑区时要显式隐藏 */
+.roles-main[hidden] {
+  display: none;
 }
 
 .roles-panel {

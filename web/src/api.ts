@@ -781,3 +781,40 @@ export async function importConfigs(document: ConfigDocument, mode: "skip" | "ov
   const response = await adminPost("/api/configs/import", { mode, document }, userName);
   return response.json();
 }
+
+/** 流程模板：参数配置里 `flow_template` 类型下的配置项，值是 JSON，岗位对应角色名称 */
+export interface FlowTemplate {
+  code: string;
+  name: string;
+  remark: string;
+  /** 岗位（executor / judge / case_writer / planner）→ 角色名称 */
+  roles: Record<string, string>;
+}
+
+export function parseFlowRoles(value: string): Record<string, string> | null {
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+    const roles: Record<string, string> = {};
+    for (const [slot, name] of Object.entries(parsed)) {
+      if (typeof name === "string" && name.trim()) roles[slot] = name.trim();
+    }
+    return Object.keys(roles).length > 0 ? roles : null;
+  } catch {
+    return null;
+  }
+}
+
+/** 读所有可用的流程模板（类型和配置项都是「正常」、值格式对的）；读不到就当没有，不挡住手动选角色 */
+export async function fetchFlowTemplates(signal?: AbortSignal): Promise<FlowTemplate[]> {
+  try {
+    const detail = await get<ConfigTypeDetail>("/api/configs/flow_template?page=1&page_size=100", signal);
+    if (detail.type.status !== "normal") return [];
+    return detail.items.rows.flatMap((item) => {
+      const roles = item.status === "normal" ? parseFlowRoles(item.value) : null;
+      return roles ? [{ code: item.code, name: item.name, remark: item.remark, roles }] : [];
+    });
+  } catch {
+    return [];
+  }
+}

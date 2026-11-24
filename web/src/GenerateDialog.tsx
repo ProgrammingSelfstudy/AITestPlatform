@@ -19,6 +19,7 @@ import ReviewTokenDialog from "./ReviewTokenDialog";
 import { LoadError } from "./runUi";
 import { REFRESH_MS, usePolling } from "./usePolling";
 import IdentityHint from "./IdentityHint";
+import { fetchFlowTemplates, type FlowTemplate } from "./api";
 import { NEED_LOGIN_MESSAGE, useRememberedUserName } from "./identity";
 import "./modules.css";
 
@@ -189,6 +190,19 @@ export default function GenerateDialog({ onClose, initialModule }: { onClose: ()
   }>({ loading: false, error: null, data: null, forKey: "" });
   const [rolesRefreshSeq, setRolesRefreshSeq] = useState(0);
 
+  // 流程模板（参数配置里配的，例如「研发测试流程」）：选了流程，就按里面的角色名在节点上找对应岗位的角色
+  const [flows, setFlows] = useState<FlowTemplate[]>([]);
+  const [flowCode, setFlowCode] = useState("");
+  const [flowNotes, setFlowNotes] = useState<string[]>([]);
+  useEffect(() => {
+    const controller = new AbortController();
+    void fetchFlowTemplates(controller.signal).then((list) => {
+      if (controller.signal.aborted) return;
+      setFlows(list);
+      setFlowCode((prev) => prev || list[0]?.code || "");
+    });
+    return () => controller.abort();
+  }, []);
   const [writerRole, setWriterRole] = useState("");
   const [reviewerRole, setReviewerRole] = useState("");
 
@@ -304,6 +318,37 @@ export default function GenerateDialog({ onClose, initialModule }: { onClose: ()
       return okJudgeRoles[0]?.id ?? "";
     });
   }, [rolesLoaded, nodeRolesOffline, okWriterRoles, okJudgeRoles]);
+
+  // 选了流程：用流程里的角色名给「测试用例」「评审员」岗位选角色；找不到或没通过检测的，如实写出来
+  useEffect(() => {
+    const flow = flows.find((f) => f.code === flowCode);
+    if (!flow || !rolesLoaded || nodeRolesOffline) {
+      setFlowNotes([]);
+      return;
+    }
+    const notes: string[] = [];
+    const pick = (slot: "case_writer" | "judge", label: string, roles: RoleView[]): string | null => {
+      const wanted = flow.roles[slot];
+      if (!wanted) return null;
+      const found = roles.find((r) => r.name === wanted);
+      if (!found) {
+        notes.push(`流程里的${label}「${wanted}」在这个节点上不存在`);
+        return null;
+      }
+      if (found.check.status !== "ok") {
+        notes.push(`流程里的${label}「${wanted}」还没通过检测`);
+        return null;
+      }
+      return found.id;
+    };
+    const writer = pick("case_writer", "测试用例角色", writerRoles);
+    const reviewer = pick("judge", "判定员角色", judgeRoles);
+    if (!flow.roles.case_writer) notes.push("这个流程没有指定测试用例角色，请手动选");
+    if (!flow.roles.judge) notes.push("这个流程没有指定判定员角色，请手动选");
+    if (writer) setWriterRole(writer);
+    if (reviewer) setReviewerRole(reviewer);
+    setFlowNotes(notes);
+  }, [flows, flowCode, rolesLoaded, nodeRolesOffline, writerRoles, judgeRoles]);
 
   const selectedWriterRoleObj = useMemo(
     () => writerRoles.find((r) => r.id === writerRole) ?? null,
@@ -928,6 +973,27 @@ export default function GenerateDialog({ onClose, initialModule }: { onClose: ()
             title="所选节点当前离线"
             description="节点离线时无法拉取角色列表或执行用例生成，请先确认节点已连上平台。"
           />
+        )}
+
+        {/* 流程模板：选了流程，下面的角色自动选好（仍可手动改） */}
+        {flows.length > 0 && (
+          <div className="mod-field">
+            <div className="mod-field-head">
+              <RequiredLabel text="流程" />
+              <span className="mod-field-meta">在「参数配置」里的流程模板中配置</span>
+            </div>
+            <Select
+              aria-label="流程"
+              value={flowCode || undefined}
+              disabled={busy}
+              placeholder="选择流程"
+              options={[...flows.map((f) => ({ value: f.code, label: f.name })), { value: "", label: "不用流程，手动选角色" }]}
+              onChange={(val) => setFlowCode(val)}
+            />
+            {flowNotes.length > 0 && flowCode && (
+              <div className="mod-field-hint">{flowNotes.join("；")}。</div>
+            )}
+          </div>
         )}
 
         {/* 6. 测试用例角色 & 判定员（评审员）角色 */}

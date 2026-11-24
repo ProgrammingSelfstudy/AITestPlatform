@@ -692,10 +692,27 @@ fn check_known_value(type_code: &str, item_code: &str, value: &str) -> Result<()
         ("device_retry", "max_attempts") => ("设备命令重试次数", *P::RETRY_RANGE.start(), *P::RETRY_RANGE.end()),
         ("stuck_detect", "stuck_n") => ("卡住判定次数", *P::STUCK_N_RANGE.start(), *P::STUCK_N_RANGE.end()),
         ("stuck_detect", "keep") => ("卡住检测保留记录数", *P::STUCK_N_RANGE.start(), P::KEEP_MAX),
+        ("flow_template", _) => return check_flow_template(value),
         _ => return Ok(()),
     };
     match value.trim().parse::<u32>() {
         Ok(n) if (min..=max).contains(&n) => Ok(()),
         _ => Err(bad(format!("{label}要是 {min} 到 {max} 的整数"))),
     }
+}
+
+/// 流程模板的值：JSON 对象，岗位（executor / judge / case_writer / planner）对应角色名称。
+/// 新建任务时选这个流程，就按名称去节点上找对应岗位的角色。至少要有一个岗位。
+fn check_flow_template(value: &str) -> Result<(), ApiError> {
+    const SLOTS: [&str; 4] = ["executor", "judge", "case_writer", "planner"];
+    let invalid = || bad("流程模板的值要是 JSON，例如 {\"case_writer\":\"角色名\",\"judge\":\"角色名\"}，岗位只能是 executor、judge、case_writer、planner，角色名不超过 60 个字");
+    let parsed: serde_json::Value = serde_json::from_str(value).map_err(|_| invalid())?;
+    let object = parsed.as_object().filter(|o| !o.is_empty()).ok_or_else(invalid)?;
+    for (slot, name) in object {
+        let ok = SLOTS.contains(&slot.as_str()) && name.as_str().is_some_and(|n| !n.trim().is_empty() && n.chars().count() <= 60);
+        if !ok {
+            return Err(invalid());
+        }
+    }
+    Ok(())
 }

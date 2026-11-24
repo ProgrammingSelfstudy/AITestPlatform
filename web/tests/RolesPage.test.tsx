@@ -79,7 +79,13 @@ test("填的是别人的名字：能看，但不能改（节点是别人的，�
   await user.type(await screen.findByPlaceholderText(/你的名字/), "路人甲");
   expect((await screen.findAllByText("角色-a")).length).toBeGreaterThan(0);
   expect((await screen.findAllByText(/这是别人的节点/)).length).toBeGreaterThan(0);
+  // 编辑区默认收起：点角色卡展开
+  expect(screen.queryByRole("button", { name: /检\s*测/ })).not.toBeInTheDocument();
+  await user.click(screen.getByRole("button", { name: /角色-a/ }));
   expect(screen.getByRole("button", { name: /检\s*测/ })).toBeDisabled();
+  // 再点同一张卡：收起
+  await user.click(screen.getByRole("button", { name: /角色-a/ }));
+  expect(screen.queryByRole("button", { name: /检\s*测/ })).not.toBeInTheDocument();
 });
 
 test("服务端提示先登录时可输入密码，登录后刷新权限，清除时注销", async () => {
@@ -104,6 +110,7 @@ test("服务端提示先登录时可输入密码，登录后刷新权限，清�
 
   const user = await openPage();
   expect((await screen.findAllByText("角色-a")).length).toBeGreaterThan(0);
+  await user.click(screen.getByRole("button", { name: /角色-a/ }));
   expect(screen.getByRole("button", { name: /检\s*测/ })).toBeDisabled();
   await user.click(await screen.findByRole("button", { name: "登录" }));
   const dialog = within(await screen.findByRole("dialog", { name: "登录" }));

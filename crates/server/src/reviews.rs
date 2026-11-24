@@ -24,6 +24,10 @@ pub(crate) use export_api::export;
 const TOKEN_HEADER: &str = "x-review-token";
 const WINDOW: Duration = Duration::from_secs(60);
 const FAILURE_LIMIT: usize = 10;
+/// 审核口令最短长度。口令短时靠失败锁定兜底（一分钟内第 11 次错口令锁一分钟），
+/// 但 4 位口令只有一万种组合，仍然容易被连续猜中：只适合可信的局域网，对外开放前请换成更长、更随机的值。
+pub(crate) const MIN_TOKEN_CHARS: usize = 4;
+
 const VERDICTS: [&str; 3] = ["passed", "failed", "uncertain"];
 
 struct ReviewToken {
@@ -47,14 +51,14 @@ impl ReviewAuth {
     pub(crate) fn from_env() -> Self {
         let auth = Self::new(std::env::var("PLATFORM_REVIEW_TOKEN").ok());
         if auth.token.is_none() {
-            tracing::warn!("创建任务、取消执行和审核提交已关闭：请设置至少 16 个字符的 PLATFORM_REVIEW_TOKEN");
+            tracing::warn!("创建任务、取消执行和审核提交已关闭：请设置至少 {MIN_TOKEN_CHARS} 个字符的 PLATFORM_REVIEW_TOKEN");
         }
         auth
     }
 
     pub(crate) fn new(value: Option<String>) -> Self {
         let token = value
-            .filter(|token| token.chars().count() >= 16)
+            .filter(|token| token.chars().count() >= MIN_TOKEN_CHARS)
             .map(|value| ReviewToken {
                 digest: Sha256::digest(value.as_bytes()).into(),
                 value,
@@ -386,19 +390,18 @@ mod tests {
     }
 
     #[test]
-    fn 审核口令缺失或短于十六字符时禁用提交() {
-        for configured in [
-            None,
-            Some(String::new()),
-            Some("密".repeat(15)),
-            Some("0123456789abcde".into()),
-        ] {
+    fn 审核口令缺失或短于最短长度时禁用提交() {
+        let too_short = "密".repeat(MIN_TOKEN_CHARS - 1);
+        for configured in [None, Some(String::new()), Some(too_short), Some("123".into())] {
             let auth = ReviewAuth::new(configured);
             assert!(auth.token.is_none());
             let mut headers = HeaderMap::new();
-            headers.insert(TOKEN_HEADER, "0123456789abcde".parse().unwrap());
+            headers.insert(TOKEN_HEADER, "123".parse().unwrap());
             assert_eq!(auth.check(&headers), Err(StatusCode::FORBIDDEN));
         }
+        // 刚好最短长度就启用；中文按字符数算，不按字节
+        assert!(ReviewAuth::new(Some("9527".into())).token.is_some());
+        assert!(ReviewAuth::new(Some("密".repeat(MIN_TOKEN_CHARS))).token.is_some());
     }
 
     #[test]

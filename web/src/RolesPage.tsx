@@ -352,6 +352,8 @@ export default function RolesPage() {
 
   // 选中角色、本地未保存草稿、新增草稿
   const [selectedRoleId, setSelectedRoleId] = useState<string | null>(null);
+  // 右侧「编辑角色 + 检测日志」默认收起；点角色卡展开，再点同一张卡收起
+  const [editorOpen, setEditorOpen] = useState(false);
   // 新建但还没保存的角色可以同时有多个（比如先建执行员、再建判定员，一起保存）
   const [draftNewRoles, setDraftNewRoles] = useState<ModelRole[]>([]);
   // 每个岗位的角色数上限：来自参数配置，读不到时用默认值
@@ -508,6 +510,12 @@ export default function RolesPage() {
   const watchedSource = Form.useWatch("source", form) ?? activeRoleForForm?.source ?? "codex_exec";
   const watchedModels = Form.useWatch("models", form);
   const watchedDefaultModel = Form.useWatch("defaultModel", form) ?? "";
+
+  // 操作失败的提示在页面顶部：用户常常已经滚到下面的编辑区，看不到就只看到「未保存」，所以出错时滚到提示处
+  useEffect(() => {
+    if (!actionError) return;
+    document.getElementById("roles-action-alert")?.scrollIntoView?.({ behavior: "smooth", block: "center" });
+  }, [actionError]);
 
   /** 任何一个可用来源支持这个岗位就能选；选了之后来源会自动切过去 */
   const slotFull = (slot: ModelRole["slot"]) =>
@@ -700,6 +708,7 @@ export default function RolesPage() {
     };
     setDraftNewRoles((prev) => [...prev, fresh]);
     setSelectedRoleId(newId);
+    setEditorOpen(true);
     const initialValues = roleToFormValues(fresh);
     setDraftsById((prev) => ({ ...prev, [newId]: initialValues }));
     form.setFieldsValue(initialValues);
@@ -841,6 +850,14 @@ export default function RolesPage() {
       const input = buildRoleFromForm(draftRole.id, newDraftValues);
       payload.push(input);
       createdIds.push(input.id);
+    }
+
+    for (const slot of ["executor", "judge", "case_writer", "planner"] as const) {
+      const limit = roleLimits[slot] ?? ROLE_SLOT_LIMIT;
+      if (payload.filter((role) => role.slot === slot).length > limit) {
+        setActionError(`${SLOT_LABEL[slot]}最多 ${limit} 个（上限在「参数配置」里设置），请先删掉多余的。`);
+        return;
+      }
     }
 
     await executeWrite({ kind: "save", payload, createdIds });
@@ -1097,6 +1114,7 @@ export default function RolesPage() {
           )}
           {actionError && (
             <Alert
+              id="roles-action-alert"
               type="error"
               showIcon
               closable
@@ -1185,9 +1203,15 @@ export default function RolesPage() {
                       key={role.id}
                       type="button"
                       aria-pressed={isSelected}
+                      aria-expanded={isSelected && editorOpen}
                       onClick={() => {
-                        setSelectedRoleId(role.id);
                         setActionError(null);
+                        if (isSelected && editorOpen) {
+                          setEditorOpen(false);
+                          return;
+                        }
+                        setSelectedRoleId(role.id);
+                        setEditorOpen(true);
                       }}
                       className={`roles-entity-card${isSelected ? " is-selected" : ""}`}
                     >
@@ -1262,7 +1286,10 @@ export default function RolesPage() {
           </aside>
 
           {/* 右栏：流程管线 + 统计块 + 编辑表单 + 类终端检测日志 */}
-          <main className="roles-main">
+          {!editorOpen && (
+            <div className="roles-collapsed-hint">点左边的角色卡，展开它的配置和检测日志；再点一次收起。</div>
+          )}
+          <main className="roles-main" hidden={!editorOpen}>
             {/* 右栏中部：选中角色编辑表单 */}
             <section className="roles-panel" aria-label="角色配置编辑">
               <div className="roles-panel-head">

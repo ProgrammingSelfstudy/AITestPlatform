@@ -5,14 +5,14 @@ use crate::test_support::test_state_with_accounts;
 #[tokio::test]
 async fn 未配置或短审核口令始终返回空的403() {
     let temp = TempPaths::new();
-    for token in [None, Some("short-token")] {
+    for token in [None, Some("123")] {
         let app = temp.app(with_token(lazy_state(), token));
         for _ in 0..12 {
             let (status, _, body) = request(
                 &app,
                 Method::POST,
                 REVIEW_ROUTE,
-                &review_headers("short-token"),
+                &review_headers("123"),
                 "{",
             )
             .await;
