@@ -9,6 +9,7 @@ import {
   saveNodeRoles,
   releaseNode,
   forceReleaseNode,
+  claimNode,
   type CheckStatus,
   type ModelRole,
   type NodeRoles,
@@ -380,6 +381,23 @@ export default function RolesPage() {
   const [adminName, setAdminName] = useState("");
   const [adminPassword, setAdminPassword] = useState("");
   const [adminBusy, setAdminBusy] = useState(false);
+
+  const [claimBusy, setClaimBusy] = useState(false);
+
+  async function claimThisNode() {
+    if (!selectedNodeId || claimBusy) return;
+    setClaimBusy(true);
+    setActionError(null);
+    try {
+      await claimNode(selectedNodeId, trimmedName);
+      setActionNotice("已认领这个节点：现在它是你的，可以选应用、创建和检测角色了（用的是你自己的额度）。");
+      reloadRoles();
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setClaimBusy(false);
+    }
+  }
 
   async function forceRelease() {
     if (!selectedNodeId || adminBusy) return;
@@ -1046,6 +1064,11 @@ export default function RolesPage() {
             {canAct && (
               <Button size="small" danger disabled={busy} loading={busyAction === "release"} onClick={() => void executeWrite({ kind: "release" })}>
                 解除节点绑定
+              </Button>
+            )}
+            {selectedNodeId && trimmedName && loadedForNode && rolesPoll.payload.unowned && (
+              <Button size="small" type="primary" loading={claimBusy} onClick={() => void claimThisNode()}>
+                认领这个节点
               </Button>
             )}
             {selectedNodeId && !canAct && (

@@ -2463,3 +2463,37 @@ async fn 管理员强制解除节点绑定_要管理员账号和密码_不是主
     let after: Option<Uuid> = sqlx::query_scalar("select owner_user_id from nodes where id = $1").bind(node).fetch_one(state.pool()).await.unwrap();
     assert_eq!(after, None);
 }
+
+#[tokio::test]
+async fn 认领节点_没主人才能认领_别人的不能抢_要先说明是谁() {
+    let temp = TempPaths::with_config();
+    let state = test_state(config()).await;
+    let app = temp.app(state.clone());
+    let (free, taken) = (Uuid::new_v4(), Uuid::new_v4());
+    sqlx::query("insert into users (name) values ('测试用户')").execute(state.pool()).await.unwrap();
+    let other: Uuid = sqlx::query_scalar("insert into users (name) values ('别人') returning id").fetch_one(state.pool()).await.unwrap();
+    for (id, owner) in [(free, None), (taken, Some(other))] {
+        sqlx::query("insert into nodes (id, caps, online, last_seen, secret_hash, owner_user_id) values ($1, '{}', true, now(), 'x', $2)")
+            .bind(id).bind(owner).execute(state.pool()).await.unwrap();
+    }
+    let mut me = WRITE_HEADERS.to_vec();
+    me.push(("x-user-name", USER_NAME));
+    let free_path = format!("/api/nodes/{free}/claim");
+
+    // 没说明是谁：401，节点仍没主人
+    let (status, _, _) = request(&app, Method::POST, &free_path, &WRITE_HEADERS, "{}").await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    // 查看时告诉前端「没有主人，可认领」
+    let (_, _, body) = request(&app, Method::GET, &format!("/api/nodes/{free}/roles"), &[("x-user-name", USER_NAME)], "").await;
+    assert!(String::from_utf8_lossy(&body).contains("\"unowned\":true"), "{}", String::from_utf8_lossy(&body));
+    // 认领成功，再认领一次也成功（已经是自己的）
+    for _ in 0..2 {
+        let (status, _, _) = request(&app, Method::POST, &free_path, &me, "{}").await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+    }
+    // 别人的节点不能抢
+    let (status, _, _) = request(&app, Method::POST, &format!("/api/nodes/{taken}/claim"), &me, "{}").await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    let owner: Uuid = sqlx::query_scalar("select owner_user_id from nodes where id = $1").bind(taken).fetch_one(state.pool()).await.unwrap();
+    assert_eq!(owner, other);
+}

@@ -78,6 +78,7 @@ pub(crate) fn routes(app: AppState, paths: Paths) -> Router {
         .route("/api/nodes/{id}/apps/{source}/scan", post(scan_node_app))
         .route("/api/nodes/{id}/release", post(release_node).route_layer(authorize_write.clone()))
         .route("/api/nodes/{id}/force-release", post(force_release_node))
+        .route("/api/nodes/{id}/claim", post(claim_node))
         .route("/api/nodes/{id}/roles/init-template", post(init_node_roles).route_layer(authorize_write.clone()))
         .route("/api/nodes/{id}/roles/{role}/check", post(check_node_role).route_layer(authorize_write.clone()))
         .route(
@@ -308,11 +309,15 @@ async fn viewer(state: &ApiState, headers: &axum::http::HeaderMap, id: &str) -> 
     let viewer = match users::browser_user(state.app.pool(), headers).await.map_err(|e| internal("校验用户失败", e))? {
         BrowserUser::Identified(user) => {
             let owned = matches!(crate::users::check_node_owner(state.app.pool(), node, user).await.map_err(|e| internal("校验节点属主失败", e))?, crate::users::NodeOwner::Owned);
-            Viewer { mine: Some(owned), name_problem: None }
+            // 节点没有主人：这个名字可以认领它（页面显示「认领这个节点」）
+            let unowned: bool = !owned
+                && sqlx::query_scalar("select owner_user_id is null from nodes where id = $1").bind(node).fetch_one(state.app.pool()).await.map_err(|e| internal("查询节点属主失败", e))?;
+            let name_problem = unowned.then(|| "这个节点还没有主人：点「认领这个节点」就归你，用的是你自己的额度".to_string());
+            Viewer { mine: Some(owned), name_problem, unowned }
         }
-        BrowserUser::Unspecified => Viewer { mine: None, name_problem: None },
-        BrowserUser::Unregistered(name) => Viewer { mine: Some(false), name_problem: Some(format!("「{name}」还没有登记：没有任何节点是用这个名字（NODE_USER_NAME）启动的")) },
-        BrowserUser::LoginRequired => Viewer { mine: Some(false), name_problem: Some(users::NEED_LOGIN_MESSAGE.into()) },
+        BrowserUser::Unspecified => Viewer { mine: None, name_problem: None, unowned: false },
+        BrowserUser::Unregistered(name) => Viewer { mine: Some(false), name_problem: Some(format!("「{name}」还没有登记：没有任何节点是用这个名字（NODE_USER_NAME）启动的")), unowned: false },
+        BrowserUser::LoginRequired => Viewer { mine: Some(false), name_problem: Some(users::NEED_LOGIN_MESSAGE.into()), unowned: false },
     };
     Ok((node, viewer))
 }
@@ -321,6 +326,8 @@ async fn viewer(state: &ApiState, headers: &axum::http::HeaderMap, id: &str) -> 
 struct Viewer {
     mine: Option<bool>,
     name_problem: Option<String>,
+    /// 节点还没有主人，当前名字可以认领
+    unowned: bool,
 }
 
 #[derive(Serialize)]
@@ -404,6 +411,27 @@ fn credential_error(message: &str) -> ApiError {
 
 fn password_locked() -> ApiError {
     (StatusCode::TOO_MANY_REQUESTS, "密码尝试次数过多，请等待 5 分钟后再试".into())
+}
+
+/// 认领一个没有主人的节点：要先说明你是谁（有密码的名字要登录）。
+/// 已经是你的：直接成功；属于别人：409，不能抢；认领和占用在同一条 update 里，两人同时认领只有一个成功。
+async fn claim_node(State(state): State<ApiState>, Path(id): Path<String>, headers: axum::http::HeaderMap) -> Result<StatusCode, ApiError> {
+    let node: Uuid = id.parse().map_err(|_| (StatusCode::NOT_FOUND, "没有这个节点".to_string()))?;
+    let user = require_browser_user(&state, &headers).await?;
+    let done = sqlx::query("update nodes set owner_user_id = $1 where id = $2 and owner_user_id is null")
+        .bind(user)
+        .bind(node)
+        .execute(state.app.pool())
+        .await
+        .map_err(|e| internal("认领节点失败", e))?;
+    if done.rows_affected() == 1 {
+        return Ok(StatusCode::NO_CONTENT);
+    }
+    match crate::users::check_node_owner(state.app.pool(), node, user).await.map_err(|e| internal("校验节点属主失败", e))? {
+        crate::users::NodeOwner::Owned => Ok(StatusCode::NO_CONTENT),
+        crate::users::NodeOwner::Missing => Err((StatusCode::NOT_FOUND, "没有这个节点".to_string())),
+        crate::users::NodeOwner::NotYours => Err((StatusCode::CONFLICT, "这个节点已经有主人了，不能认领；让主人或管理员先解除绑定".to_string())),
+    }
 }
 
 /// 管理员强制解除：用管理员账号（名字 + 密码）验证，不要求是节点主人，节点离线也行。

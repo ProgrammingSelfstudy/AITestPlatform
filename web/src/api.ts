@@ -271,6 +271,8 @@ export interface NodeRoles {
   mine: boolean | null;
   /** 名字没登记等原因，原样显示 */
   name_problem: string | null;
+  /** 节点还没有主人，当前名字可以认领 */
+  unowned?: boolean;
 }
 
 /** 保存时提交的角色。api_key 只在需要新设或更换 Key 时填；不填表示保持原来的。 */
@@ -472,6 +474,11 @@ export async function releaseNode(nodeId: string, token: string, userName: strin
   await post(`/api/nodes/${encodeURIComponent(nodeId)}/release`, {}, token, userHeaders(userName));
 }
 
+/** 认领一个没有主人的节点（要先说明你是谁；有密码的名字要先登录）。已经有主人不能抢。 */
+export async function claimNode(nodeId: string, userName: string): Promise<void> {
+  await post(`/api/nodes/${encodeURIComponent(nodeId)}/claim`, {}, "", userHeaders(userName));
+}
+
 /** 管理员强制解除：用管理员账号（名字 + 密码）验证，不要求是节点主人，也不需要复核口令。 */
 export async function forceReleaseNode(nodeId: string, name: string, password: string): Promise<void> {
   await post(`/api/nodes/${encodeURIComponent(nodeId)}/force-release`, { name, password }, "");
@@ -547,6 +554,7 @@ export interface NodeApps {
   apps: AppView[];
   mine: boolean | null;
   name_problem: string | null;
+  unowned?: boolean;
 }
 
 export async function fetchNodeApps(nodeId: string, userName: string, signal?: AbortSignal): Promise<NodeApps> {
