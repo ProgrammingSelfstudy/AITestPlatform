@@ -181,3 +181,16 @@ test("「我是谁」填了记在浏览器里：刷新（重新进入页面）�
   expect((await screen.findAllByText(/你现在是只读/)).length).toBeGreaterThan(0);
   expect(window.localStorage.getItem("platform.userName.v1")).toBeNull();
 });
+
+test("可以连续新建多个角色，每个都显示在列表里（比如执行员和判定员一起建）", async () => {
+  serve([role("a", "executor", "codex_exec", "ok", null)]);
+  const user = await openPage();
+  const add = await screen.findByRole("button", { name: /新增角色/ });
+  await waitFor(() => expect(add).toBeEnabled());
+  await user.click(add);
+  await user.click(add);
+  // 两个新建草稿都在列表里，而且按钮不会变成「继续编辑」把第二次点击吞掉
+  expect(await screen.findAllByText("新建未保存")).toHaveLength(2);
+  expect(screen.getAllByText("未命名新角色")).toHaveLength(2);
+  expect(screen.queryByText("继续编辑新建角色")).toBeNull();
+});

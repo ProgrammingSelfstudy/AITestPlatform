@@ -81,7 +81,7 @@ type RolesPollState =
 const IDLE_POLL: RolesPollState = { status: "idle" };
 
 type WriteIntent =
-  | { kind: "save"; payload: RoleInput[]; createdId: string | null }
+  | { kind: "save"; payload: RoleInput[]; createdIds: string[] }
   | { kind: "init" }
   | { kind: "release" }
   | { kind: "check"; roleId: string; roleName: string }
@@ -367,7 +367,8 @@ export default function RolesPage() {
 
   // 选中角色、本地未保存草稿、新增草稿
   const [selectedRoleId, setSelectedRoleId] = useState<string | null>(null);
-  const [draftNewRole, setDraftNewRole] = useState<ModelRole | null>(null);
+  // 新建但还没保存的角色可以同时有多个（比如先建执行员、再建判定员，一起保存）
+  const [draftNewRoles, setDraftNewRoles] = useState<ModelRole[]>([]);
   const [draftsById, setDraftsById] = useState<Record<string, RoleFormValues>>({});
 
   // 写操作与审核口令流程（与 NewTaskDialog / ScriptsPage 一致）
@@ -421,7 +422,7 @@ export default function RolesPage() {
   // 切换节点或换了名字时立即清理草稿与临时状态（避免残留任何未保存内容或 Key）
   useEffect(() => {
     setSelectedRoleId(null);
-    setDraftNewRole(null);
+    setDraftNewRoles([]);
     setDraftsById({});
     setPendingWrite(null);
     setDeleteTarget(null);
@@ -445,9 +446,10 @@ export default function RolesPage() {
         models: input.models,
       };
     });
-    if (draftNewRole && !serverRoles.some((role) => role.id === draftNewRole.id)) {
-      const draft = draftsById[draftNewRole.id];
-      const base = draft ? buildRoleFromForm(draftNewRole.id, draft) : draftNewRole;
+    for (const draftRole of draftNewRoles) {
+      if (serverRoles.some((role) => role.id === draftRole.id)) continue;
+      const draft = draftsById[draftRole.id];
+      const base = draft ? buildRoleFromForm(draftRole.id, draft) : draftRole;
       list.push({
         id: base.id,
         slot: base.slot,
@@ -460,14 +462,14 @@ export default function RolesPage() {
       });
     }
     return list;
-  }, [serverRoles, draftNewRole, draftsById]);
+  }, [serverRoles, draftNewRoles, draftsById]);
 
   // 新建角色保存后，待服务端轮询返回该角色时再平滑移除本地新建草稿，避免瞬间跳回第一项
   useEffect(() => {
-    if (draftNewRole && serverRoles.some((role) => role.id === draftNewRole.id)) {
-      setDraftNewRole(null);
+    if (draftNewRoles.some((draftRole) => serverRoles.some((role) => role.id === draftRole.id))) {
+      setDraftNewRoles((prev) => prev.filter((draftRole) => !serverRoles.some((role) => role.id === draftRole.id)));
     }
-  }, [draftNewRole, serverRoles]);
+  }, [draftNewRoles, serverRoles]);
 
   // 自动选中第一个角色；若当前选中角色已不存在则回退
   useEffect(() => {
@@ -486,10 +488,9 @@ export default function RolesPage() {
     () => serverRoles.find((item) => item.id === selectedRoleId) ?? null,
     [serverRoles, selectedRoleId],
   );
-  const isEditingNewDraft = Boolean(
-    draftNewRole && selectedRoleId === draftNewRole.id && !activeServerRole,
-  );
-  const activeRoleForForm: ModelRole | null = isEditingNewDraft ? draftNewRole : activeServerRole;
+  const activeDraftRole = draftNewRoles.find((draftRole) => draftRole.id === selectedRoleId) ?? null;
+  const isEditingNewDraft = Boolean(activeDraftRole && !activeServerRole);
+  const activeRoleForForm: ModelRole | null = isEditingNewDraft ? activeDraftRole : activeServerRole;
   const activeConfigSig = activeRoleForForm ? configSignature(activeRoleForForm) : "";
 
   // 仅在切换角色或已保存配置真正变更（且无本地草稿）时同步到表单，绝不在轮询更新检测状态时打断用户输入
@@ -605,7 +606,7 @@ export default function RolesPage() {
       });
   }, [serverRoles]);
 
-  const dirtyCount = Object.keys(draftsById).length + (draftNewRole && !draftsById[draftNewRole.id] ? 1 : 0);
+  const dirtyCount = Object.keys(draftsById).length + draftNewRoles.filter((draftRole) => !draftsById[draftRole.id]).length;
 
   // ---------------------------------------------------------------- 表单联动与草稿维护
 
@@ -676,11 +677,8 @@ export default function RolesPage() {
     if (isNodeOffline || !canQueryRoles || busy) return;
     setActionError(null);
     setActionNotice(null);
-    if (draftNewRole) {
-      setSelectedRoleId(draftNewRole.id);
-      return;
-    }
-    const existingIds = new Set(serverRoles.map((role) => role.id));
+    // 已有的和还没保存的新建角色 id 都要避开，不然两个草稿会撞 id
+    const existingIds = new Set([...serverRoles.map((role) => role.id), ...draftNewRoles.map((draftRole) => draftRole.id)]);
     const defaultSource = ROLE_SOURCES.find((item) => item.available)?.value ?? "codex_exec";
     const defaultSlot = allowedSlotsForSource(defaultSource)[0];
     const newId = generateRoleId(existingIds, defaultSource);
@@ -692,7 +690,7 @@ export default function RolesPage() {
       default: { model: "", effort: null },
       models: [{ model: "", efforts: [] }],
     };
-    setDraftNewRole(fresh);
+    setDraftNewRoles((prev) => [...prev, fresh]);
     setSelectedRoleId(newId);
     const initialValues = roleToFormValues(fresh);
     setDraftsById((prev) => ({ ...prev, [newId]: initialValues }));
@@ -704,8 +702,8 @@ export default function RolesPage() {
     if (!selectedRoleId) return;
     setActionError(null);
     setActionNotice(null);
-    if (draftNewRole && selectedRoleId === draftNewRole.id) {
-      setDraftNewRole(null);
+    if (isEditingNewDraft) {
+      setDraftNewRoles((prev) => prev.filter((draftRole) => draftRole.id !== selectedRoleId));
       setDraftsById((prev) => {
         const next = { ...prev };
         delete next[selectedRoleId];
@@ -751,13 +749,10 @@ export default function RolesPage() {
         await saveNodeRoles(selectedNodeId, intent.payload, token, trimmedName);
         setDraftsById({});
         form.setFieldValue("apiKey", "");
-        if (intent.createdId) {
-          const savedCreated = intent.payload.find((item) => item.id === intent.createdId);
-          setDraftNewRole(savedCreated ? toRoleInput(savedCreated) : null);
-          setSelectedRoleId(intent.createdId);
-        } else {
-          setDraftNewRole(null);
-        }
+        // 刚保存的新角色先留在列表里，等服务端轮询返回后再由上面的 effect 去掉本地草稿
+        const savedCreated = intent.payload.filter((item) => intent.createdIds.includes(item.id)).map(toRoleInput);
+        setDraftNewRoles(savedCreated);
+        if (intent.createdIds.length > 0) setSelectedRoleId(intent.createdIds[0]);
         setActionNotice("角色配置已保存并下发到节点。");
       } else if (intent.kind === "release") {
         await releaseNode(selectedNodeId, token, trimmedName);
@@ -826,19 +821,21 @@ export default function RolesPage() {
       return buildRoleFromForm(role.id, draft);
     });
 
-    let createdId: string | null = null;
-    if (draftNewRole && !serverRoles.some((role) => role.id === draftNewRole.id)) {
-      const newDraftValues = mergedDrafts[draftNewRole.id];
+    // 所有还没保存的新建角色一起提交
+    const createdIds: string[] = [];
+    for (const draftRole of draftNewRoles) {
+      if (serverRoles.some((role) => role.id === draftRole.id)) continue;
+      const newDraftValues = mergedDrafts[draftRole.id];
       if (!newDraftValues) {
         setActionError("请先完善新增角色的配置");
         return;
       }
-      const input = buildRoleFromForm(draftNewRole.id, newDraftValues);
+      const input = buildRoleFromForm(draftRole.id, newDraftValues);
       payload.push(input);
-      createdId = input.id;
+      createdIds.push(input.id);
     }
 
-    await executeWrite({ kind: "save", payload, createdId });
+    await executeWrite({ kind: "save", payload, createdIds });
   }
 
   /** 从「选应用」面板创建角色：和节点上现有的角色一起整体提交（走审核口令流程），新角色是第一个选中的 */
@@ -847,7 +844,7 @@ export default function RolesPage() {
     setActionError(null);
     setActionNotice(null);
     const payload: RoleInput[] = [...serverRoles.map(toRoleInput), ...created];
-    void executeWrite({ kind: "save", payload, createdId: created[0].id });
+    void executeWrite({ kind: "save", payload, createdIds: created.map((item) => item.id) });
   }
 
   function handleCheckCurrent() {
@@ -876,7 +873,7 @@ export default function RolesPage() {
     const target = deleteTarget;
     setDeleteTarget(null);
     if (target.isDraftNew) {
-      setDraftNewRole(null);
+      setDraftNewRoles((prev) => prev.filter((draftRole) => draftRole.id !== target.id));
       setDraftsById((prev) => {
         const next = { ...prev };
         delete next[target.id];
@@ -1183,7 +1180,7 @@ export default function RolesPage() {
               <div className="roles-card-list">
                 {allDisplayRoles.map((role) => {
                   const isSelected = role.id === selectedRoleId;
-                  const isDirty = Boolean(draftsById[role.id]) || role.id === draftNewRole?.id;
+                  const isDirty = Boolean(draftsById[role.id]) || draftNewRoles.some((draftRole) => draftRole.id === role.id);
                   const meta = CHECK_META[role.check.status];
                   return (
                     <button
@@ -1217,7 +1214,7 @@ export default function RolesPage() {
                               )}
                               {isDirty && (
                                 <span className="roles-dirty-pill">
-                                  {role.id === draftNewRole?.id ? "新建未保存" : "未保存"}
+                                  {draftNewRoles.some((draftRole) => draftRole.id === role.id) ? "新建未保存" : "未保存"}
                                 </span>
                               )}
                             </div>
@@ -1262,7 +1259,7 @@ export default function RolesPage() {
               onClick={handleAddRole}
             >
               <span aria-hidden="true">+</span>
-              <span>{draftNewRole ? "继续编辑新建角色" : "新增角色"}</span>
+              <span>新增角色</span>
             </button>
           </aside>
 
