@@ -51,8 +51,14 @@ pub(crate) fn routes(app: AppState, paths: Paths) -> Router {
     let authorize_write = axum::middleware::from_fn_with_state(app.clone(), reviews::authorize);
     Router::new()
         .route("/api/models", get(models))
-        .route("/api/configs", get(crate::configs::api_list_types))
+        .route("/api/configs", get(crate::configs::api_list_types).post(crate::configs::api_create_type))
         .route("/api/configs/{code}", get(crate::configs::api_type_detail))
+        // 写入全用 POST：浏览器写入守卫（来源、Content-Type、X-Requested-With）只管 POST
+        .route("/api/configs/{code}/update", post(crate::configs::api_update_type))
+        .route("/api/configs/{code}/delete", post(crate::configs::api_delete_type))
+        .route("/api/configs/{code}/items", post(crate::configs::api_create_item))
+        .route("/api/configs/{code}/items/{id}/update", post(crate::configs::api_update_item))
+        .route("/api/configs/{code}/items/{id}/delete", post(crate::configs::api_delete_item))
         .route("/api/projects/{project}/modules", post(crate::modules::api_create_module).route_layer(authorize_write.clone()).get(crate::modules::api_list))
         .route(
             "/api/projects/{project}/casegen-requests",
@@ -234,11 +240,11 @@ fn role_valid(role: &RoleConfig) -> bool {
 }
 
 /// 一组角色是否合法：id 不重复、每个角色合法、两个岗位都至少一个、每个岗位不超过上限。
-fn roles_valid(roles: &[RoleConfig]) -> bool {
+fn roles_valid(roles: &[RoleConfig], limit: impl Fn(RoleSlot) -> usize) -> bool {
     let unique = roles.iter().enumerate().all(|(i, r)| roles[..i].iter().all(|o| o.id != r.id));
     let within_limit = [RoleSlot::Executor, RoleSlot::Judge, RoleSlot::CaseWriter, RoleSlot::Planner]
         .iter()
-        .all(|slot| roles.iter().filter(|r| r.slot == *slot).count() <= RoleSlot::MAX_PER_SLOT);
+        .all(|slot| roles.iter().filter(|r| r.slot == *slot).count() <= limit(*slot));
     unique && within_limit && roles.iter().all(role_valid) && [RoleSlot::Executor, RoleSlot::Judge].iter().all(|slot| roles.iter().any(|r| r.slot == *slot))
 }
 
@@ -249,7 +255,7 @@ fn pick<'a>(roles: &'a [RoleConfig], slot: RoleSlot, role: Option<&str>) -> Opti
 
 impl Models {
     fn valid(&self) -> bool {
-        roles_valid(&self.roles)
+        roles_valid(&self.roles, |_| RoleSlot::MAX_PER_SLOT)
     }
 }
 
@@ -367,8 +373,17 @@ async fn set_node_roles(
     let node = require_owned(&state, &headers, &id).await?;
     let Json(request) = body.map_err(|_| bad_request("角色配置格式无效"))?;
     let configs: Vec<RoleConfig> = request.roles.iter().map(|r| r.config.clone()).collect();
-    if !roles_valid(&configs) {
-        return Err(bad_request("角色配置无效：id 不能重复，执行员和判定员各至少一个，每个岗位最多 3 个，来源要和岗位匹配且已有运行器，默认模型要在模型列表里"));
+    // 岗位上限来自参数配置（role_limit），配置缺失或写坏时用代码里的默认值
+    let pool = state.app.pool();
+    let limits = [
+        (RoleSlot::Executor, crate::configs::role_limit(pool, "executor", RoleSlot::MAX_PER_SLOT).await),
+        (RoleSlot::Judge, crate::configs::role_limit(pool, "judge", RoleSlot::MAX_PER_SLOT).await),
+        (RoleSlot::CaseWriter, crate::configs::role_limit(pool, "case_writer", RoleSlot::MAX_PER_SLOT).await),
+        (RoleSlot::Planner, crate::configs::role_limit(pool, "planner", RoleSlot::MAX_PER_SLOT).await),
+    ];
+    let limit = |slot: RoleSlot| limits.iter().find(|(s, _)| *s == slot).map_or(RoleSlot::MAX_PER_SLOT, |(_, n)| *n);
+    if !roles_valid(&configs, limit) {
+        return Err(bad_request("角色配置无效：id 不能重复，执行员和判定员各至少一个，每个岗位的角色数不能超过参数配置里的上限，来源要和岗位匹配且已有运行器，默认模型要在模型列表里"));
     }
     push_roles(&state, node, request.roles).await
 }

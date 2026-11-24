@@ -6,6 +6,7 @@ import {
   fetchNodes,
   initNodeRoles,
   ROLE_SLOT_LIMIT,
+  fetchRoleLimits,
   ROLE_SOURCES,
   saveNodeRoles,
   releaseNode,
@@ -353,6 +354,13 @@ export default function RolesPage() {
   const [selectedRoleId, setSelectedRoleId] = useState<string | null>(null);
   // 新建但还没保存的角色可以同时有多个（比如先建执行员、再建判定员，一起保存）
   const [draftNewRoles, setDraftNewRoles] = useState<ModelRole[]>([]);
+  // 每个岗位的角色数上限：来自参数配置，读不到时用默认值
+  const [roleLimits, setRoleLimits] = useState<Record<string, number>>({});
+  useEffect(() => {
+    const controller = new AbortController();
+    void fetchRoleLimits(controller.signal).then((limits) => { if (!controller.signal.aborted) setRoleLimits(limits); });
+    return () => controller.abort();
+  }, []);
   const [draftsById, setDraftsById] = useState<Record<string, RoleFormValues>>({});
 
   // 写操作与审核口令流程（与 NewTaskDialog / ScriptsPage 一致）
@@ -503,7 +511,7 @@ export default function RolesPage() {
 
   /** 任何一个可用来源支持这个岗位就能选；选了之后来源会自动切过去 */
   const slotFull = (slot: ModelRole["slot"]) =>
-    [...serverRoles, ...draftNewRoles].filter((r) => r.slot === slot && r.id !== selectedRoleId).length >= ROLE_SLOT_LIMIT;
+    [...serverRoles, ...draftNewRoles].filter((r) => r.slot === slot && r.id !== selectedRoleId).length >= (roleLimits[slot] ?? ROLE_SLOT_LIMIT);
   const slotSupported = (slot: ModelRole["slot"]) =>
     !slotFull(slot) && ROLE_SOURCES.some((item) => item.available && allowedSlotsForSource(item.value).includes(slot));
   const allowedSlots = useMemo(() => allowedSlotsForSource(watchedSource), [watchedSource]);
@@ -1356,7 +1364,7 @@ export default function RolesPage() {
                           extra={
                             allowedSlots.length === 1
                               ? `当前来源仅支持担任${SLOT_LABEL[allowedSlots[0]]}`
-                              : `选择该角色在测试流程中的岗位（每个岗位最多 ${ROLE_SLOT_LIMIT} 个，满了会置灰）`
+                              : "选择该角色在测试流程中的岗位（每个岗位的数量上限在「参数配置」里设置，满了会置灰）"
                           }
                         >
                           <Segmented<ModelRole["slot"]>

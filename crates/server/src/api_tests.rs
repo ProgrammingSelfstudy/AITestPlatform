@@ -2559,3 +2559,114 @@ async fn 参数配置_一级列表能搜索分页_二级详情带配置项() {
     let (status, _, _) = request(&world.app, Method::GET, "/api/configs/nope", &[], "").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
+
+#[tokio::test]
+async fn 参数配置_只有登录的管理员能改_值里不能有密码或密钥() {
+    let temp = TempPaths::with_config();
+    let state = test_state(config()).await;
+    let app = temp.app(state.clone());
+    let password = Uuid::new_v4().to_string();
+    for name in ["root", "other"] {
+        assert_eq!(post_credentials(&app, "/api/users", name, &password).await.0, StatusCode::CREATED);
+    }
+    sqlx::query("update users set is_admin = true where name = 'root'").execute(state.pool()).await.unwrap();
+    let (admin_token, other_token) = (login_token(&app, "root", &password).await, login_token(&app, "other", &password).await);
+    let post = |path: &'static str, body: Value, name: &'static str, token: Option<String>| {
+        let app = app.clone();
+        async move {
+            let mut headers = WRITE_HEADERS.to_vec();
+            headers.push(("x-user-name", name));
+            if let Some(token) = token.as_deref() {
+                headers.push(("x-user-token", token));
+            }
+            let (status, _, bytes) = request(&app, Method::POST, path, &headers, body.to_string()).await;
+            (status, bytes)
+        }
+    };
+    let admin = |path, body| post(path, body, "root", Some(admin_token.clone()));
+    let new_type = json!({"name": "测试类型", "code": "demo_type", "remark": "给测试用"});
+
+    // 没身份、普通名字、管理员名字没带会话：一律 403，什么都没写进去
+    for (name, token) in [("", None), ("other", Some(other_token.clone())), ("root", None)] {
+        let (status, _) = post("/api/configs", new_type.clone(), if name.is_empty() { "nobody" } else { name }, token).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{name}");
+    }
+    // 列表告诉页面能不能写
+    let get_can_write = |name: &'static str, token: Option<String>| {
+        let app = app.clone();
+        async move {
+            let mut headers = vec![("x-user-name", name)];
+            if let Some(t) = token.as_deref() { headers.push(("x-user-token", t)); }
+            let (_, _, bytes) = request(&app, Method::GET, "/api/configs", &headers, "").await;
+            json_body(&bytes)["can_write"].as_bool().unwrap()
+        }
+    };
+    assert!(!get_can_write("other", Some(other_token.clone())).await);
+    assert!(get_can_write("root", Some(admin_token.clone())).await);
+
+    // 管理员新增类型；编码格式不对 400、重复 409
+    assert_eq!(admin("/api/configs", new_type.clone()).await.0, StatusCode::CREATED);
+    assert_eq!(admin("/api/configs", new_type.clone()).await.0, StatusCode::CONFLICT);
+    assert_eq!(admin("/api/configs", json!({"name": "x", "code": "Bad-Code"})).await.0, StatusCode::BAD_REQUEST);
+
+    // 新增配置项；值或备注像密码、密钥一律拒绝
+    let item = |value: &str, remark: &str| json!({"name": "上限", "code": "max_n", "value": value, "remark": remark, "sort": 1});
+    for (value, remark) in [("password=abc", ""), ("5", "api_key 放这里"), ("sk-abcdefghijklmnopqrstuv", ""), ("AKIAABCDEFGHIJKLMNOP", "")] {
+        let (status, body) = admin("/api/configs/demo_type/items", item(value, remark)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value} {remark}");
+        assert!(text(&body).contains("不能出现密码或 API Key"));
+    }
+    let (status, body) = admin("/api/configs/demo_type/items", item("5", "")).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let item_id = json_body(&body)["id"].as_i64().unwrap();
+    assert_eq!(admin("/api/configs/demo_type/items", item("6", "")).await.0, StatusCode::CONFLICT, "同类型下编码唯一");
+
+    // 修改配置项（编码不变）和停用
+    let update = format!("/api/configs/demo_type/items/{item_id}/update");
+    let update: &'static str = Box::leak(update.into_boxed_str());
+    assert_eq!(admin(update, json!({"name": "上限", "value": "7", "status": "disabled"})).await.0, StatusCode::NO_CONTENT);
+    let (_, _, bytes) = request(&app, Method::GET, "/api/configs/demo_type", &[], "").await;
+    let row = json_body(&bytes)["items"]["rows"][0].clone();
+    assert_eq!((row["value"].clone(), row["status"].clone(), row["code"].clone(), row["updated_by"].clone()), (json!("7"), json!("disabled"), json!("max_n"), json!("root")));
+
+    // 类型下还有配置项不能删；清空后能删
+    assert_eq!(admin("/api/configs/demo_type/delete", json!({})).await.0, StatusCode::CONFLICT);
+    let delete: &'static str = Box::leak(format!("/api/configs/demo_type/items/{item_id}/delete").into_boxed_str());
+    assert_eq!(admin(delete, json!({})).await.0, StatusCode::NO_CONTENT);
+    assert_eq!(admin(delete, json!({})).await.0, StatusCode::NOT_FOUND);
+    assert_eq!(admin("/api/configs/demo_type/delete", json!({})).await.0, StatusCode::NO_CONTENT);
+    assert_eq!(admin("/api/configs/demo_type/update", json!({"name": "x"})).await.0, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn 参数配置_岗位上限读配置_写坏了用默认值() {
+    let world = World::new().await;
+    let path = format!("/api/nodes/{}/roles", world.node);
+    let post = |roles: Vec<Value>| {
+        let mut headers = review_headers(REVIEW_TOKEN);
+        headers.push(("x-user-name", USER_NAME));
+        let (app, path) = (world.app.clone(), path.clone());
+        async move { request(&app, Method::POST, &path, &headers, set_roles_body(json!(roles))).await.0 }
+    };
+    let judge = |id: &str| role_json(id, "judge", "agy", "m");
+    let base = |judges: &[&str]| {
+        let mut v = vec![role_json("e", "executor", "codex_exec", "m")];
+        v.extend(judges.iter().map(|id| judge(id)));
+        v
+    };
+    let pool = world.state.pool();
+    // 判定员上限改成 1：两个判定员 400，一个放行（节点离线 409）
+    sqlx::query("update config_items set value = '1' where code = 'judge'").execute(pool).await.unwrap();
+    assert_eq!(post(base(&["j1", "j2"])).await, StatusCode::BAD_REQUEST);
+    assert_eq!(post(base(&["j1"])).await, StatusCode::CONFLICT);
+    // 改成 4：四个放行
+    sqlx::query("update config_items set value = '4' where code = 'judge'").execute(pool).await.unwrap();
+    assert_eq!(post(base(&["j1", "j2", "j3", "j4"])).await, StatusCode::CONFLICT);
+    // 值写坏了、类型停用：回到默认 3
+    sqlx::query("update config_items set value = 'abc' where code = 'judge'").execute(pool).await.unwrap();
+    assert_eq!(post(base(&["j1", "j2", "j3", "j4"])).await, StatusCode::BAD_REQUEST);
+    assert_eq!(post(base(&["j1", "j2", "j3"])).await, StatusCode::CONFLICT);
+    sqlx::query("update config_items set value = '1' where code = 'judge'").execute(pool).await.unwrap();
+    sqlx::query("update config_types set status = 'disabled' where code = 'role_limit'").execute(pool).await.unwrap();
+    assert_eq!(post(base(&["j1", "j2", "j3"])).await, StatusCode::CONFLICT);
+}

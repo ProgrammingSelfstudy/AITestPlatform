@@ -685,19 +685,77 @@ export interface Paged<T> {
   page: number;
   page_size: number;
   rows: T[];
+  /** 当前这个人能不能改配置（只有登录的管理员） */
+  can_write: boolean;
 }
 
 export interface ConfigTypeDetail {
   type: ConfigType;
   items: Paged<ConfigItem>;
+  can_write: boolean;
 }
 
-export const fetchConfigTypes = (query: { name?: string; code?: string; page: number; pageSize: number }, signal?: AbortSignal) => {
+export interface ConfigTypeInput {
+  name: string;
+  code?: string;
+  remark: string;
+  status: ConfigStatus;
+}
+
+export interface ConfigItemInput {
+  name: string;
+  code?: string;
+  value: string;
+  label: string;
+  group_name: string;
+  sort: number;
+  remark: string;
+  status: ConfigStatus;
+}
+
+export const fetchConfigTypes = (query: { name?: string; code?: string; page: number; pageSize: number }, userName: string, signal?: AbortSignal) => {
   const params = new URLSearchParams({ page: String(query.page), page_size: String(query.pageSize) });
   if (query.name?.trim()) params.set("name", query.name.trim());
   if (query.code?.trim()) params.set("code", query.code.trim());
-  return get<Paged<ConfigType>>(`/api/configs?${params}`, signal);
+  return getWith<Paged<ConfigType>>(`/api/configs?${params}`, userName, signal);
 };
 
-export const fetchConfigDetail = (code: string, page: number, pageSize: number, signal?: AbortSignal) =>
-  get<ConfigTypeDetail>(`/api/configs/${encodeURIComponent(code)}?page=${page}&page_size=${pageSize}`, signal);
+export const fetchConfigDetail = (code: string, page: number, pageSize: number, userName: string, signal?: AbortSignal) =>
+  getWith<ConfigTypeDetail>(`/api/configs/${encodeURIComponent(code)}?page=${page}&page_size=${pageSize}`, userName, signal);
+
+/** 带「我是谁」和会话令牌的读取：服务端据此告诉页面能不能写 */
+async function getWith<T>(path: string, userName: string, signal?: AbortSignal): Promise<T> {
+  const response = await request(path, { signal, headers: userHeaders(userName) });
+  try {
+    return (await response.json()) as T;
+  } catch {
+    throw new Error("服务端返回的数据格式无效");
+  }
+}
+
+// 写入只给管理员：身份靠名字 + 登录会话，不需要审核口令。全部用 POST（浏览器写入守卫只管 POST）。
+const configPath = (code: string) => `/api/configs/${encodeURIComponent(code)}`;
+const adminPost = (path: string, body: object, userName: string) => post(path, body, "", userHeaders(userName));
+
+export const createConfigType = async (input: ConfigTypeInput, userName: string) => { await adminPost("/api/configs", input, userName); };
+export const updateConfigType = async (code: string, input: ConfigTypeInput, userName: string) => { await adminPost(`${configPath(code)}/update`, input, userName); };
+export const deleteConfigType = async (code: string, userName: string) => { await adminPost(`${configPath(code)}/delete`, {}, userName); };
+export const createConfigItem = async (code: string, input: ConfigItemInput, userName: string) => { await adminPost(`${configPath(code)}/items`, input, userName); };
+export const updateConfigItem = async (code: string, id: number, input: ConfigItemInput, userName: string) => { await adminPost(`${configPath(code)}/items/${id}/update`, input, userName); };
+export const deleteConfigItem = async (code: string, id: number, userName: string) => { await adminPost(`${configPath(code)}/items/${id}/delete`, {}, userName); };
+
+/** 每个岗位最多几个角色：读参数配置里的 role_limit，读不到或值不合法就用默认 ROLE_SLOT_LIMIT（服务端保存时也是这个规则） */
+export async function fetchRoleLimits(signal?: AbortSignal): Promise<Record<string, number>> {
+  const limits: Record<string, number> = {};
+  try {
+    const detail = await get<ConfigTypeDetail>("/api/configs/role_limit?page=1&page_size=100", signal);
+    if (detail.type.status !== "normal") return limits;
+    for (const item of detail.items.rows) {
+      const value = Number(item.value.trim());
+      if (item.status === "normal" && Number.isInteger(value) && value >= 1 && value <= 20) limits[item.code] = value;
+    }
+  } catch {
+    /* 读不到就全部用默认值 */
+  }
+  return limits;
+}
