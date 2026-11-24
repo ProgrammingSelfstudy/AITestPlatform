@@ -27,6 +27,7 @@ export const RESULT_TEXT: Record<NonNullable<LatestRun["final_result"]>, string>
 
 export function resultText(run: LatestRun | null): string {
   if (!run) return "未执行";
+  if (run.blocked_reason === "skipped") return "已跳过";
   if (run.final_result) return RESULT_TEXT[run.final_result];
   return "进行中";
 }

@@ -76,6 +76,7 @@ const BLOCKED_REASON_TEXT: Record<string, string> = {
   stuck: "执行卡住",
   quota: "模型额度用完",
   other: "执行未能完成",
+  skipped: "已跳过（条件不足）",
 };
 
 function getRunStatusMeta(status: string) {

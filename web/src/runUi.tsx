@@ -43,6 +43,7 @@ const blocked: Record<BlockedReason, string> = {
   stuck: "执行卡住",
   quota: "模型额度用完",
   other: "执行未能完成",
+  skipped: "已跳过（条件不足，没有执行）",
 };
 
 export function blockedLabel(reason: BlockedReason) {

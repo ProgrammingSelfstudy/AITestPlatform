@@ -109,11 +109,21 @@ test("测试用例：导入 CSV 发给服务端，成功显示条数并刷新；
 });
 
 test("测试结果：每条一行，没跑过写「未执行」，汇总各类条数，未执行不算通过", () => {
-  const run = (final_result: "passed" | "failed" | "uncertain" | "blocked" | null) => ({ run_id: "r1", task_id: "t1", status: "finished", final_result, blocked_reason: null, queued_at: "2026-11-24T00:00:00Z" });
+  const run = (final_result: "passed" | "failed" | "uncertain" | "blocked" | null) => ({ run_id: "r1", task_id: "t1", status: "finished", final_result, blocked_reason: null, skip_reason: null, queued_at: "2026-11-24T00:00:00Z" });
   render(<ModuleResults cases={[kase("T-1", { latest_run: run("passed") }), kase("T-2", { latest_run: run("failed") }), kase("T-3"), kase("T-4", { latest_run: run(null) })]} />);
   expect(screen.getByText("通过 1")).toBeInTheDocument();
   expect(screen.getByText("失败 1")).toBeInTheDocument();
   expect(screen.getByText("未执行 1")).toBeInTheDocument();
   expect(screen.getByText("进行中 1")).toBeInTheDocument();
   expect(screen.getAllByRole("link", { name: "查看" }).length).toBe(3);
+});
+
+test("测试结果：条件不足跳过的单独一类「已跳过」，写出原因，不算受阻也不算通过", () => {
+  const skippedRun = { run_id: "r9", task_id: "t1", status: "blocked", final_result: "blocked" as const, blocked_reason: "skipped", skip_reason: "这条用例是 H5 页面，平台还没有 H5 执行器，已跳过", queued_at: "2026-11-24T00:00:00Z" };
+  const blockedRun = { ...skippedRun, run_id: "r8", blocked_reason: "link", skip_reason: null };
+  render(<ModuleResults cases={[kase("H5-1", { run_env: "h5", latest_run: skippedRun }), kase("B-1", { latest_run: blockedRun })]} />);
+  expect(screen.getByText("已跳过 1")).toBeInTheDocument();
+  expect(screen.getByText("受阻 1")).toBeInTheDocument();
+  expect(screen.getByText("通过 0")).toBeInTheDocument();
+  expect(screen.getByText(/平台还没有 H5 执行器，已跳过/)).toBeInTheDocument();
 });

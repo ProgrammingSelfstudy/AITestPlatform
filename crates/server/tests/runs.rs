@@ -542,3 +542,52 @@ async fn 宽限期过期统一收尾() {
     let r = sqlx::query("select status, blocked_reason from runs where id = $1").bind(t.run_ids[0]).fetch_one(w.st.pool()).await.unwrap();
     assert_eq!((r.get::<String, _>("status"), r.get::<Option<String>, _>("blocked_reason")), ("blocked".into(), Some("node_lost".into())));
 }
+
+#[tokio::test]
+async fn 创建任务_条件不足的用例直接跳过_不派发_不占设备_也不算通过() {
+    let w = world(1).await;
+    let mut h5 = nc("H5", 1, "打开链接");
+    h5.platforms = vec!["h5".into()];
+    let mut web = nc("WEB", 1, "打开网页");
+    web.platforms = vec!["browser".into()];
+    let mut ios = nc("IOS", 1, "iOS 步骤");
+    ios.platforms = vec!["ios".into()];
+    import(w.st.pool(), "p", &[h5, web, ios], &BTreeMap::new()).await.unwrap();
+
+    let t = task(&w, &["A", "H5", "WEB", "IOS"]).await;
+    assert_eq!(t.run_ids.len(), 4, "跳过的也要有记录，页面才能显示原因");
+    let skipped: Vec<(&str, &str)> = t.skipped.iter().map(|s| (s.code.as_str(), s.reason.as_str())).collect();
+    assert_eq!(skipped.iter().map(|(c, _)| *c).collect::<Vec<_>>(), ["H5", "WEB", "IOS"]);
+    assert!(skipped[0].1.contains("H5 执行器"), "{skipped:?}");
+    assert!(skipped[1].1.contains("浏览器执行器"), "{skipped:?}");
+    assert!(skipped[2].1.contains("iOS 设备"), "节点上只有安卓设备：{skipped:?}");
+
+    // 正常的 app 用例照常排队；跳过的是已结束的 blocked，原因 skipped，没有设备，不算通过
+    assert_eq!(status_of(&w.st, t.run_ids[0]).await, "queued");
+    for run in &t.run_ids[1..] {
+        let r = sqlx::query("select status, final_result, blocked_reason, device_id, finished_at, executor_reason from runs where id = $1").bind(run).fetch_one(w.st.pool()).await.unwrap();
+        assert_eq!(r.get::<String, _>("status"), "blocked");
+        assert_eq!(r.get::<Option<String>, _>("final_result").as_deref(), Some("blocked"), "不是 passed");
+        assert_eq!(r.get::<Option<String>, _>("blocked_reason").as_deref(), Some("skipped"));
+        assert!(r.get::<Option<Uuid>, _>("device_id").is_none() && r.get::<Option<chrono::DateTime<chrono::Utc>>, _>("finished_at").is_some());
+        assert!(r.get::<Option<String>, _>("executor_reason").is_some_and(|x| x.contains("已跳过")));
+    }
+    // 节点只会领到正常的那一条；之后没有可领的了，设备也没被跳过的占着
+    let claimed = runs::claim_next(w.st.pool(), w.node).await.unwrap().unwrap();
+    assert_eq!(claimed.run_id, t.run_ids[0]);
+    assert!(runs::claim_next(w.st.pool(), w.node).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn 创建任务_节点上一台设备都没登记过_app_用例跳过() {
+    let w = world(0).await;
+    let t = task(&w, &["A", "B"]).await;
+    assert_eq!(t.skipped.len(), 2);
+    assert!(t.skipped[0].reason.contains("还没有登记过这样的设备"), "{:?}", t.skipped);
+    // 设备只是离线 / 忙着：登记过就不算缺，照常排队
+    let w = world(1).await;
+    sqlx::query("update devices set status = 'offline' where node_id = $1").bind(w.node).execute(w.st.pool()).await.unwrap();
+    let t = task(&w, &["A"]).await;
+    assert!(t.skipped.is_empty());
+    assert_eq!(status_of(&w.st, t.run_ids[0]).await, "queued");
+}

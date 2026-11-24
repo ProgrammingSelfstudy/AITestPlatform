@@ -93,8 +93,8 @@ test("复核：批准评审员有疑问的用例必须写备注，没写不发�
 
 test("测试中的模块切到指挥台布局，复核功能仍在", async () => {
   serve(mod({ active_runs: 1, approved_count: 2, case_count: 2, needs_human_count: 0 }), [
-    kase("GEN-1", "approved", "", { latest_run: { run_id: "r1", task_id: "t1", status: "running", final_result: null, blocked_reason: null, queued_at: "2026-11-23T00:00:00Z" } }),
-    kase("GEN-2", "approved", "", { latest_run: { run_id: "r2", task_id: "t1", status: "finished", final_result: "failed", blocked_reason: null, queued_at: "2026-11-23T00:00:00Z" } }),
+    kase("GEN-1", "approved", "", { latest_run: { run_id: "r1", task_id: "t1", status: "running", final_result: null, blocked_reason: null, skip_reason: null, queued_at: "2026-11-23T00:00:00Z" } }),
+    kase("GEN-2", "approved", "", { latest_run: { run_id: "r2", task_id: "t1", status: "finished", final_result: "failed", blocked_reason: null, skip_reason: null, queued_at: "2026-11-23T00:00:00Z" } }),
   ]);
   render(<ModuleDetailPage id={MOD} />);
   expect(await screen.findByText("测试指挥台")).toBeInTheDocument();

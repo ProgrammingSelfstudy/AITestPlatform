@@ -834,6 +834,8 @@ pub struct LatestRun {
     pub status: String,
     pub final_result: Option<String>,
     pub blocked_reason: Option<String>,
+    /// 条件不足被跳过时的具体原因（`blocked_reason` 是 `skipped` 才有）
+    pub skip_reason: Option<String>,
     pub queued_at: DateTime<Utc>,
 }
 
@@ -844,7 +846,7 @@ pub async fn module_cases(pool: &PgPool, module_id: Uuid) -> Res<Vec<ModuleCase>
     }
     let rows = sqlx::query(
         "select c.code, c.title, c.level, c.platforms, c.preconditions, c.origin, c.review_status, c.review_note, c.steps, c.expected,
-                r.id as run_id, r.task_id, r.status as run_status, r.final_result, r.blocked_reason, r.queued_at
+                r.id as run_id, r.task_id, r.status as run_status, r.final_result, r.blocked_reason, r.executor_reason, r.queued_at
          from test_cases c
          left join lateral (select * from runs x where x.case_id = c.id order by x.seq desc limit 1) r on true
          where c.module_id = $1 order by c.code",
@@ -872,6 +874,7 @@ pub async fn module_cases(pool: &PgPool, module_id: Uuid) -> Res<Vec<ModuleCase>
                 status: r.get("run_status"),
                 final_result: r.get("final_result"),
                 blocked_reason: r.get("blocked_reason"),
+                skip_reason: r.get::<Option<String>, _>("blocked_reason").filter(|b| b == "skipped").and_then(|_| r.get("executor_reason")),
                 queued_at: r.get("queued_at"),
             }),
         })

@@ -246,7 +246,10 @@ fn review_text(status: &str) -> &'static str {
     }
 }
 
-fn result_text(final_result: Option<&str>, has_run: bool) -> String {
+fn result_text(final_result: Option<&str>, blocked_reason: Option<&str>, has_run: bool) -> String {
+    if blocked_reason == Some("skipped") {
+        return "已跳过".into();
+    }
     match (final_result, has_run) {
         (Some("passed"), _) => "通过".into(),
         (Some("failed"), _) => "失败".into(),
@@ -433,7 +436,7 @@ pub(crate) async fn api_cases_csv(State(state): State<ApiState>, Path(id): Path<
     require_module(pool, module).await?;
     let rows = sqlx::query(
         "select c.code, c.title, c.level, c.platforms, c.preconditions, c.steps, c.expected, c.review_status,
-                r.id as run_id, r.final_result
+                r.id as run_id, r.final_result, r.blocked_reason
          from test_cases c
          left join lateral (select * from runs x where x.case_id = c.id order by x.seq desc limit 1) r on true
          where c.module_id = $1 order by c.code",
@@ -459,7 +462,7 @@ pub(crate) async fn api_cases_csv(State(state): State<ApiState>, Path(id): Path<
             strings(r.get("steps")).join("\n"),
             expected.join("\n"),
             review_text(&r.get::<String, _>("review_status")).to_string(),
-            result_text(final_result.as_deref(), r.get::<Option<Uuid>, _>("run_id").is_some()),
+            result_text(final_result.as_deref(), r.get::<Option<String>, _>("blocked_reason").as_deref(), r.get::<Option<Uuid>, _>("run_id").is_some()),
         ];
         out.push_str(&csv_line(&line));
         out.push_str("\r\n");

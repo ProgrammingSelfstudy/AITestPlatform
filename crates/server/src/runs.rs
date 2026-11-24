@@ -135,7 +135,35 @@ pub struct NewTask {
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct TaskCreated {
     pub task_id: Uuid,
+    /// 包含已跳过的 run（它们一创建就是结束状态）
     pub run_ids: Vec<Uuid>,
+    /// 条件不足、没有派发的用例和原因
+    pub skipped: Vec<SkippedCase>,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct SkippedCase {
+    pub code: String,
+    pub reason: String,
+}
+
+/// 条件不足就不跑：返回跳过的原因（中文，直接给人看）。`platforms` 是用例的运行平台，`node_platforms` 是这个节点上登记过的设备平台。
+/// - 运行环境是 h5 / 浏览器：平台还没有这两种执行器，一律跳过；
+/// - 运行环境是 app：节点上一台对应平台的设备都没登记过，跳过（设备只是暂时离线、忙着的不算，会排队等）。
+pub(crate) fn skip_reason(platforms: &[String], node_platforms: &[String]) -> Option<String> {
+    match crate::modules::assets::run_env_of(platforms) {
+        "browser" => return Some("这条用例要在浏览器里跑，平台还没有浏览器执行器，已跳过".into()),
+        "h5" => return Some("这条用例是 H5 页面，平台还没有 H5 执行器，已跳过".into()),
+        _ => {}
+    }
+    let wanted: Vec<String> = platforms.iter().map(|p| p.to_lowercase()).filter(|p| p == "android" || p == "ios").collect();
+    let usable = |p: &str| node_platforms.iter().any(|n| n.eq_ignore_ascii_case(p));
+    let ok = if wanted.is_empty() { !node_platforms.is_empty() } else { wanted.iter().any(|p| usable(p)) };
+    if ok {
+        return None;
+    }
+    let need = if wanted.is_empty() { "手机".to_string() } else { wanted.iter().map(|p| if p == "ios" { "iOS" } else { "Android" }).collect::<Vec<_>>().join(" / ") };
+    Some(format!("这条用例要在 {need} 设备上跑，这个节点上还没有登记过这样的设备，已跳过"))
 }
 
 /// 创建任务：每个用例一个 run（排队），并把用例内容快照进 run。
@@ -165,8 +193,11 @@ pub async fn create_task(pool: &PgPool, t: &NewTask) -> Res<TaskCreated> {
         .await?;
     let mut run_ids = vec![];
     let mut problems = vec![];
+    let mut skipped = vec![];
+    // 这个节点上登记过的设备平台（不管现在在线还是忙）：判断用例要的设备有没有
+    let node_platforms: Vec<String> = sqlx::query_scalar("select distinct platform from devices where node_id = $1").bind(t.node_id).fetch_all(&mut *tx).await?;
     for code in &t.case_codes {
-        let Some(r) = sqlx::query("select id, status, blocked_reason, version, review_status from test_cases where project_id = $1 and code = $2").bind(project_id).bind(code).fetch_optional(&mut *tx).await? else {
+        let Some(r) = sqlx::query("select id, status, blocked_reason, version, review_status, platforms from test_cases where project_id = $1 and code = $2").bind(project_id).bind(code).fetch_optional(&mut *tx).await? else {
             problems.push(format!("{code} 不存在"));
             continue;
         };
@@ -184,6 +215,24 @@ pub async fn create_task(pool: &PgPool, t: &NewTask) -> Res<TaskCreated> {
         }
         let case_id: Uuid = r.get("id");
         let (spec, version) = crate::cases::spec_by_id(&mut tx, case_id).await?;
+        // 条件不足：不派发，记一条已结束的「已跳过」run，原因写清楚
+        if let Some(reason) = skip_reason(&r.get::<Vec<String>, _>("platforms"), &node_platforms) {
+            let id: Uuid = sqlx::query_scalar(
+                "insert into runs (task_id, case_id, case_version, case_spec, node_id, status, final_result, blocked_reason, executor_reason, finished_at)
+                 values ($1,$2,$3,$4,$5,'blocked','blocked','skipped',$6,now()) returning id",
+            )
+            .bind(task_id)
+            .bind(case_id)
+            .bind(version)
+            .bind(serde_json::to_value(&spec).expect("可序列化"))
+            .bind(t.node_id)
+            .bind(&reason)
+            .fetch_one(&mut *tx)
+            .await?;
+            run_ids.push(id);
+            skipped.push(SkippedCase { code: code.clone(), reason });
+            continue;
+        }
         let id: Uuid = sqlx::query_scalar("insert into runs (task_id, case_id, case_version, case_spec, node_id) values ($1,$2,$3,$4,$5) returning id")
             .bind(task_id)
             .bind(case_id)
@@ -199,7 +248,26 @@ pub async fn create_task(pool: &PgPool, t: &NewTask) -> Res<TaskCreated> {
         return Err(RunError::Invalid(format!("不能创建任务：{}", problems.join("；"))));
     }
     tx.commit().await?;
-    Ok(TaskCreated { task_id, run_ids })
+    Ok(TaskCreated { task_id, run_ids, skipped })
+}
+
+/// 用例要用测试账号，但平台没有配置账号池：这些 run 永远领不到账号，与其一直排队不如直接跳过并说清楚。
+/// 只在页面 / 管理员建任务的入口调用（命令行和测试里建任务的行为不变）。返回新跳过的用例。
+pub async fn skip_account_runs(pool: &PgPool, task_id: Uuid) -> Res<Vec<SkippedCase>> {
+    if AccountPool::configured().is_some() {
+        return Ok(vec![]);
+    }
+    let reason = "这条用例要用测试账号，但平台还没有配置账号池，已跳过";
+    let rows = sqlx::query(
+        "update runs set status = 'blocked', final_result = 'blocked', blocked_reason = 'skipped', executor_reason = $2, finished_at = now()
+         where task_id = $1 and status = 'queued' and strpos(case_spec::text, '{{account.') > 0
+         returning (case_spec->>'code') as code",
+    )
+    .bind(task_id)
+    .bind(reason)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.iter().map(|r| SkippedCase { code: r.get::<Option<String>, _>("code").unwrap_or_default(), reason: reason.into() }).collect())
 }
 
 // ---------------------------------------------------------------- 领任务

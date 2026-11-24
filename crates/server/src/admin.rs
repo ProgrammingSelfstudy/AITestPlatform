@@ -425,6 +425,7 @@ async fn execute(state: &ApiState, user: Uuid, node: Uuid, p: &AdminProposal) ->
             let (executor, judge) = default_task_roles(state, node)?;
             let codes: Vec<String> = args.get("case_codes").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect()).unwrap_or_default();
             let created = runs::create_task(pool, &NewTask { project: PROJECT.into(), node_id: node, case_codes: codes.clone(), executor, judge }).await.map_err(|e| e.to_string())?;
+            runs::skip_account_runs(pool, created.task_id).await.map_err(|e| e.to_string())?;
             Ok((format!("已用你的节点发起测试：{} 条用例，任务 {}", created.run_ids.len(), &created.task_id.to_string()[..8]), serde_json::json!({ "task_id": created.task_id })))
         }
         other => Err(format!("不认识的提议类型 {other}")),

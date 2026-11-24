@@ -725,9 +725,11 @@ async fn create_task(
             effort: None,
         },
     };
-    let created = runs::create_task(state.app.pool(), &task)
+    let mut created = runs::create_task(state.app.pool(), &task)
         .await
         .map_err(|e| run_error(e, "创建任务失败"))?;
+    let no_account = runs::skip_account_runs(state.app.pool(), created.task_id).await.map_err(|e| run_error(e, "创建任务失败"))?;
+    created.skipped.extend(no_account);
     Ok((StatusCode::CREATED, Json(created)))
 }
 

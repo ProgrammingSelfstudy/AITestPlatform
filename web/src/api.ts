@@ -34,7 +34,7 @@ export type RunStatus = "queued" | "assigned" | "running" | "judging" | "finishe
 export type Verdict = "passed" | "failed" | "uncertain";
 export type FinalResult = Verdict | "blocked";
 export type JudgeStatus = "completed" | "failed" | "not_run";
-export type BlockedReason = "setup" | "link" | "node_lost" | "stuck" | "quota" | "other";
+export type BlockedReason = "setup" | "link" | "node_lost" | "stuck" | "quota" | "other" | "skipped";
 
 interface RoleModel {
   source: ModelSourceCap["source"];
@@ -188,6 +188,8 @@ export interface LatestRun {
   status: string;
   final_result: "passed" | "failed" | "uncertain" | "blocked" | null;
   blocked_reason: string | null;
+  /** 条件不足被跳过时的具体原因（blocked_reason 是 skipped 才有） */
+  skip_reason: string | null;
   queued_at: string;
 }
 
@@ -402,7 +404,7 @@ export const fetchCases = (project: string, signal?: AbortSignal) =>
   get<CaseSummary[]>(`/api/projects/${encodeURIComponent(project)}/cases`, signal);
 
 /** `userName` 是发起人的名字（只记名字、靠自觉）。服务端据此确认所选节点是他的：数据大家都能跑，但只能用自己的节点、花自己的额度。 */
-export async function createTask(task: NewTask, token: string, userName: string): Promise<{ task_id: string; run_ids: string[] }> {
+export async function createTask(task: NewTask, token: string, userName: string): Promise<{ task_id: string; run_ids: string[]; skipped: { code: string; reason: string }[] }> {
   const response = await post("/api/tasks", task, token, userHeaders(userName));
   return response.json();
 }
