@@ -5,6 +5,7 @@ import FlowTemplateEditor from "./FlowTemplateEditor";
 import { NEED_ADMIN_HINT, StatusTag } from "./ConfigsPage";
 import { createConfigItem, deleteConfigItem, describeFlowRoles, fetchConfigDetail, parseFlowRoles, updateConfigItem, type ConfigItem, type ConfigItemInput, type ConfigTypeDetail } from "./api";
 import { useRememberedUserName } from "./identity";
+import { useUnsavedWarning } from "./unsavedWarning";
 
 interface ItemForm {
   name: string;
@@ -22,10 +23,14 @@ function ItemDrawer({ typeCode, editing, open, onClose, onSubmit }: { typeCode: 
   const [form] = Form.useForm<ItemForm>();
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [touched, setTouched] = useState(false);
+  // 抽屉开着、改过还没保存：刷新或关页面前先问一声
+  useUnsavedWarning(open && touched);
 
   useEffect(() => {
     if (!open) return;
     setError(null);
+    setTouched(false);
     form.resetFields();
     form.setFieldsValue(
       editing
@@ -50,6 +55,7 @@ function ItemDrawer({ typeCode, editing, open, onClose, onSubmit }: { typeCode: 
         remark: values.remark?.trim() ?? "",
         status: values.enabled ? "normal" : "disabled",
       });
+      setTouched(false);
     } catch (e) {
       setError(e instanceof Error ? e.message : "保存失败");
     } finally {
@@ -67,7 +73,7 @@ function ItemDrawer({ typeCode, editing, open, onClose, onSubmit }: { typeCode: 
       extra={<Button type="primary" loading={saving} onClick={() => void submit()}>保存</Button>}
     >
       {error && <Alert type="error" showIcon title={error} style={{ marginBottom: 16 }} />}
-      <Form form={form} name="config_item" layout="vertical">
+      <Form form={form} name="config_item" layout="vertical" onValuesChange={() => setTouched(true)}>
         <Form.Item name="name" label="名称" rules={[{ required: true, whitespace: true, message: "请填写名称" }, { max: 50, message: "名称不超过 50 个字" }]}>
           <Input />
         </Form.Item>

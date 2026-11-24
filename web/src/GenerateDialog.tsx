@@ -21,6 +21,8 @@ import { REFRESH_MS, usePolling } from "./usePolling";
 import IdentityHint from "./IdentityHint";
 import { fetchFlowTemplates, type FlowTemplate } from "./api";
 import { NEED_LOGIN_MESSAGE, useRememberedUserName } from "./identity";
+import { clearDraft, loadDraft, saveDraft } from "./draftStore";
+import { useUnsavedWarning } from "./unsavedWarning";
 import "./modules.css";
 
 const project = "hafa";
@@ -43,6 +45,17 @@ const CHECK_STATUS_META: Record<CheckStatus, { text: string; tone: Tone; ok: boo
   quota_exhausted: { text: "额度用完", tone: "lost", ok: false },
   failed: { text: "检测失败", tone: "fail", ok: false },
 };
+
+const DRAFT_KEY = "generate-casegen";
+
+/** 暂存在浏览器里的草稿：文字 + 截图（previewUrl 是 data URL，图片内容就在里面）。不含节点、角色、「我是谁」，那些重新选。 */
+interface GenerateDraft {
+  v: 1;
+  moduleName: string;
+  doc: string;
+  links: string[];
+  shots: { id: string; name: string; size: number; previewUrl: string }[];
+}
 
 interface ScreenshotItem {
   id: string;
@@ -180,6 +193,61 @@ export default function GenerateDialog({ onClose, initialModule }: { onClose: ()
   const [dragOver, setDragOver] = useState(false);
 
   const [nodeId, setNodeId] = useState("");
+
+  // 草稿暂存（浏览器里，文字和截图都存）：刷新、热更新、误关页面后还在；提交成功才清掉
+  const [draftReady, setDraftReady] = useState(false);
+  const [restoredAt, setRestoredAt] = useState<number | null>(null);
+  const submittedRef = useRef(false);
+  const hasContent = Boolean(moduleName.trim() || doc.trim() || links.some((l) => l.trim()) || screenshots.length > 0);
+  useUnsavedWarning(hasContent && !submittedRef.current);
+  useEffect(() => {
+    let cancelled = false;
+    void loadDraft<GenerateDraft>(DRAFT_KEY).then((saved) => {
+      if (cancelled) return;
+      const d = saved?.value;
+      if (saved && d && d.v === 1 && (d.moduleName || d.doc || d.links.some((l) => l.trim()) || d.shots.length > 0)) {
+        // 从管理员的提议进来时，模块名以提议为准
+        if (!initialModule) setModuleName(d.moduleName);
+        setDoc(d.doc);
+        setLinks(d.links.length > 0 ? d.links : [""]);
+        setScreenshots(d.shots.map((s) => ({ id: s.id, name: s.name, size: s.size, previewUrl: s.previewUrl, data_b64: stripDataUrlPrefix(s.previewUrl) })));
+        screenshotIdSeq.current = Math.max(screenshotIdSeq.current, ...d.shots.map((s) => Number(s.id.replace(/\D/g, "")) || 0));
+        screenshotsCountRef.current = d.shots.length;
+        setRestoredAt(saved.savedAt);
+      }
+      setDraftReady(true);
+    });
+    return () => { cancelled = true; };
+    // 只在打开时读一次
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+  useEffect(() => {
+    if (!draftReady || submittedRef.current) return;
+    const timer = window.setTimeout(() => {
+      if (!hasContent) {
+        void clearDraft(DRAFT_KEY);
+        return;
+      }
+      void saveDraft<GenerateDraft>(DRAFT_KEY, {
+        v: 1,
+        moduleName,
+        doc,
+        links,
+        shots: screenshots.map((s) => ({ id: s.id, name: s.name, size: s.size, previewUrl: s.previewUrl })),
+      });
+    }, 600);
+    return () => window.clearTimeout(timer);
+  }, [draftReady, hasContent, moduleName, doc, links, screenshots]);
+
+  function discardDraft() {
+    setModuleName(initialModule ?? "");
+    setDoc("");
+    setLinks([""]);
+    setScreenshots([]);
+    screenshotsCountRef.current = 0;
+    setRestoredAt(null);
+    void clearDraft(DRAFT_KEY);
+  }
   const { name: userName, setName: setUserName, expiresAt: nameExpiresAt, forget: forgetName } = useRememberedUserName();
   const trimmedName = userName.trim();
 
@@ -525,14 +593,8 @@ export default function GenerateDialog({ onClose, initialModule }: { onClose: ()
       for (let i = 0; i < links.length; i += 1) {
         const raw = links[i];
         const trimmed = raw.trim();
-        if (!trimmed) {
-          if (links.length === 1) {
-            nextErrors.links = "请至少填写 1 个 UI 图链接";
-          } else {
-            nextErrors.links = `第 ${i + 1} 行 UI 图链接为空，请填写或删除该行`;
-          }
-          break;
-        }
+        // UI 图链接不是必填：空行直接忽略，只检查填了的
+        if (!trimmed) continue;
         if (/\s/.test(trimmed)) {
           nextErrors.links = `第 ${i + 1} 个 UI 图链接不能包含空格`;
           break;
@@ -542,9 +604,6 @@ export default function GenerateDialog({ onClose, initialModule }: { onClose: ()
           break;
         }
         cleanedLinks.push(trimmed);
-      }
-      if (!nextErrors.links && cleanedLinks.length === 0) {
-        nextErrors.links = "请至少填写 1 个 UI 图链接";
       }
     }
 
@@ -615,6 +674,8 @@ export default function GenerateDialog({ onClose, initialModule }: { onClose: ()
     setSubmitting(true);
     try {
       const result = await createCasegenRequest(project, input, token, trimmedName);
+      submittedRef.current = true;
+      await clearDraft(DRAFT_KEY);
       window.location.hash = `#/modules/${encodeURIComponent(result.module_id)}`;
       onClose();
     } catch (err) {
@@ -689,6 +750,16 @@ export default function GenerateDialog({ onClose, initialModule }: { onClose: ()
       onCancel={onClose}
     >
       <div className="mod-gen-form">
+        {restoredAt !== null && (
+          <Alert
+            type="info"
+            showIcon
+            closable
+            onClose={() => setRestoredAt(null)}
+            title={`已恢复上次没提交的草稿（保存于 ${new Date(restoredAt).toLocaleString("zh-CN", { hour12: false })}，只存在这个浏览器里，包括截图）`}
+            action={<Button size="small" onClick={discardDraft}>清除草稿</Button>}
+          />
+        )}
         {nodesError && <LoadError title="无法加载节点列表" error={nodesError} interval={REFRESH_MS} />}
         {submitError && (
           <Alert
@@ -769,7 +840,7 @@ export default function GenerateDialog({ onClose, initialModule }: { onClose: ()
         {/* 3. UI 图链接 */}
         <div className="mod-field">
           <div className="mod-field-head">
-            <RequiredLabel text="UI 图链接" />
+            <span className="mod-field-label">UI 图链接（选填）</span>
             <div className="mod-field-meta">
               <span className="mod-mono">
                 {links.length} / {MAX_LINKS} 个

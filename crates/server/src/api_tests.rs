@@ -621,7 +621,6 @@ async fn 模块和生成请求_必填校验_去重_只能用自己的节点() {
     for (key, value, expect) in [
         ("module", json!(""), "模块必填"),
         ("doc", json!(""), "需求文档必填"),
-        ("ui_links", json!([]), "UI 图链接必填"),
         ("screenshots", json!([]), "UI 区域截图必填"),
         ("ui_links", json!(["javascript:alert(1)"]), "http"),
         ("doc", json!("密码：hunter2"), "明文密码"),
@@ -2944,4 +2943,18 @@ async fn 模块详情_ui图增删_用例csv往返_录屏列表() {
     assert_eq!((status, json_body(&bytes)), (StatusCode::OK, json!([])));
     let (status, _, _) = request(&world.app, Method::GET, &format!("/api/modules/{}/recordings", Uuid::new_v4()), &[], "").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+
+#[tokio::test]
+async fn 生成用例_ui图链接不是必填_不带链接也能创建() {
+    let world = World::new().await;
+    let mut body = casegen_body(world.node, "无链接模块");
+    body["ui_links"] = json!([]);
+    let (status, _, bytes) = browser_post(&world.app, "/api/projects/hafa/casegen-requests", body).await;
+    assert_eq!(status, StatusCode::CREATED, "{}", text(&bytes));
+    let id = json_body(&bytes)["request_id"].as_str().unwrap().to_string();
+    let (_, _, bytes) = request(&world.app, Method::GET, &format!("/api/casegen-requests/{id}"), &[], "").await;
+    assert_eq!(json_body(&bytes)["ui_links"], json!([]));
+    assert_eq!(json_body(&bytes)["screenshot_count"], 1, "截图仍然必填，这里带了一张");
 }

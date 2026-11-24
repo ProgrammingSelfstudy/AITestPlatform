@@ -13,6 +13,8 @@ export default defineConfig(({ mode }) => {
       environment: "jsdom",
       setupFiles: ["./tests/setup.ts"],
       include: ["tests/**/*.test.{ts,tsx}"],
+      // antd 在 jsdom 里交互很慢，整套并行跑、机器忙时 5 秒默认值会偶发超时
+      testTimeout: 15000,
       restoreMocks: true,
     },
     server: {

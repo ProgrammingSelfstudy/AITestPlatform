@@ -5,6 +5,7 @@ import { createConfigType, deleteConfigType, fetchConfigTypes, updateConfigType,
 import ConfigImportDialog from "./ConfigImportDialog";
 import { useRememberedUserName } from "./identity";
 import { formatDate } from "./runUi";
+import { useUnsavedWarning } from "./unsavedWarning";
 
 export const NEED_ADMIN_HINT = "只有管理员能改：先在「我是谁」里用管理员名字登录";
 
@@ -24,10 +25,14 @@ function TypeDrawer({ editing, open, onClose, onSubmit }: { editing: ConfigType 
   const [form] = Form.useForm<TypeForm>();
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [touched, setTouched] = useState(false);
+  // 抽屉开着、改过还没保存：刷新或关页面前先问一声
+  useUnsavedWarning(open && touched);
 
   useEffect(() => {
     if (!open) return;
     setError(null);
+    setTouched(false);
     form.resetFields();
     form.setFieldsValue(editing ? { name: editing.name, code: editing.code, remark: editing.remark, enabled: editing.status === "normal" } : { enabled: true });
   }, [open, editing, form]);
@@ -39,6 +44,7 @@ function TypeDrawer({ editing, open, onClose, onSubmit }: { editing: ConfigType 
     setError(null);
     try {
       await onSubmit({ name: values.name.trim(), code: values.code?.trim(), remark: values.remark?.trim() ?? "", status: values.enabled ? "normal" : "disabled" });
+      setTouched(false);
     } catch (e) {
       setError(e instanceof Error ? e.message : "保存失败");
     } finally {
@@ -56,7 +62,7 @@ function TypeDrawer({ editing, open, onClose, onSubmit }: { editing: ConfigType 
       extra={<Button type="primary" loading={saving} onClick={() => void submit()}>保存</Button>}
     >
       {error && <Alert type="error" showIcon title={error} style={{ marginBottom: 16 }} />}
-      <Form form={form} name="config_type" layout="vertical">
+      <Form form={form} name="config_type" layout="vertical" onValuesChange={() => setTouched(true)}>
         <Form.Item name="name" label="名称" rules={[{ required: true, whitespace: true, message: "请填写名称" }, { max: 50, message: "名称不超过 50 个字" }]}>
           <Input />
         </Form.Item>

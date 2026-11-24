@@ -48,10 +48,13 @@ test("创建任务：必填项缺哪项提示哪项，缺项时不发请求", as
   const user = userEvent.setup();
   render(<GenerateDialog onClose={() => {}} />);
   await user.click(await screen.findByRole("button", { name: /提交生成任务/ }));
-  for (const message of [/请填写或上传需求文档/, /请至少填写 1 个 UI 图链接/, /请至少上传 1 张 UI 区域截图/, /请填「我是谁」/]) {
+  for (const message of [/请填写或上传需求文档/, /请至少上传 1 张 UI 区域截图/, /请填「我是谁」/]) {
     expect((await screen.findAllByText(message)).length, String(message)).toBeGreaterThan(0);
   }
   expect(posts()).toHaveLength(0);
+  // UI 图链接是选填，不填不报错
+  expect(screen.queryByText(/请至少填写 1 个 UI 图链接/)).not.toBeInTheDocument();
+  expect(screen.getByText("UI 图链接（选填）")).toBeInTheDocument();
   // 链接不会被打开、文档和截图会外发，都要明确告诉用户
   expect(screen.getAllByText(/AI 不会打开它/).length).toBeGreaterThan(0);
   expect(screen.getAllByText(/发给你所选角色的模型来源/).length).toBeGreaterThan(0);

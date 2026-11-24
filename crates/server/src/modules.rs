@@ -175,9 +175,7 @@ pub struct Validated {
 pub fn validate(input: &CasegenInput) -> Res<Validated> {
     let module = check_module_name(&input.module).map_err(|_| ModuleError::Invalid("模块必填：请选择或新建一个模块（名称不超过 80 个字）".into()))?;
     let doc = check_doc(&input.doc)?;
-    if input.ui_links.is_empty() {
-        return invalid("UI 图链接必填：请至少填一个设计图链接");
-    }
+    // UI 图链接不是必填（可以一个都不填）；填了才检查个数和格式
     if input.ui_links.len() > MAX_LINKS {
         return invalid(format!("UI 图链接最多 {MAX_LINKS} 个"));
     }
@@ -1014,9 +1012,13 @@ mod tests {
         let mut i = input();
         i.doc = "  \n ".into();
         assert!(message(&i).contains("需求文档必填"));
+        // UI 图链接不是必填：一个都不填也能通过校验；填多了、格式不对才拒绝
         let mut i = input();
         i.ui_links.clear();
-        assert!(message(&i).contains("UI 图链接必填"));
+        assert!(validate(&i).is_ok(), "不填 UI 图链接应通过");
+        let mut i = input();
+        i.ui_links = (0..=MAX_LINKS).map(|n| format!("https://example.com/{n}")).collect();
+        assert!(message(&i).contains("最多"));
         let mut i = input();
         i.screenshots.clear();
         assert!(message(&i).contains("UI 区域截图必填"));

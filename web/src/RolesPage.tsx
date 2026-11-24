@@ -21,6 +21,7 @@ import {
   type RoleView,
 } from "./api";
 import { readReviewToken, rememberReviewToken, writeTokenAction } from "./reviewLogic";
+import { useUnsavedWarning } from "./unsavedWarning";
 import AppsPanel, { type AppRoleDraft } from "./AppsPanel";
 import IdentityHint from "./IdentityHint";
 import { NEED_LOGIN_MESSAGE, useRememberedUserName } from "./identity";
@@ -598,6 +599,8 @@ export default function RolesPage() {
   }, [serverRoles]);
 
   const dirtyCount = Object.keys(draftsById).length + draftNewRoles.filter((draftRole) => !draftsById[draftRole.id]).length;
+  // 有没保存的角色（API Key 也可能在里面，所以只提醒，不暂存到浏览器）：刷新或关页面前先问一声
+  useUnsavedWarning(dirtyCount > 0);
 
   // ---------------------------------------------------------------- 表单联动与草稿维护
 

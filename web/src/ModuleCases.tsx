@@ -3,6 +3,7 @@ import type { TableColumnsType } from "antd";
 import { useState } from "react";
 import { importModuleCases, moduleCasesCsvUrl, type LatestRun, type ModuleCase, type ReviewStatus } from "./api";
 import { useGuardedWrite } from "./useGuardedWrite";
+import { useUnsavedWarning } from "./unsavedWarning";
 
 export const RUN_ENV_META: Record<ModuleCase["run_env"], { text: string; color: string }> = {
   app: { text: "App", color: "blue" },
@@ -47,6 +48,8 @@ function ImportDialog({ moduleId, userName, open, onClose, onDone }: { moduleId:
   const [text, setText] = useState("");
   const [result, setResult] = useState<string | null>(null);
   const write = useGuardedWrite(userName);
+  // 贴了内容还没导入：刷新或关页面前先问一声
+  useUnsavedWarning(open && text.trim() !== "" && !result);
 
   function close() {
     setText("");

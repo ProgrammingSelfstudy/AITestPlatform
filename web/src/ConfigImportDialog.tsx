@@ -1,6 +1,7 @@
 import { Alert, Button, Input, Modal, Radio, Upload } from "antd";
 import { useState } from "react";
 import { fetchConfigExport, importConfigs, type ConfigDocument, type ImportResult } from "./api";
+import { useUnsavedWarning } from "./unsavedWarning";
 
 const MAX_FILE_BYTES = 2 * 1024 * 1024;
 
@@ -24,6 +25,8 @@ export default function ConfigImportDialog({ open, userName, onClose, onDone }: 
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<ImportResult | null>(null);
+  // 贴了内容还没导入：刷新或关页面前先问一声
+  useUnsavedWarning(open && text.trim() !== "" && !result);
 
   function close() {
     setText("");
