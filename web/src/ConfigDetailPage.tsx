@@ -1,8 +1,9 @@
 import { Alert, Button, Drawer, Form, Input, InputNumber, Popconfirm, Switch, Table, Tooltip } from "antd";
 import type { TableColumnsType } from "antd";
 import { useEffect, useState } from "react";
+import FlowTemplateEditor from "./FlowTemplateEditor";
 import { NEED_ADMIN_HINT, StatusTag } from "./ConfigsPage";
-import { createConfigItem, deleteConfigItem, fetchConfigDetail, updateConfigItem, type ConfigItem, type ConfigItemInput, type ConfigTypeDetail } from "./api";
+import { createConfigItem, deleteConfigItem, describeFlowRoles, fetchConfigDetail, parseFlowRoles, updateConfigItem, type ConfigItem, type ConfigItemInput, type ConfigTypeDetail } from "./api";
 import { useRememberedUserName } from "./identity";
 
 interface ItemForm {
@@ -17,7 +18,7 @@ interface ItemForm {
 }
 
 /** 配置项的新增和修改：修改时编码只读 */
-function ItemDrawer({ editing, open, onClose, onSubmit }: { editing: ConfigItem | null; open: boolean; onClose: () => void; onSubmit: (input: ConfigItemInput) => Promise<void> }) {
+function ItemDrawer({ typeCode, editing, open, onClose, onSubmit }: { typeCode: string; editing: ConfigItem | null; open: boolean; onClose: () => void; onSubmit: (input: ConfigItemInput) => Promise<void> }) {
   const [form] = Form.useForm<ItemForm>();
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -78,9 +79,20 @@ function ItemDrawer({ editing, open, onClose, onSubmit }: { editing: ConfigItem 
         >
           <Input disabled={Boolean(editing)} />
         </Form.Item>
-        <Form.Item name="value" label="值" rules={[{ required: true, whitespace: true, message: "请填写值" }, { max: 2000, message: "值不超过 2000 个字" }]}>
-          <Input.TextArea rows={3} />
-        </Form.Item>
+        {typeCode === "flow_template" ? (
+          <Form.Item
+            name="value"
+            label="流程里的角色"
+            extra="从节点上已有的角色里勾选，每个岗位最多勾几个由「岗位角色上限」决定；新建任务选这个流程时，按角色名在所选节点上自动选好。"
+            rules={[{ required: true, message: "请至少勾选一个角色" }, { validator: (_rule, v: string) => (parseFlowRoles(v ?? "") ? Promise.resolve() : Promise.reject(new Error("请至少勾选一个角色（或检查手写的 JSON 格式）"))) }]}
+          >
+            <FlowTemplateEditor />
+          </Form.Item>
+        ) : (
+          <Form.Item name="value" label="值" rules={[{ required: true, whitespace: true, message: "请填写值" }, { max: 2000, message: "值不超过 2000 个字" }]}>
+            <Input.TextArea rows={3} />
+          </Form.Item>
+        )}
         <Form.Item name="label" label="标签" rules={[{ max: 32, message: "标签不超过 32 个字" }]}><Input /></Form.Item>
         <Form.Item name="group_name" label="分组" rules={[{ max: 32, message: "分组不超过 32 个字" }]}><Input /></Form.Item>
         <Form.Item name="sort" label="排序" extra="数字小的排前面"><InputNumber precision={0} style={{ width: "100%" }} /></Form.Item>
@@ -138,7 +150,16 @@ export default function ConfigDetailPage({ code }: { code: string }) {
   const columns: TableColumnsType<ConfigItem> = [
     { title: "编号", dataIndex: "id", width: 80 },
     { title: "名称", dataIndex: "name" },
-    { title: "值", dataIndex: "value", ellipsis: { showTitle: true }, render: (value: string) => <span className="mono">{value}</span> },
+    {
+      title: "值",
+      dataIndex: "value",
+      ellipsis: { showTitle: true },
+      render: (value: string) => {
+        // 流程模板显示成「执行员：A；判定员：B、C」，不显示一串 JSON；解析不了才显示原文
+        const flow = code === "flow_template" ? parseFlowRoles(value) : null;
+        return flow ? <span title={value}>{describeFlowRoles(flow)}</span> : <span className="mono">{value}</span>;
+      },
+    },
     { title: "标签", dataIndex: "label", width: 80 },
     { title: "编码", dataIndex: "code", render: (value: string) => <span className="mono">{value}</span> },
     { title: "分组", dataIndex: "group_name", width: 100 },
@@ -217,6 +238,7 @@ export default function ConfigDetailPage({ code }: { code: string }) {
       />
 
       <ItemDrawer
+        typeCode={code}
         editing={drawer.editing}
         open={drawer.open}
         onClose={() => setDrawer({ open: false, editing: null })}

@@ -2824,8 +2824,10 @@ async fn 参数配置_流程模板的值要是岗位到角色名的_json() {
     let item = |code: &str, value: &str| json!({"name": "流程", "code": code, "value": value});
     // 合法：岗位只能是 executor / judge / case_writer / planner，角色名非空
     assert_eq!(post("/api/configs/flow_template/items", item("ok_flow", r#"{"case_writer":"用例","judge":"找茬"}"#)).await, StatusCode::CREATED);
+    // 一个岗位可以配多个角色（名字列表），UI 走查岗位也一样；同一岗位里名字不能重复、不能是空列表
+    assert_eq!(post("/api/configs/flow_template/items", item("multi_flow", r#"{"case_writer":["用例1","用例2","用例3"],"judge":["找茬"],"ui_review":["走查甲","走查乙"]}"#)).await, StatusCode::CREATED);
     // 不合法：不是 JSON、不是对象、空对象、未知岗位、角色名为空或不是字符串
-    for (n, value) in ["不是json", "[1,2]", "{}", r#"{"boss":"x"}"#, r#"{"judge":""}"#, r#"{"judge":3}"#].into_iter().enumerate() {
+    for (n, value) in ["不是json", "[1,2]", "{}", r#"{"boss":"x"}"#, r#"{"judge":""}"#, r#"{"judge":3}"#, r#"{"judge":[]}"#, r#"{"judge":["a","a"]}"#, r#"{"judge":["a",""]}"#, r#"{"judge":["a",3]}"#].into_iter().enumerate() {
         let code: &'static str = Box::leak(format!("bad_flow_{n}").into_boxed_str());
         assert_eq!(post("/api/configs/flow_template/items", item(code, value)).await, StatusCode::BAD_REQUEST, "{value}");
     }

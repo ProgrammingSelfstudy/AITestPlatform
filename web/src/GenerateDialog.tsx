@@ -329,19 +329,17 @@ export default function GenerateDialog({ onClose, initialModule }: { onClose: ()
       return;
     }
     const notes: string[] = [];
+    // 一个岗位在流程里可以配多个角色：按顺序取第一个在节点上存在、且通过检测的；都不行就逐个说明原因
     const pick = (slot: "case_writer" | "judge", label: string, roles: RoleView[]): string | null => {
-      const wanted = flow.roles[slot];
-      if (!wanted) return null;
-      const found = roles.find((r) => r.name === wanted);
-      if (!found) {
-        notes.push(`流程里的${label}「${wanted}」在这个节点上不存在`);
-        return null;
+      const wanted = flow.roles[slot] ?? [];
+      const problems: string[] = [];
+      for (const name of wanted) {
+        const found = roles.find((r) => r.name === name);
+        if (found && found.check.status === "ok") return found.id;
+        problems.push(found ? `「${name}」还没通过检测` : `「${name}」在这个节点上不存在`);
       }
-      if (found.check.status !== "ok") {
-        notes.push(`流程里的${label}「${wanted}」还没通过检测`);
-        return null;
-      }
-      return found.id;
+      if (problems.length > 0) notes.push(`流程里的${label}${problems.join("、")}`);
+      return null;
     };
     const writer = pick("case_writer", "测试用例角色", writerRoles);
     const reviewer = pick("judge", "判定员角色", judgeRoles);

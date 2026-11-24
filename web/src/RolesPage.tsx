@@ -6,6 +6,7 @@ import {
   fetchNodes,
   initNodeRoles,
   ROLE_SLOT_LIMIT,
+  SLOT_LABEL,
   fetchRoleLimits,
   ROLE_SOURCES,
   saveNodeRoles,
@@ -46,13 +47,6 @@ const CHECK_META: Record<CheckStatus, CheckMeta> = {
   failed: { text: "检测失败", tone: "fail", available: false },
 };
 
-const SLOT_LABEL: Record<ModelRole["slot"], string> = {
-  executor: "执行员",
-  judge: "判定员",
-  case_writer: "测试用例",
-  planner: "管理员",
-  ui_review: "UI 走查",
-};
 
 interface ModelRowField {
   model: string;

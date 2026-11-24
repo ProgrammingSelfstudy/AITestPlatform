@@ -787,22 +787,39 @@ export interface FlowTemplate {
   code: string;
   name: string;
   remark: string;
-  /** 岗位（executor / judge / case_writer / planner / ui_review）→ 角色名称 */
-  roles: Record<string, string>;
+  /** 岗位（executor / judge / case_writer / planner / ui_review）→ 角色名称列表（一个岗位可以配多个，按顺序优先） */
+  roles: Record<string, string[]>;
 }
 
-export function parseFlowRoles(value: string): Record<string, string> | null {
+/** 岗位的中文名和显示顺序 */
+export const SLOT_LABEL: Record<ModelRole["slot"], string> = {
+  executor: "执行员",
+  judge: "判定员",
+  case_writer: "测试用例",
+  planner: "管理员",
+  ui_review: "UI 走查",
+};
+export const SLOT_ORDER: ModelRole["slot"][] = ["executor", "judge", "case_writer", "planner", "ui_review"];
+
+/** 解析流程模板的值。每个岗位可以是一个名字（旧格式）或名字列表，统一成列表；格式不对返回 null */
+export function parseFlowRoles(value: string): Record<string, string[]> | null {
   try {
     const parsed = JSON.parse(value) as unknown;
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
-    const roles: Record<string, string> = {};
-    for (const [slot, name] of Object.entries(parsed)) {
-      if (typeof name === "string" && name.trim()) roles[slot] = name.trim();
+    const roles: Record<string, string[]> = {};
+    for (const [slot, names] of Object.entries(parsed)) {
+      const list = (Array.isArray(names) ? names : [names]).filter((n): n is string => typeof n === "string" && n.trim() !== "").map((n) => n.trim());
+      if (list.length > 0) roles[slot] = [...new Set(list)];
     }
     return Object.keys(roles).length > 0 ? roles : null;
   } catch {
     return null;
   }
+}
+
+/** 把流程里的角色按岗位顺序写成「执行员：A；判定员：B、C」，给表格显示用 */
+export function describeFlowRoles(roles: Record<string, string[]>): string {
+  return SLOT_ORDER.filter((slot) => roles[slot]?.length).map((slot) => `${SLOT_LABEL[slot]}：${roles[slot].join("、")}`).join("；");
 }
 
 /** 读所有可用的流程模板（类型和配置项都是「正常」、值格式对的）；读不到就当没有，不挡住手动选角色 */

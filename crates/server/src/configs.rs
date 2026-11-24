@@ -701,15 +701,24 @@ fn check_known_value(type_code: &str, item_code: &str, value: &str) -> Result<()
     }
 }
 
-/// 流程模板的值：JSON 对象，岗位（executor / judge / case_writer / planner / ui_review）对应角色名称。
+/// 流程模板的值：JSON 对象，岗位（executor / judge / case_writer / planner / ui_review）对应角色名称，
+/// 可以是一个名字，也可以是名字列表（一个岗位可以配多个角色，最多几个由「岗位角色上限」决定，页面上勾选时限制）。
 /// 新建任务时选这个流程，就按名称去节点上找对应岗位的角色。至少要有一个岗位。
 fn check_flow_template(value: &str) -> Result<(), ApiError> {
     const SLOTS: [&str; 5] = ["executor", "judge", "case_writer", "planner", "ui_review"];
-    let invalid = || bad("流程模板的值要是 JSON，例如 {\"case_writer\":\"角色名\",\"judge\":\"角色名\"}，岗位只能是 executor、judge、case_writer、planner、ui_review，角色名不超过 60 个字");
+    let invalid = || bad("流程模板的值要是 JSON，例如 {\"case_writer\":[\"角色名\"],\"judge\":[\"角色名1\",\"角色名2\"]}，岗位只能是 executor、judge、case_writer、planner、ui_review，每个岗位 1 到 20 个角色名，每个不超过 60 个字、不能重复");
+    let name_ok = |n: &serde_json::Value| n.as_str().is_some_and(|n| !n.trim().is_empty() && n.chars().count() <= 60);
     let parsed: serde_json::Value = serde_json::from_str(value).map_err(|_| invalid())?;
     let object = parsed.as_object().filter(|o| !o.is_empty()).ok_or_else(invalid)?;
-    for (slot, name) in object {
-        let ok = SLOTS.contains(&slot.as_str()) && name.as_str().is_some_and(|n| !n.trim().is_empty() && n.chars().count() <= 60);
+    for (slot, names) in object {
+        let ok = SLOTS.contains(&slot.as_str())
+            && match names {
+                serde_json::Value::Array(list) => {
+                    let mut seen = std::collections::HashSet::new();
+                    (1..=20).contains(&list.len()) && list.iter().all(&name_ok) && list.iter().all(|n| seen.insert(n.as_str().unwrap_or_default().trim().to_string()))
+                }
+                one => name_ok(one),
+            };
         if !ok {
             return Err(invalid());
         }
