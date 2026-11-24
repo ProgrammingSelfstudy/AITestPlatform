@@ -1,4 +1,4 @@
-import { Alert, Button, Empty, Input, Modal, Skeleton } from "antd";
+import { Alert, Button, Empty, Input, Modal, Skeleton, Tabs } from "antd";
 import type { ComponentType } from "react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
@@ -11,6 +11,10 @@ import {
   type ModuleView,
   type ReviewStatus,
 } from "./api";
+import ModuleCases from "./ModuleCases";
+import ModuleRecordings from "./ModuleRecordings";
+import ModuleResults from "./ModuleResults";
+import ModuleShots from "./ModuleShots";
 import NewTaskDialog from "./NewTaskDialog";
 import { readReviewToken, rememberReviewToken, writeTokenAction } from "./reviewLogic";
 import ReviewTokenDialog from "./ReviewTokenDialog";
@@ -456,6 +460,8 @@ export default function ModuleDetailPage({ id }: { id: string }) {
   // 「我是谁」在本浏览器记 30 天。
   const { name: userName, setName: setUserName, expiresAt: nameExpiresAt, forget: forgetName } = useRememberedUserName();
   const trimmedName = userName.trim();
+  // 页面分区：概览与复核（原来的内容）/ UI 图 / 测试用例 / 录屏 / 测试结果
+  const [tab, setTab] = useState("overview");
 
   // 轮询模块列表（找到当前 id），防闪烁缓存
   const modsCacheRef = useRef<{ sig: string; data: ModuleView[] } | null>(null);
@@ -1070,7 +1076,23 @@ export default function ModuleDetailPage({ id }: { id: string }) {
 
   return (
     <div className="mod-page">
-      {isTesting ? (
+      <Tabs
+        activeKey={tab}
+        onChange={setTab}
+        className="mod-detail-tabs"
+        items={[
+          { key: "overview", label: "概览与复核" },
+          { key: "shots", label: "UI 图" },
+          { key: "cases", label: `测试用例（${cases.length}）` },
+          { key: "recordings", label: "录屏" },
+          { key: "results", label: "测试结果" },
+        ]}
+      />
+      {tab === "shots" && <>{tokenBar}<ModuleShots moduleId={id} userName={userName} /></>}
+      {tab === "cases" && <>{tokenBar}<ModuleCases moduleId={id} cases={cases} userName={userName} onChanged={reloadAll} /></>}
+      {tab === "recordings" && <ModuleRecordings moduleId={id} />}
+      {tab === "results" && <ModuleResults cases={cases} />}
+      {tab === "overview" && (isTesting ? (
         /* ========================= 测试中：指挥台布局 ========================= */
         <>
           <header className="mod-cmd-hero" aria-label="模块测试指挥台">
@@ -1524,7 +1546,7 @@ export default function ModuleDetailPage({ id }: { id: string }) {
             {reviewContent}
           </section>
         </>
-      )}
+      ))}
 
       {/* 批准（needs_human 必填备注）/ 拒绝（可选备注）弹窗 */}
       {decisionModal && (

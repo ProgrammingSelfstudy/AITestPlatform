@@ -194,6 +194,10 @@ export interface LatestRun {
 export interface ModuleCase {
   code: string;
   title: string;
+  /** 运行环境：app / h5 / browser（和 CSV 里的「运行环境」一致） */
+  run_env: "app" | "h5" | "browser";
+  level: string;
+  preconditions: string[];
   origin: "imported" | "generated";
   review_status: ReviewStatus;
   /** 评审员的意见和人的备注，原样显示 */
@@ -834,4 +838,53 @@ export async function fetchFlowTemplates(signal?: AbortSignal): Promise<FlowTemp
   } catch {
     return [];
   }
+}
+
+// ---------------------------------------------------------------- 模块详情：UI 图、用例 CSV、录屏
+
+export interface ModuleShot {
+  id: string;
+  name: string;
+  content_type: string;
+  size: number;
+  created_at: string;
+  created_by: string | null;
+}
+
+export interface CaseRecordings {
+  code: string;
+  title: string;
+  run_id: string;
+  final_result: LatestRun["final_result"];
+  recordings: { seq: number; url: string; duration_ms: number | null; start_epoch_ms: number | null }[];
+  expires_at: number;
+}
+
+const moduleBase = (moduleId: string) => `/api/modules/${encodeURIComponent(moduleId)}`;
+
+export const fetchModuleShots = (moduleId: string, signal?: AbortSignal) => get<ModuleShot[]>(`${moduleBase(moduleId)}/screenshots`, signal);
+export const moduleShotUrl = (moduleId: string, shotId: string) => `${moduleBase(moduleId)}/screenshots/${encodeURIComponent(shotId)}`;
+export const fetchModuleRecordings = (moduleId: string, signal?: AbortSignal) => get<CaseRecordings[]>(`${moduleBase(moduleId)}/recordings`, signal);
+export const moduleCasesCsvUrl = (moduleId: string) => `${moduleBase(moduleId)}/cases.csv`;
+
+/** 给模块加 UI 图：一次最多 100 张，单张 ≤ 3MB（PNG / JPEG），模块里合计最多 100 张、100MB；同一张图不重复存 */
+export async function addModuleShots(moduleId: string, shots: { name: string; data_b64: string }[], token: string, userName: string): Promise<{ added: number; duplicates: number }> {
+  const response = await post(`${moduleBase(moduleId)}/screenshots`, { screenshots: shots }, token, userHeaders(userName));
+  return response.json();
+}
+
+export async function deleteModuleShot(moduleId: string, shotId: string, token: string, userName: string): Promise<void> {
+  await post(`${moduleBase(moduleId)}/screenshots/${encodeURIComponent(shotId)}/delete`, {}, token, userHeaders(userName));
+}
+
+/** 导入用例 CSV：整体校验，有问题整个文件都不写，错误里写明第几行 */
+export async function importModuleCases(moduleId: string, csv: string, token: string, userName: string): Promise<{ inserted: number; updated: number; unchanged: number }> {
+  const response = await post(`${moduleBase(moduleId)}/cases/import`, { csv }, token, userHeaders(userName));
+  return response.json();
+}
+
+/** 读文本（导出 CSV 用）：带「我是谁」，错误原样抛出 */
+export async function fetchText(path: string, signal?: AbortSignal): Promise<string> {
+  const response = await request(path, { signal });
+  return response.text();
 }

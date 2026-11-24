@@ -2857,3 +2857,91 @@ async fn 角色岗位_ui走查要看图_只有_claude_和_codex_能当() {
     let two = vec![role_json("u1", "ui_review", "claude_cli", "m"), role_json("u2", "ui_review", "codex_exec", "m")];
     assert_eq!(post(two).await, StatusCode::BAD_REQUEST);
 }
+
+#[tokio::test]
+async fn 模块详情_ui图增删_用例csv往返_录屏列表() {
+    use base64::Engine as _;
+    let world = World::new().await;
+    let pool = world.state.pool();
+    let module: Uuid = sqlx::query_scalar("insert into modules (project_id, name) select id, '语聊房' from projects where name = 'hafa' returning id")
+        .fetch_one(pool).await.unwrap();
+    let b64 = |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
+    let png = |tag: &str| b64(&[b"\x89PNG\r\n\x1a\n".as_slice(), tag.as_bytes()].concat());
+
+    // ---- UI 图：不登录名字不能加；加的图能列出来、能读出来；同一张不重复存；能删
+    let shots = format!("/api/modules/{module}/screenshots");
+    let no_name = review_headers(REVIEW_TOKEN);
+    let (status, _, _) = request(&world.app, Method::POST, &shots, &no_name, json!({"screenshots": [{"name": "a", "data_b64": png("a")}]}).to_string()).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "没名字不能加图");
+    let (status, _, bytes) = browser_post(&world.app, &shots, json!({"screenshots": [{"name": "首页", "data_b64": png("a")}, {"name": "充值页", "data_b64": png("b")}, {"name": "重复的首页", "data_b64": png("a")}]})).await;
+    assert_eq!(status, StatusCode::OK, "{}", text(&bytes));
+    assert_eq!((json_body(&bytes)["added"].clone(), json_body(&bytes)["duplicates"].clone()), (json!(2), json!(1)));
+    let (status, _, bytes) = request(&world.app, Method::GET, &shots, &[], "").await;
+    assert_eq!(status, StatusCode::OK);
+    let list = json_body(&bytes);
+    assert_eq!(list.as_array().unwrap().len(), 2);
+    assert_eq!(list[0]["name"], "首页");
+    let first = list[0]["id"].as_str().unwrap().to_string();
+    let (status, headers, body) = request(&world.app, Method::GET, &format!("{shots}/{first}"), &[], "").await;
+    assert_eq!((status, headers[header::CONTENT_TYPE].to_str().unwrap(), headers[header::X_CONTENT_TYPE_OPTIONS].to_str().unwrap()), (StatusCode::OK, "image/png", "nosniff"));
+    assert!(body.starts_with(b"\x89PNG"));
+    // 不是图片、不是 base64：400
+    for bad in [b64(b"GIF89a..."), "不是base64!!".to_string()] {
+        let (status, _, _) = browser_post(&world.app, &shots, json!({"screenshots": [{"name": "x", "data_b64": bad}]})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+    // 模块里已有 100 张：再加新的一张 400；删掉就能加
+    sqlx::query("insert into module_screenshots (module_id, name, content_type, bytes, sha256) select $1, 'f' || n, 'image/png', '\\x89504e47'::bytea, 'fill' || n from generate_series(1, 98) n")
+        .bind(module).execute(pool).await.unwrap();
+    let (status, _, bytes) = browser_post(&world.app, &shots, json!({"screenshots": [{"name": "多的", "data_b64": png("c")}]})).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{}", text(&bytes));
+    assert!(text(&bytes).contains("最多 100 张"));
+    let delete = format!("{shots}/{first}/delete");
+    assert_eq!(browser_post(&world.app, &delete, json!({})).await.0, StatusCode::NO_CONTENT);
+    assert_eq!(browser_post(&world.app, &delete, json!({})).await.0, StatusCode::NOT_FOUND);
+    assert_eq!(browser_post(&world.app, &shots, json!({"screenshots": [{"name": "新的", "data_b64": png("c")}]})).await.0, StatusCode::OK);
+
+    // ---- 用例 CSV：导入 → 导出 → 再导入不变 → 改标题算更新；有问题整个文件不写
+    let import = format!("/api/modules/{module}/cases/import");
+    let csv = "编号,标题,运行环境,级别,前置条件,步骤,预期\r\nCSV-1,充值成功,app,高,已登录,\"点充值\n选 6 元\n确认\",\"到账\n出现流水\"\r\nCSV-2,H5 活动页,h5,,,打开链接,能看到活动\r\n";
+    let (status, _, bytes) = browser_post(&world.app, &import, json!({"csv": csv})).await;
+    assert_eq!(status, StatusCode::OK, "{}", text(&bytes));
+    assert_eq!(json_body(&bytes), json!({"inserted": 2, "updated": 0, "unchanged": 0}));
+    let (status, headers, body) = request(&world.app, Method::GET, &format!("/api/modules/{module}/cases.csv"), &[], "").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(headers[header::CONTENT_TYPE].to_str().unwrap().starts_with("text/csv"));
+    let exported = String::from_utf8(body.to_vec()).unwrap();
+    assert!(exported.starts_with('\u{feff}'), "带 BOM，Excel 能直接打开");
+    assert!(exported.contains("CSV-1,充值成功,app,高") && exported.contains("CSV-2,H5 活动页,h5"), "{exported}");
+    assert!(exported.contains("\"点充值\n选 6 元\n确认\"") && exported.contains("未执行"));
+    // 导出的文件直接再导入：内容没变，一条都不更新
+    let (_, _, bytes) = browser_post(&world.app, &import, json!({"csv": exported})).await;
+    assert_eq!(json_body(&bytes), json!({"inserted": 0, "updated": 0, "unchanged": 2}));
+    let (_, _, bytes) = browser_post(&world.app, &import, json!({"csv": csv.replace("充值成功", "充值成功（改）")})).await;
+    assert_eq!(json_body(&bytes), json!({"inserted": 0, "updated": 1, "unchanged": 1}));
+    // 前端用的用例列表里有这两条
+    let (_, _, bytes) = request(&world.app, Method::GET, &format!("/api/modules/{module}/cases"), &[], "").await;
+    assert_eq!(json_body(&bytes).as_array().unwrap().len(), 2);
+    // 问题：带行号、整体不写；占用别的模块或老用例的编号；明文密码
+    let before: i64 = sqlx::query_scalar("select count(*) from test_cases").fetch_one(pool).await.unwrap();
+    for (bad, want) in [
+        ("编号,标题,步骤,预期\r\nOK-1,好,点一下,成功\r\nBAD-2,没步骤,,成功\r\n", "第 3 行：步骤不能为空"),
+        ("编号,标题,运行环境,步骤,预期\r\nOK-1,好,ios,点,成功\r\n", "运行环境只能是"),
+        ("编号,标题,步骤,预期\r\nTC-04,占别人的编号,点,成功\r\n", "已经被别的模块"),
+        ("编号,标题,步骤,预期\r\nPW-1,有密码,输入密码：hunter2,成功\r\n", "明文密码"),
+        ("标题,步骤\r\n缺列,点\r\n", "缺少这些列"),
+    ] {
+        let (status, _, bytes) = browser_post(&world.app, &import, json!({"csv": bad})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}");
+        assert!(text(&bytes).contains(want), "{want} 不在 {}", text(&bytes));
+        assert!(!text(&bytes).contains("hunter2"), "错误里不能回显密码");
+    }
+    let after: i64 = sqlx::query_scalar("select count(*) from test_cases").fetch_one(pool).await.unwrap();
+    assert_eq!(before, after, "有问题的文件一条都不能写入");
+
+    // ---- 录屏：没跑过的用例不出现；模块不存在 404
+    let (status, _, bytes) = request(&world.app, Method::GET, &format!("/api/modules/{module}/recordings"), &[], "").await;
+    assert_eq!((status, json_body(&bytes)), (StatusCode::OK, json!([])));
+    let (status, _, _) = request(&world.app, Method::GET, &format!("/api/modules/{}/recordings", Uuid::new_v4()), &[], "").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}

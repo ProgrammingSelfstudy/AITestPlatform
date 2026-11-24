@@ -46,6 +46,8 @@ pub enum ModuleError {
     Db(#[from] sqlx::Error),
 }
 
+pub(crate) mod assets;
+
 type Res<T> = Result<T, ModuleError>;
 
 fn invalid<T>(message: impl Into<String>) -> Res<T> {
@@ -333,6 +335,19 @@ pub async fn create_request(pool: &PgPool, project: &str, user: Uuid, input: &Ca
             .bind(hex::encode(Sha256::digest(&shot.bytes)))
             .execute(&mut *tx)
             .await?;
+        // 同时记进模块的图库（模块详情页能看、能删）；同一张图已经在里面就不重复存
+        sqlx::query(
+            "insert into module_screenshots (module_id, name, content_type, bytes, sha256, created_by)
+             values ($1,$2,$3,$4,$5,$6) on conflict (module_id, sha256) do nothing",
+        )
+        .bind(module_id)
+        .bind(format!("生成用例时上传的截图 {}", seq + 1))
+        .bind(shot.content_type)
+        .bind(&shot.bytes)
+        .bind(hex::encode(Sha256::digest(&shot.bytes)))
+        .bind(user)
+        .execute(&mut *tx)
+        .await?;
     }
     tx.commit().await?;
     Ok(Created { request_id, module_id, doc_id })
@@ -799,6 +814,10 @@ pub(crate) async fn api_review(
 pub struct ModuleCase {
     pub code: String,
     pub title: String,
+    /// 运行环境：app / h5 / browser（由 platforms 推导，和 CSV 里的「运行环境」一致）
+    pub run_env: String,
+    pub level: String,
+    pub preconditions: Vec<String>,
     pub origin: String,
     pub review_status: String,
     pub review_note: String,
@@ -824,7 +843,7 @@ pub async fn module_cases(pool: &PgPool, module_id: Uuid) -> Res<Vec<ModuleCase>
         return Err(ModuleError::NotFound("没有这个模块".into()));
     }
     let rows = sqlx::query(
-        "select c.code, c.title, c.origin, c.review_status, c.review_note, c.steps, c.expected,
+        "select c.code, c.title, c.level, c.platforms, c.preconditions, c.origin, c.review_status, c.review_note, c.steps, c.expected,
                 r.id as run_id, r.task_id, r.status as run_status, r.final_result, r.blocked_reason, r.queued_at
          from test_cases c
          left join lateral (select * from runs x where x.case_id = c.id order by x.seq desc limit 1) r on true
@@ -839,6 +858,9 @@ pub async fn module_cases(pool: &PgPool, module_id: Uuid) -> Res<Vec<ModuleCase>
         .map(|r| ModuleCase {
             code: r.get("code"),
             title: r.get("title"),
+            run_env: assets::run_env_of(&r.get::<Vec<String>, _>("platforms")).to_string(),
+            level: r.get("level"),
+            preconditions: strings(r.get("preconditions")),
             origin: r.get("origin"),
             review_status: r.get("review_status"),
             review_note: r.get("review_note"),

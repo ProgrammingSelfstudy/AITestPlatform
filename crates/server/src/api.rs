@@ -73,6 +73,20 @@ pub(crate) fn routes(app: AppState, paths: Paths) -> Router {
         .route("/api/node/casegen-requests/claim", put(crate::modules::api_claim))
         .route("/api/casegen-requests/{id}/review", put(crate::modules::api_review).layer(axum::extract::DefaultBodyLimit::max(1024 * 1024)))
         .route("/api/modules/{id}/cases", get(crate::modules::api_module_cases))
+        .route("/api/modules/{id}/cases.csv", get(crate::modules::assets::api_cases_csv))
+        .route("/api/modules/{id}/cases/import", post(crate::modules::assets::api_import_cases).route_layer(authorize_write.clone()).layer(axum::extract::DefaultBodyLimit::max(2 * 1024 * 1024)))
+        .route("/api/modules/{id}/recordings", get(crate::modules::assets::api_module_recordings))
+        .route(
+            "/api/modules/{id}/screenshots",
+            // 先写后读：审核口令和请求体上限只套在 POST 上，读列表是公开的
+            post(crate::modules::assets::api_add_screenshots)
+                .route_layer(authorize_write.clone())
+                // 图片用 base64 放在 JSON 里：合计最多 100MB（base64 后约 134MB），放宽到 160MB
+                .layer(axum::extract::DefaultBodyLimit::max(160 * 1024 * 1024))
+                .get(crate::modules::assets::api_list_screenshots),
+        )
+        .route("/api/modules/{id}/screenshots/{sid}", get(crate::modules::assets::api_get_screenshot))
+        .route("/api/modules/{id}/screenshots/{sid}/delete", post(crate::modules::assets::api_delete_screenshot).route_layer(authorize_write.clone()))
         .route("/api/modules/{id}/cases/{code}/decision", post(crate::modules::api_decide).route_layer(authorize_write.clone()))
         .route("/api/modules/{id}/approve-reviewed", post(crate::modules::api_approve_reviewed).route_layer(authorize_write.clone()))
         .route("/api/casegen-requests/{id}/result", put(crate::modules::api_finish).layer(axum::extract::DefaultBodyLimit::max(2 * 1024 * 1024)))

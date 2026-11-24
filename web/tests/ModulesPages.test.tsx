@@ -17,7 +17,7 @@ function mod(overrides: Partial<ModuleView> = {}): ModuleView {
 }
 
 function kase(code: string, status: ReviewStatus, note = "", extra: Partial<ModuleCase> = {}): ModuleCase {
-  return { code, title: `标题-${code}`, origin: "generated", review_status: status, review_note: note, steps: ["点击入口"], expected: ["出现页面"], latest_run: null, ...extra };
+  return { code, title: `标题-${code}`, run_env: "app", level: "", preconditions: [], origin: "generated", review_status: status, review_note: note, steps: ["点击入口"], expected: ["出现页面"], latest_run: null, ...extra };
 }
 
 function serve(module: ModuleView, cases: ModuleCase[]) {
