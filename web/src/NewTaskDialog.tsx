@@ -1,6 +1,6 @@
 import { Alert, Form, Input, Modal, Select, Skeleton } from "antd";
 import { useEffect, useRef, useState } from "react";
-import { createTask, fetchCases, fetchModels, fetchNodes, fetchRoleLimits, ROLE_SLOT_LIMIT, type ModelRole, type Models, type ReviewStatus } from "./api";
+import { createTask, fetchCases, fetchFlowTemplates, fetchModels, fetchNodeRoles, fetchNodes, fetchRoleLimits, ROLE_SLOT_LIMIT, type FlowTemplate, type ModelRole, type ReviewStatus, type RoleView } from "./api";
 import { readReviewToken, rememberReviewToken, writeTokenAction } from "./reviewLogic";
 import ReviewTokenDialog from "./ReviewTokenDialog";
 import { LoadError } from "./runUi";
@@ -24,7 +24,6 @@ const REVIEW_LABEL: Record<ReviewStatus, string> = {
   rejected: "已拒绝",
 };
 
-const rolesOf = (models: Models | undefined, slot: ModelRole["slot"]) => models?.roles.filter((r) => r.slot === slot) ?? [];
 
 interface Fields {
   node: string;
@@ -62,28 +61,95 @@ export default function NewTaskDialog({ onClose, initialCases }: { onClose: () =
     void fetchRoleLimits(controller.signal).then((limits) => { if (!controller.signal.aborted && limits.judge) setMaxJudges(limits.judge); });
     return () => controller.abort();
   }, []);
-  const executorRoles = rolesOf(data?.models, "executor");
-  const judgeRoles = rolesOf(data?.models, "judge");
+  // 角色从哪来：所选节点上报了角色（新版节点）就只能用它上面的、检测通过的角色——服务端也是这么校验的；
+  // 节点没上报（旧版节点）才用 models.json 里的
+  const [nodeRoles, setNodeRoles] = useState<RoleView[]>([]);
+  const [nodeRolesError, setNodeRolesError] = useState<string | null>(null);
+  const trimmedName = userName.trim();
+  useEffect(() => {
+    setNodeRoles([]);
+    setNodeRolesError(null);
+    if (!node || !trimmedName) return;
+    const controller = new AbortController();
+    fetchNodeRoles(node, trimmedName, controller.signal)
+      .then((result) => {
+        if (controller.signal.aborted) return;
+        setNodeRoles(result.online ? result.roles : []);
+        if (result.name_problem) setNodeRolesError(result.name_problem);
+      })
+      .catch((e: unknown) => { if (!controller.signal.aborted) setNodeRolesError(e instanceof Error ? e.message : "读取节点角色失败"); });
+    return () => controller.abort();
+  }, [node, trimmedName]);
+  const usingNodeRoles = nodeRoles.length > 0;
+  const pool: ModelRole[] = usingNodeRoles ? nodeRoles : (data?.models.roles ?? []);
+  const isUsable = (role: ModelRole) => !usingNodeRoles || (role as RoleView).check?.status === "ok";
+  const roleLabel = (role: ModelRole) => (isUsable(role) ? role.name : `${role.name}（还没通过检测）`);
+  const poolOf = (slot: ModelRole["slot"]) => pool.filter((r) => r.slot === slot);
+  const executorRoles = poolOf("executor");
+  const judgeRoles = poolOf("judge");
   const executorRole = executorRoles.find((r) => r.id === executorRoleId);
   const judgeRole = judgeRoles.find((r) => r.id === judgeRoleId);
   const efforts = executorRole?.models.find((m) => m.model === model)?.efforts ?? [];
 
   // 配置加载后填默认：每个岗位的第一个角色和它的默认模型。只在首次加载时填，轮询刷新不覆盖用户已选的值
+  const poolKey = pool.map((r) => `${r.id}:${(r as RoleView).check?.status ?? ""}`).join("|");
   useEffect(() => {
     if (!data) return;
-    const executor = rolesOf(data.models, "executor")[0];
-    const judge = rolesOf(data.models, "judge")[0];
-    if (form.getFieldValue("executorRole")) return;
-    // 从模块页进来时预选该模块已批准的用例
-    if (initialCases?.length) form.setFieldValue("cases", initialCases);
-    form.setFieldsValue({
-      executorRole: executor?.id,
-      executor: executor?.default.model,
-      effort: executor?.default.effort ?? undefined,
-      judgeRole: judge?.id,
-      judge: judge?.default.model,
-    });
-  }, [data, form]);
+    // 从模块页进来时预选该模块已批准的用例（只填一次）
+    if (initialCases?.length && !form.getFieldValue("cases")) form.setFieldValue("cases", initialCases);
+    // 已选的角色还在可用的角色里就保留用户的选择，否则换成第一个可用的
+    const keep = (field: "executorRole" | "judgeRole", list: ModelRole[]) => list.some((r) => r.id === form.getFieldValue(field) && isUsable(r));
+    const executor = executorRoles.find(isUsable);
+    const judge = judgeRoles.find(isUsable);
+    if (!keep("executorRole", executorRoles)) {
+      form.setFieldsValue({ executorRole: executor?.id, executor: executor?.default.model, effort: executor?.default.effort ?? undefined });
+    }
+    if (!keep("judgeRole", judgeRoles)) {
+      form.setFieldsValue({ judgeRole: judge?.id, judge: judge?.default.model });
+    }
+    const more: string[] = form.getFieldValue("moreJudges") ?? [];
+    if (more.length) form.setFieldValue("moreJudges", more.filter((id) => judgeRoles.some((r) => r.id === id && isUsable(r))));
+  }, [data, form, poolKey]);
+
+  // 流程（参数配置里的「流程模板」）：选了流程，按角色名在这个节点上自动选好执行员、判定员和其他判定员
+  const [flows, setFlows] = useState<FlowTemplate[]>([]);
+  const [flowCode, setFlowCode] = useState("");
+  const [flowNotes, setFlowNotes] = useState<string[]>([]);
+  useEffect(() => {
+    const controller = new AbortController();
+    void fetchFlowTemplates(controller.signal).then((list) => { if (!controller.signal.aborted) { setFlows(list); setFlowCode((prev) => prev || list[0]?.code || ""); } });
+    return () => controller.abort();
+  }, []);
+  useEffect(() => {
+    const flow = flows.find((f) => f.code === flowCode);
+    if (!flow || !usingNodeRoles) {
+      setFlowNotes([]);
+      return;
+    }
+    const notes: string[] = [];
+    // 按流程里写的顺序，取在这个节点上存在且检测通过的；不存在或没通过的逐个说明
+    const resolve = (slot: "executor" | "judge", label: string, list: ModelRole[]): ModelRole[] => {
+      const found: ModelRole[] = [];
+      for (const name of flow.roles[slot] ?? []) {
+        const role = list.find((r) => r.name === name);
+        if (role && isUsable(role)) found.push(role);
+        else notes.push(`流程里的${label}「${name}」${role ? "还没通过检测" : "在这个节点上不存在"}`);
+      }
+      return found;
+    };
+    const executors = resolve("executor", "执行员", executorRoles);
+    const judges = resolve("judge", "判定员", judgeRoles);
+    if (!flow.roles.executor) notes.push("这个流程没有指定执行员，请手动选");
+    if (!flow.roles.judge) notes.push("这个流程没有指定判定员，请手动选");
+    if (executors[0]) form.setFieldsValue({ executorRole: executors[0].id, executor: executors[0].default.model, effort: executors[0].default.effort ?? undefined });
+    if (judges[0]) {
+      // 多个判定员：第一个是主判定员，其余同时评审；个数不超过判定员岗位上限
+      const extras = judges.slice(1, Math.max(1, maxJudges));
+      if (judges.length - 1 > extras.length) notes.push(`判定员最多同时 ${maxJudges} 个，流程里多出来的没有选`);
+      form.setFieldsValue({ judgeRole: judges[0].id, judge: judges[0].default.model, moreJudges: extras.map((r) => r.id) });
+    }
+    setFlowNotes(notes);
+  }, [flows, flowCode, poolKey, maxJudges]);
 
   function changeExecutorRole(id: string) {
     const role = executorRoles.find((r) => r.id === id);
@@ -186,9 +252,24 @@ export default function NewTaskDialog({ onClose, initialCases }: { onClose: () =
                 }))}
               />
             </Form.Item>
+            {flows.length > 0 && usingNodeRoles && (
+              <Form.Item label="流程" extra={flowNotes.length > 0 && flowCode ? `${flowNotes.join("；")}。` : "选了流程，下面的执行员、判定员按流程里的角色自动选好（仍可手动改）。流程在「参数配置」里配置。"}>
+                <Select
+                  aria-label="流程"
+                  value={flowCode || undefined}
+                  placeholder="选择流程"
+                  options={[...flows.map((f) => ({ value: f.code, label: f.name })), { value: "", label: "不用流程，手动选角色" }]}
+                  onChange={(code) => setFlowCode(code)}
+                />
+              </Form.Item>
+            )}
+            {nodeRolesError && <Alert type="warning" showIcon title={nodeRolesError} />}
+            {node && trimmedName && !usingNodeRoles && !nodeRolesError && (
+              <Alert type="info" showIcon title="没有读到这个节点上的角色，先用配置文件里的角色（旧版节点）；如果节点已经配了角色，请先在「角色与模型」页配置并检测。" />
+            )}
             {/* 同一岗位只配了一个角色时不显示角色下拉，但表单里仍带着角色 id */}
             <Form.Item name="executorRole" label="执行员角色" hidden={executorRoles.length < 2}>
-              <Select onChange={changeExecutorRole} options={executorRoles.map((r) => ({ value: r.id, label: r.name }))} />
+              <Select onChange={changeExecutorRole} options={executorRoles.map((r) => ({ value: r.id, label: roleLabel(r), disabled: !isUsable(r) }))} />
             </Form.Item>
             <div className="model-fields">
               <Form.Item name="executor" label="执行员模型" rules={[{ required: true, message: "请选择执行员模型" }]}>
@@ -201,7 +282,7 @@ export default function NewTaskDialog({ onClose, initialCases }: { onClose: () =
               )}
             </div>
             <Form.Item name="judgeRole" label="判定员角色" hidden={judgeRoles.length < 2}>
-              <Select onChange={changeJudgeRole} options={judgeRoles.map((r) => ({ value: r.id, label: r.name }))} />
+              <Select onChange={changeJudgeRole} options={judgeRoles.map((r) => ({ value: r.id, label: roleLabel(r), disabled: !isUsable(r) }))} />
             </Form.Item>
             <Form.Item name="judge" label="判定员模型" rules={[{ required: true, message: "请选择判定员模型" }]}>
               <Select options={judgeRole?.models.map((m) => ({ value: m.model, label: m.model })) ?? []} />
@@ -217,7 +298,7 @@ export default function NewTaskDialog({ onClose, initialCases }: { onClose: () =
                   mode="multiple"
                   allowClear
                   placeholder="不选就是只有一个判定员"
-                  options={judgeRoles.filter((r) => r.id !== judgeRoleId).map((r) => ({ value: r.id, label: `${r.name}（${r.default.model}）` }))}
+                  options={judgeRoles.filter((r) => r.id !== judgeRoleId).map((r) => ({ value: r.id, label: `${roleLabel(r)}（${r.default.model}）`, disabled: !isUsable(r) }))}
                 />
               </Form.Item>
             )}
