@@ -2,6 +2,7 @@ import { Alert, AutoComplete, Button, Input, Modal, Select } from "antd";
 import type { ChangeEvent, DragEvent } from "react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
+  checkNodeRole,
   createCasegenRequest,
   fetchModules,
   fetchNodeRoles,
@@ -15,6 +16,7 @@ import {
   type RoleView,
 } from "./api";
 import { readReviewToken, rememberReviewToken, writeTokenAction } from "./reviewLogic";
+import { useGuardedWrite } from "./useGuardedWrite";
 import ReviewTokenDialog from "./ReviewTokenDialog";
 import { LoadError } from "./runUi";
 import { REFRESH_MS, usePolling } from "./usePolling";
@@ -68,7 +70,6 @@ interface ScreenshotItem {
 interface RoleSelectOption {
   value: string;
   label: string;
-  disabled: boolean;
   role: RoleView;
 }
 
@@ -144,6 +145,30 @@ function UploadIcon() {
         strokeLinejoin="round"
       />
     </svg>
+  );
+}
+
+/** 选中的角色还不能用时，提交前说清楚是为什么、该怎么办 */
+function roleNotReady(role: RoleView, label: string): string {
+  const status = role.check.status;
+  if (status === "checking") return `${label}角色「${role.name}」正在检测，等检测通过再提交`;
+  if (status === "unchecked") return `${label}角色「${role.name}」还没检测，重新选一次它就会自动检测`;
+  return `${label}角色「${role.name}」检测未通过（${CHECK_STATUS_META[status].text}），可以点「重新检测」再试`;
+}
+
+/** 选中角色的检测进度：检测中给提示，没通过给原因和「重新检测」；通过了不打扰 */
+function RoleCheckNotice({ role, onRetry }: { role: RoleView | null; onRetry: (role: RoleView) => void }) {
+  if (!role) return <div className="mod-field-hint">选一个角色后会自动检测（用你自己的额度调一次模型），通过后才能提交。</div>;
+  const status = role.check.status;
+  if (status === "ok") return null;
+  if (status === "checking") return <div className="mod-field-hint">正在检测「{role.name}」…通常几秒到半分钟，检测通过后才能提交。</div>;
+  if (status === "unchecked") return <div className="mod-field-hint">「{role.name}」还没检测，重新选一次它就会自动检测。</div>;
+  return (
+    <div className="mod-field-error">
+      「{role.name}」检测未通过：{CHECK_STATUS_META[status].text}
+      {role.check.detail ? `（${role.check.detail}）` : ""}。{" "}
+      <button type="button" className="mod-link" onClick={() => onRetry(role)}>重新检测</button>
+    </div>
   );
 }
 
@@ -276,6 +301,12 @@ export default function GenerateDialog({ onClose, initialModule }: { onClose: ()
   const [writerRole, setWriterRole] = useState("");
   const [reviewerRole, setReviewerRole] = useState("");
 
+  // 选了角色就自动检测：让节点用你自己的额度真调一次模型。口令、「我是谁」缺失时走统一的写操作提示
+  const checkWrite = useGuardedWrite(trimmedName);
+  const autoChecked = useRef<Set<string>>(new Set());
+  const pendingChecks = useRef<Map<string, RoleView>>(new Map());
+  const flowApplied = useRef("");
+
   // 校验、提交与审核口令
   const [errors, setErrors] = useState<ValidationErrors>({});
   const [submitError, setSubmitError] = useState<string | null>(null);
@@ -342,6 +373,78 @@ export default function GenerateDialog({ onClose, initialModule }: { onClose: ()
     };
   }, [nodeId, trimmedName, rolesRefreshSeq]);
 
+  function requestCheck(role: RoleView) {
+    if (!nodeId || !trimmedName) return;
+    if (role.check.status === "ok" || role.check.status === "checking") return;
+    const key = `${nodeId}\0${trimmedName}`;
+    // 先在页面上标成「检测中」，让人立刻看到已经开始；没发出去或失败时，下面的轮询会读回真实状态
+    setRolesState((prev) =>
+      prev.data && prev.forKey === key
+        ? { ...prev, data: { ...prev.data, roles: prev.data.roles.map((r) => (r.id === role.id ? { ...r, check: { ...r.check, status: "checking" as CheckStatus } } : r)) } }
+        : prev,
+    );
+    pendingChecks.current.set(role.id, role);
+    flushChecks();
+  }
+
+  // 一次选了两个角色（比如选流程）时，写操作同一时刻只放一个进来：把待检测的角色排队，一个任务里逐个发
+  function flushChecks() {
+    let ran = false;
+    void checkWrite
+      .run(async (token) => {
+        ran = true;
+        let firstError: unknown = null;
+        while (pendingChecks.current.size > 0) {
+          const [id, queued] = pendingChecks.current.entries().next().value as [string, RoleView];
+          pendingChecks.current.delete(id);
+          try {
+            await checkNodeRole(nodeId, queued.id, token, trimmedName);
+          } catch (e) {
+            firstError ??= e;
+            setRolesRefreshSeq((n) => n + 1);
+          }
+        }
+        if (firstError) throw firstError;
+      })
+      .finally(() => {
+        // 任务刚结束时又有新的待检测角色：再开一轮（没执行过就是在等口令，不能重复触发）
+        if (ran && pendingChecks.current.size > 0) flushChecks();
+      });
+  }
+  const requestCheckRef = useRef(requestCheck);
+  requestCheckRef.current = requestCheck;
+
+  // 换节点或换名字：自动检测的记录重新算
+  useEffect(() => {
+    autoChecked.current = new Set();
+    flowApplied.current = "";
+  }, [nodeId, trimmedName]);
+
+  // 有角色在检测中：每 2 秒静默读一次结果（不显示「读取中」，不打断选择），最多等 3 分钟
+  const anyChecking = rolesState.data?.roles.some((r) => r.check.status === "checking") ?? false;
+  useEffect(() => {
+    if (!anyChecking || !nodeId || !trimmedName) return;
+    const key = `${nodeId}\0${trimmedName}`;
+    const controller = new AbortController();
+    const started = Date.now();
+    const timer = window.setInterval(() => {
+      if (Date.now() - started > 180_000) {
+        window.clearInterval(timer);
+        return;
+      }
+      void fetchNodeRoles(nodeId, trimmedName, controller.signal)
+        .then((payload) => {
+          if (controller.signal.aborted) return;
+          setRolesState((prev) => (prev.forKey === key ? { ...prev, data: payload } : prev));
+        })
+        .catch(() => { /* 这一轮没读到，下一轮再读 */ });
+    }, 2000);
+    return () => {
+      window.clearInterval(timer);
+      controller.abort();
+    };
+  }, [anyChecking, nodeId, trimmedName]);
+
   const currentRoles: RoleView[] = useMemo(() => {
     const key = `${nodeId}\0${trimmedName}`;
     if (rolesState.forKey !== key || !rolesState.data || !rolesState.data.online) {
@@ -379,15 +482,16 @@ export default function GenerateDialog({ onClose, initialModule }: { onClose: ()
   // 角色列表就绪时自动选择第一个可用角色；若原选择已不可用则清空
   useEffect(() => {
     if (!rolesLoaded || nodeRolesOffline) return;
+    // 已经选了的角色（不管检测到哪一步）就保留；选的角色不在列表里了，才换成第一个可用的
     setWriterRole((prev) => {
-      if (prev && okWriterRoles.some((r) => r.id === prev)) return prev;
+      if (prev && writerRoles.some((r) => r.id === prev)) return prev;
       return okWriterRoles[0]?.id ?? "";
     });
     setReviewerRole((prev) => {
-      if (prev && okJudgeRoles.some((r) => r.id === prev)) return prev;
+      if (prev && judgeRoles.some((r) => r.id === prev)) return prev;
       return okJudgeRoles[0]?.id ?? "";
     });
-  }, [rolesLoaded, nodeRolesOffline, okWriterRoles, okJudgeRoles]);
+  }, [rolesLoaded, nodeRolesOffline, writerRoles, judgeRoles, okWriterRoles, okJudgeRoles]);
 
   // 选了流程：用流程里的角色名给「测试用例」「评审员」岗位选角色；找不到或没通过检测的，如实写出来
   useEffect(() => {
@@ -397,26 +501,48 @@ export default function GenerateDialog({ onClose, initialModule }: { onClose: ()
       return;
     }
     const notes: string[] = [];
-    // 一个岗位在流程里可以配多个角色：按顺序取第一个在节点上存在、且通过检测的；都不行就逐个说明原因
+    const toCheck: RoleView[] = [];
+    // 一个岗位在流程里可以配多个角色：先取第一个在节点上存在、且已通过检测的；都没通过就选第一个存在的，并自动检测它
     const pick = (slot: "case_writer" | "judge", label: string, roles: RoleView[]): string | null => {
       const wanted = flow.roles[slot] ?? [];
-      const problems: string[] = [];
-      for (const name of wanted) {
-        const found = roles.find((r) => r.name === name);
-        if (found && found.check.status === "ok") return found.id;
-        problems.push(found ? `「${name}」还没通过检测` : `「${name}」在这个节点上不存在`);
+      const found = wanted.map((name) => ({ name, role: roles.find((r) => r.name === name) }));
+      const ready = found.find((f) => f.role && f.role.check.status === "ok");
+      if (ready?.role) return ready.role.id;
+      const candidate = found.find((f) => f.role);
+      for (const f of found) {
+        if (!f.role) notes.push(`流程里的${label}「${f.name}」在这个节点上不存在`);
       }
-      if (problems.length > 0) notes.push(`流程里的${label}${problems.join("、")}`);
-      return null;
+      if (!candidate?.role) return null;
+      const status = candidate.role.check.status;
+      if (status === "unchecked") {
+        toCheck.push(candidate.role);
+        notes.push(`流程里的${label}「${candidate.name}」正在自动检测…`);
+      } else if (status === "checking") {
+        notes.push(`流程里的${label}「${candidate.name}」正在检测…`);
+      } else {
+        notes.push(`流程里的${label}「${candidate.name}」检测未通过（${CHECK_STATUS_META[status].text}）`);
+      }
+      return candidate.role.id;
     };
     const writer = pick("case_writer", "测试用例角色", writerRoles);
     const reviewer = pick("judge", "判定员角色", judgeRoles);
     if (!flow.roles.case_writer) notes.push("这个流程没有指定测试用例角色，请手动选");
     if (!flow.roles.judge) notes.push("这个流程没有指定判定员角色，请手动选");
-    if (writer) setWriterRole(writer);
-    if (reviewer) setReviewerRole(reviewer);
+    // 只在换了流程、节点或角色列表时按流程选角色；检测进度刷新不能把你手动改的选择又改回去
+    const appliedKey = `${flowCode}|${nodeId}|${[...writerRoles, ...judgeRoles].map((r) => r.id).join(",")}`;
+    if (flowApplied.current !== appliedKey) {
+      flowApplied.current = appliedKey;
+      if (writer) setWriterRole(writer);
+      if (reviewer) setReviewerRole(reviewer);
+    }
+    for (const role of toCheck) {
+      const checkKey = `${nodeId}:${role.id}`;
+      if (autoChecked.current.has(checkKey)) continue;
+      autoChecked.current.add(checkKey);
+      requestCheckRef.current(role);
+    }
     setFlowNotes(notes);
-  }, [flows, flowCode, rolesLoaded, nodeRolesOffline, writerRoles, judgeRoles]);
+  }, [flows, flowCode, nodeId, rolesLoaded, nodeRolesOffline, writerRoles, judgeRoles]);
 
   const selectedWriterRoleObj = useMemo(
     () => writerRoles.find((r) => r.id === writerRole) ?? null,
@@ -631,17 +757,23 @@ export default function GenerateDialog({ onClose, initialModule }: { onClose: ()
       } else if (rolesState.error) {
         nextErrors.writerRole = "节点角色读取失败，无法选择角色";
       } else {
-        if (!writerRole || !okWriterRoles.some((r) => r.id === writerRole)) {
+        const writerPicked = writerRoles.find((r) => r.id === writerRole);
+        if (!writerPicked) {
           nextErrors.writerRole =
             writerRoles.length === 0
               ? "当前节点没有配置「测试用例」角色，请先前往「角色与模型」配置"
-              : "请选择一个检测通过（可用）的测试用例角色";
+              : "请选择一个测试用例角色（选了会自动检测）";
+        } else if (writerPicked.check.status !== "ok") {
+          nextErrors.writerRole = roleNotReady(writerPicked, "测试用例");
         }
-        if (!reviewerRole || !okJudgeRoles.some((r) => r.id === reviewerRole)) {
+        const reviewerPicked = judgeRoles.find((r) => r.id === reviewerRole);
+        if (!reviewerPicked) {
           nextErrors.reviewerRole =
             judgeRoles.length === 0
               ? "当前节点没有配置「判定员」角色，请先前往「角色与模型」配置"
-              : "请选择一个检测通过（可用）的判定员（评审员）角色";
+              : "请选择一个判定员（评审员）角色（选了会自动检测）";
+        } else if (reviewerPicked.check.status !== "ok") {
+          nextErrors.reviewerRole = roleNotReady(reviewerPicked, "判定员");
         }
       }
     }
@@ -710,7 +842,6 @@ export default function GenerateDialog({ onClose, initialModule }: { onClose: ()
       writerRoles.map((role) => ({
         value: role.id,
         label: `${role.name}（${CHECK_STATUS_META[role.check.status].text}）`,
-        disabled: role.check.status !== "ok",
         role,
       })),
     [writerRoles],
@@ -721,7 +852,6 @@ export default function GenerateDialog({ onClose, initialModule }: { onClose: ()
       judgeRoles.map((role) => ({
         value: role.id,
         label: `${role.name}（${CHECK_STATUS_META[role.check.status].text}）`,
-        disabled: role.check.status !== "ok",
         role,
       })),
     [judgeRoles],
@@ -1094,7 +1224,7 @@ export default function GenerateDialog({ onClose, initialModule }: { onClose: ()
                   ? "先选择节点并填「我是谁」"
                   : rolesState.loading
                     ? "正在读取角色…"
-                    : "选择可用的测试用例角色"
+                    : "选择测试用例角色（选了自动检测）"
               }
               options={writerOptions}
               optionRender={(option) => (
@@ -1111,6 +1241,8 @@ export default function GenerateDialog({ onClose, initialModule }: { onClose: ()
               onChange={(val) => {
                 setWriterRole(val);
                 setErrors((prev) => ({ ...prev, writerRole: undefined }));
+                const picked = writerRoles.find((r) => r.id === val);
+                if (picked) requestCheck(picked);
               }}
             />
             {rolesLoaded && !nodeRolesOffline && writerRoles.length === 0 && (
@@ -1121,23 +1253,8 @@ export default function GenerateDialog({ onClose, initialModule }: { onClose: ()
                 </a>
               </div>
             )}
-            {rolesLoaded && !nodeRolesOffline && writerRoles.length > 0 && okWriterRoles.length === 0 && (
-              <div className="mod-field-error">
-                当前「测试用例」角色均未通过检测（已禁用）。请先前往{" "}
-                <a className="mod-link" href="#/roles" onClick={onClose}>
-                  角色与模型
-                </a>{" "}
-                完成检测。
-              </div>
-            )}
-            {rolesLoaded && !nodeRolesOffline && okWriterRoles.length > 0 && writerRoles.length > okWriterRoles.length && (
-              <div className="mod-field-hint">
-                未检测或检测未通过的角色已禁用，可前往{" "}
-                <a className="mod-link" href="#/roles" onClick={onClose}>
-                  角色与模型
-                </a>{" "}
-                检测。
-              </div>
+            {rolesLoaded && !nodeRolesOffline && writerRoles.length > 0 && (
+              <RoleCheckNotice role={selectedWriterRoleObj} onRetry={requestCheck} />
             )}
             {errors.writerRole && <div className="mod-field-error">{errors.writerRole}</div>}
           </div>
@@ -1155,7 +1272,7 @@ export default function GenerateDialog({ onClose, initialModule }: { onClose: ()
                   ? "先选择节点并填「我是谁」"
                   : rolesState.loading
                     ? "正在读取角色…"
-                    : "选择可用的判定员角色"
+                    : "选择判定员角色（选了自动检测）"
               }
               options={judgeOptions}
               optionRender={(option) => (
@@ -1172,6 +1289,8 @@ export default function GenerateDialog({ onClose, initialModule }: { onClose: ()
               onChange={(val) => {
                 setReviewerRole(val);
                 setErrors((prev) => ({ ...prev, reviewerRole: undefined }));
+                const picked = judgeRoles.find((r) => r.id === val);
+                if (picked) requestCheck(picked);
               }}
             />
             {rolesLoaded && !nodeRolesOffline && judgeRoles.length === 0 && (
@@ -1182,25 +1301,11 @@ export default function GenerateDialog({ onClose, initialModule }: { onClose: ()
                 </a>
               </div>
             )}
-            {rolesLoaded && !nodeRolesOffline && judgeRoles.length > 0 && okJudgeRoles.length === 0 && (
-              <div className="mod-field-error">
-                当前「判定员」角色均未通过检测（已禁用）。请先前往{" "}
-                <a className="mod-link" href="#/roles" onClick={onClose}>
-                  角色与模型
-                </a>{" "}
-                完成检测。
-              </div>
-            )}
-            {rolesLoaded && !nodeRolesOffline && okJudgeRoles.length > 0 && judgeRoles.length > okJudgeRoles.length && (
-              <div className="mod-field-hint">
-                未检测或检测未通过的角色已禁用，可前往{" "}
-                <a className="mod-link" href="#/roles" onClick={onClose}>
-                  角色与模型
-                </a>{" "}
-                检测。
-              </div>
+            {rolesLoaded && !nodeRolesOffline && judgeRoles.length > 0 && (
+              <RoleCheckNotice role={selectedJudgeRoleObj} onRetry={requestCheck} />
             )}
             {errors.reviewerRole && <div className="mod-field-error">{errors.reviewerRole}</div>}
+            {checkWrite.error && <div className="mod-field-error">{checkWrite.error}</div>}
           </div>
         </div>
 
@@ -1244,6 +1349,7 @@ export default function GenerateDialog({ onClose, initialModule }: { onClose: ()
         )}
       </div>
 
+      {checkWrite.dialog}
       {pendingInput && (
         <ReviewTokenDialog
           disabled={submitting}
