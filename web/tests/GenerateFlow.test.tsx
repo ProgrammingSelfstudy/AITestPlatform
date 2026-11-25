@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import type { NodeView, RoleView } from "../src/api";
@@ -91,8 +91,34 @@ test("选了流程：流程里没检测的角色自动检测，检测通过后�
   await openAsOwner();
   await waitFor(() => expect([...checked].sort()).toEqual(["r1", "r3"]));
   // 检测中的轮询每 2 秒读一次，读到可用后「正在自动检测」的提示就没了
-  await waitFor(() => expect(screen.queryByText(/正在自动检测/)).not.toBeInTheDocument(), { timeout: 8000 });
-  expect(screen.queryByText(/还没检测/)).not.toBeInTheDocument();
+  await waitFor(() => expect(screen.queryByText(/还没检测|正在检测/)).not.toBeInTheDocument(), { timeout: 8000 });
+});
+
+test("没有审核口令：选流程后弹出口令框，输入后两个角色都开始检测", async () => {
+  const checked = serveWithCheck(
+    [role("r1", "case_writer", "牛马测试用例", "codex_exec", "unchecked"), role("r3", "judge", "找茬", "claude_cli", "unchecked")],
+    JSON.stringify({ case_writer: "牛马测试用例", judge: "找茬" }),
+  );
+  const user = await openAsOwner();
+  await user.type(await screen.findByLabelText("审核口令"), "9527");
+  await user.click(screen.getByRole("button", { name: /确\s?认/ }));
+  await waitFor(() => expect([...checked].sort()).toEqual(["r1", "r3"]));
+});
+
+test("口令框被关掉后检测没发出去：页面如实说没检测，点「立即检测」能重新开始", async () => {
+  const checked = serveWithCheck(
+    [role("r1", "case_writer", "牛马测试用例", "codex_exec", "unchecked"), role("r3", "judge", "找茬", "claude_cli", "ok")],
+    JSON.stringify({ case_writer: "牛马测试用例", judge: "找茬" }),
+  );
+  const user = await openAsOwner();
+  const tokenDialog = (await screen.findByLabelText("审核口令")).closest(".ant-modal") as HTMLElement;
+  await user.click(within(tokenDialog).getByRole("button", { name: /取\s?消/ }));
+  expect(checked).toEqual([]);
+  // 轮询读回真实状态后，不再假装在检测
+  const retry = await screen.findByRole("button", { name: "立即检测" }, { timeout: 8000 });
+  rememberReviewToken("9527");
+  await user.click(retry);
+  await waitFor(() => expect(checked).toEqual(["r1"]));
 });
 
 test("手动选一个没检测的角色：马上自动检测，不用再去角色页", async () => {

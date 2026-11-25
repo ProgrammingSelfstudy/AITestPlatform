@@ -152,7 +152,7 @@ function UploadIcon() {
 function roleNotReady(role: RoleView, label: string): string {
   const status = role.check.status;
   if (status === "checking") return `${label}角色「${role.name}」正在检测，等检测通过再提交`;
-  if (status === "unchecked") return `${label}角色「${role.name}」还没检测，重新选一次它就会自动检测`;
+  if (status === "unchecked") return `${label}角色「${role.name}」还没检测，点它下面的「立即检测」`;
   return `${label}角色「${role.name}」检测未通过（${CHECK_STATUS_META[status].text}），可以点「重新检测」再试`;
 }
 
@@ -162,7 +162,14 @@ function RoleCheckNotice({ role, onRetry }: { role: RoleView | null; onRetry: (r
   const status = role.check.status;
   if (status === "ok") return null;
   if (status === "checking") return <div className="mod-field-hint">正在检测「{role.name}」…通常几秒到半分钟，检测通过后才能提交。</div>;
-  if (status === "unchecked") return <div className="mod-field-hint">「{role.name}」还没检测，重新选一次它就会自动检测。</div>;
+  if (status === "unchecked") {
+    return (
+      <div className="mod-field-hint">
+        「{role.name}」还没检测（检测要用审核口令；刚才如果关掉了口令框，就是没发出去）。{" "}
+        <button type="button" className="mod-link" onClick={() => onRetry(role)}>立即检测</button>
+      </div>
+    );
+  }
   return (
     <div className="mod-field-error">
       「{role.name}」检测未通过：{CHECK_STATUS_META[status].text}
@@ -516,7 +523,7 @@ export default function GenerateDialog({ onClose, initialModule }: { onClose: ()
       const status = candidate.role.check.status;
       if (status === "unchecked") {
         toCheck.push(candidate.role);
-        notes.push(`流程里的${label}「${candidate.name}」正在自动检测…`);
+        notes.push(`流程里的${label}「${candidate.name}」还没检测，会自动检测（首次要输入审核口令）`);
       } else if (status === "checking") {
         notes.push(`流程里的${label}「${candidate.name}」正在检测…`);
       } else {
