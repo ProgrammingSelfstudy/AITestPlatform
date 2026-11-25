@@ -2528,10 +2528,12 @@ async fn 参数配置_一级列表能搜索分页_二级详情带配置项() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(headers[header::CACHE_CONTROL], "no-store");
     let all = json_body(&bytes);
-    assert_eq!(all["total"], 3);
+    assert_eq!(all["total"], 4);
     let codes: Vec<_> = all["rows"].as_array().unwrap().iter().map(|r| r["code"].as_str().unwrap().to_string()).collect();
-    assert_eq!(codes, ["role_limit", "device_retry", "stuck_detect"]);
+    assert_eq!(codes, ["role_limit", "device_retry", "stuck_detect", "account_identity"]);
     assert_eq!(all["rows"][0]["item_count"], 5);
+    // 账号身份只建类型、不预置任何身份：身份全由管理员在配置里添加
+    assert_eq!(all["rows"][3]["item_count"], 0);
 
     // 按编码、名称搜索；% 和 _ 当普通字符，不当通配符
     let (_, _, bytes) = request(&world.app, Method::GET, "/api/configs?code=retry", &[], "").await;
@@ -2541,10 +2543,10 @@ async fn 参数配置_一级列表能搜索分页_二级详情带配置项() {
     let (_, _, bytes) = request(&world.app, Method::GET, "/api/configs?code=%25", &[], "").await;
     assert_eq!(json_body(&bytes)["total"], 0, "% 不是通配符");
 
-    // 分页：每页 2 条，第 2 页只剩 1 条；每页条数超上限会被收到 100
+    // 分页：每页 2 条，第 2 页还有 2 条；每页条数超上限会被收到 100
     let (_, _, bytes) = request(&world.app, Method::GET, "/api/configs?page=2&page_size=2", &[], "").await;
     let page = json_body(&bytes);
-    assert_eq!((page["total"].clone(), page["rows"].as_array().unwrap().len()), (json!(3), 1));
+    assert_eq!((page["total"].clone(), page["rows"].as_array().unwrap().len()), (json!(4), 2));
     let (_, _, bytes) = request(&world.app, Method::GET, "/api/configs?page_size=100000", &[], "").await;
     assert_eq!(json_body(&bytes)["page_size"], 100);
 
@@ -2640,6 +2642,74 @@ async fn 参数配置_只有登录的管理员能改_值里不能有密码或密
     assert_eq!(admin(delete, json!({})).await.0, StatusCode::NOT_FOUND);
     assert_eq!(admin("/api/configs/demo_type/delete", json!({})).await.0, StatusCode::NO_CONTENT);
     assert_eq!(admin("/api/configs/demo_type/update", json!({"name": "x"})).await.0, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn 账号身份_只能用参数配置里的身份_账号列表不含凭证_被引用的身份不能删() {
+    let temp = TempPaths::with_config();
+    let state = test_state(config()).await;
+    let app = temp.app(state.clone());
+    let password = Uuid::new_v4().to_string();
+    for name in ["root", "other"] {
+        assert_eq!(post_credentials(&app, "/api/users", name, &password).await.0, StatusCode::CREATED);
+    }
+    sqlx::query("update users set is_admin = true where name = 'root'").execute(state.pool()).await.unwrap();
+    let (admin_token, other_token) = (login_token(&app, "root", &password).await, login_token(&app, "other", &password).await);
+    let post = |path: String, body: Value, name: &'static str, token: String| {
+        let app = app.clone();
+        async move {
+            let mut headers = WRITE_HEADERS.to_vec();
+            headers.push(("x-user-name", name));
+            headers.push(("x-user-token", token.as_str()));
+            let (status, _, bytes) = request(&app, Method::POST, &path, &headers, body.to_string()).await;
+            (status, bytes)
+        }
+    };
+    let admin = |path: String, body: Value| post(path, body, "root", admin_token.clone());
+
+    // 导入一个带用户名密码的账号：身份为空
+    let key = crate::accounts::AccountKey::from_hex(&"ab".repeat(32)).unwrap();
+    crate::accounts::import_accounts(
+        state.pool(), &key, "身份项目", "debug",
+        &[crate::accounts::NewAccount { username: "synthetic-user@x.invalid".into(), password: "synthetic-pass-9!".into(), nickname: "合成昵称".into(), tags: vec![], device_serial: None, identity: None }],
+    )
+    .await
+    .unwrap();
+
+    // 账号列表只有元数据，没有用户名、密码、密文
+    let (status, _, bytes) = request(&app, Method::GET, "/api/account-pool", &[], "").await;
+    assert_eq!(status, StatusCode::OK);
+    let body = text(&bytes);
+    assert!(body.contains("合成昵称"));
+    for leaked in ["synthetic-user", "synthetic-pass", "username", "password", "_enc"] {
+        assert!(!body.contains(leaked), "账号列表不能带出 {leaked}");
+    }
+    let id = json_body(&bytes)[0]["id"].as_str().unwrap().to_string();
+    let path = format!("/api/account-pool/{id}/identity");
+
+    // 配置里还没有任何身份：谁也不能把账号设成某个身份（不写死身份）
+    assert_eq!(admin(path.clone(), json!({"identity": "host"})).await.0, StatusCode::BAD_REQUEST);
+
+    // 管理员在参数配置里加身份后才能选；普通名字改不了
+    let item = json!({"name": "主播", "code": "host", "value": "host"});
+    assert_eq!(admin("/api/configs/account_identity/items".into(), item).await.0, StatusCode::CREATED);
+    assert_eq!(post(path.clone(), json!({"identity": "host"}), "other", other_token.clone()).await.0, StatusCode::FORBIDDEN);
+    assert_eq!(admin(path.clone(), json!({"identity": "host"})).await.0, StatusCode::NO_CONTENT);
+    let (_, _, bytes) = request(&app, Method::GET, "/api/account-pool", &[], "").await;
+    assert_eq!(json_body(&bytes)[0]["identity"], json!("host"));
+    assert_eq!(admin(format!("/api/account-pool/{}/identity", Uuid::new_v4()), json!({"identity": null})).await.0, StatusCode::NOT_FOUND);
+
+    // 身份还被账号用着：不能删、不能停用
+    let (_, _, bytes) = request(&app, Method::GET, "/api/configs/account_identity", &[], "").await;
+    let item_id = json_body(&bytes)["items"]["rows"][0]["id"].as_i64().unwrap();
+    let delete = format!("/api/configs/account_identity/items/{item_id}/delete");
+    let update = format!("/api/configs/account_identity/items/{item_id}/update");
+    assert_eq!(admin(delete.clone(), json!({})).await.0, StatusCode::CONFLICT);
+    assert_eq!(admin(update, json!({"name": "主播", "value": "host", "status": "disabled"})).await.0, StatusCode::CONFLICT);
+
+    // 清掉账号上的身份后就能删
+    assert_eq!(admin(path, json!({"identity": null})).await.0, StatusCode::NO_CONTENT);
+    assert_eq!(admin(delete, json!({})).await.0, StatusCode::NO_CONTENT);
 }
 
 #[tokio::test]

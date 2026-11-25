@@ -91,6 +91,8 @@ pub struct NewAccount {
     pub nickname: String,
     pub tags: Vec<String>,
     pub device_serial: Option<String>,
+    /// 身份编码（参数配置「账号身份」里的配置项编码）；None = 不区分身份
+    pub identity: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -101,6 +103,7 @@ struct YamlAccount {
     tags: Option<Vec<String>>,
     env: Option<String>,
     device: Option<String>,
+    identity: Option<String>,
 }
 
 #[derive(Debug, Error)]
@@ -113,6 +116,8 @@ pub enum ImportError {
     MixedEnv(usize),
     #[error("第 {0} 项的用户名或密码为空")]
     EmptyCredentials(usize),
+    #[error("第 {0} 项的身份不在参数配置「账号身份」里，请先在参数配置里添加这个身份")]
+    UnknownIdentity(usize),
     #[error("导入账号时写入数据库失败")]
     Database,
     #[error(transparent)]
@@ -158,6 +163,7 @@ pub fn parse_accounts(yaml: &str, env: &str) -> Result<Vec<NewAccount>, ImportEr
                     .filter(|tags| !tags.is_empty())
                     .unwrap_or_else(|| vec!["voice_room".into()]),
                 device_serial: row.device,
+                identity: row.identity.map(|v| v.trim().to_string()).filter(|v| !v.is_empty()),
             };
             validate_account(index, &account)?;
             Ok(account)
@@ -191,6 +197,11 @@ pub async fn import_accounts(
     let mut hashes = HashSet::new();
     for (index, account) in accounts.iter().enumerate() {
         validate_account(index, account)?;
+        if let Some(identity) = &account.identity {
+            if !identity_exists(&mut tx, identity).await.map_err(db)? {
+                return Err(ImportError::UnknownIdentity(index + 1));
+            }
+        }
         let hash = hex::encode(Sha256::digest(account.username.as_bytes()));
         let id = sqlx::query_scalar(
             "select id from test_accounts where project_id = $1 and env = $2 and username_hash = $3",
@@ -203,17 +214,17 @@ pub async fn import_accounts(
         .map_err(db)?
         .unwrap_or_else(Uuid::new_v4);
         let written = sqlx::query(
-            "insert into test_accounts (id, project_id, env, username_hash, username_enc, password_enc, nickname, tags, device_serial)
-             values ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            "insert into test_accounts (id, project_id, env, username_hash, username_enc, password_enc, nickname, tags, device_serial, identity)
+             values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
              on conflict (project_id, env, username_hash) do update set
                username_enc = excluded.username_enc, password_enc = excluded.password_enc, nickname = excluded.nickname,
-               device_serial = excluded.device_serial
+               device_serial = excluded.device_serial, identity = excluded.identity
              where test_accounts.id = excluded.id",
         )
         .bind(id).bind(project_id).bind(env).bind(&hash)
         .bind(encrypt(key, id, &account.username)?)
         .bind(encrypt(key, id, &account.password)?)
-        .bind(&account.nickname).bind(&account.tags).bind(&account.device_serial)
+        .bind(&account.nickname).bind(&account.tags).bind(&account.device_serial).bind(&account.identity)
         .execute(&mut *tx).await.map_err(db)?;
         if written.rows_affected() != 1 {
             return Err(ImportError::Database);
@@ -222,6 +233,17 @@ pub async fn import_accounts(
     }
     tx.commit().await.map_err(db)?;
     Ok(hashes.len())
+}
+
+/// 身份编码是否存在于参数配置「账号身份」里（类型和配置项都要是启用状态）。
+pub(crate) async fn identity_exists(conn: &mut PgConnection, code: &str) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar(
+        "select exists(select 1 from config_items i join config_types t on t.id = i.type_id
+         where t.code = 'account_identity' and i.code = $1 and i.status = 'normal' and t.status = 'normal')",
+    )
+    .bind(code)
+    .fetch_one(conn)
+    .await
 }
 
 pub(crate) struct AccountPool {
@@ -308,8 +330,8 @@ pub(crate) async fn acquire_with_settings(
     settings: &PoolSettings,
 ) -> Result<Option<Lease>, sqlx::Error> {
     let mut tx = conn.begin().await?;
-    let scope: Option<(Uuid, Uuid, String)> = sqlx::query_as(
-        "select t.project_id, r.node_id, d.serial from runs r join tasks t on t.id = r.task_id
+    let scope: Option<(Uuid, Uuid, String, Option<String>)> = sqlx::query_as(
+        "select t.project_id, r.node_id, d.serial, r.account_identity from runs r join tasks t on t.id = r.task_id
          join devices d on d.id = $2 and d.node_id = r.node_id
          where r.id = $1 and r.status = 'queued' and r.lease_id is null for update of r",
     )
@@ -317,7 +339,7 @@ pub(crate) async fn acquire_with_settings(
     .bind(device)
     .fetch_optional(&mut *tx)
     .await?;
-    let Some((project, node, serial)) = scope else {
+    let Some((project, node, serial, identity)) = scope else {
         return Ok(None);
     };
 
@@ -354,11 +376,12 @@ pub(crate) async fn acquire_with_settings(
     let account: Option<(Uuid, bool)> = sqlx::query_as(
         "select id, needs_cleanup from test_accounts where project_id = $1 and env = $2 and status = 'idle'
            and (device_serial is null or device_serial = $3)
+           and ($4::text is null or identity = $4)
            and (cooldown_until is null or cooldown_until <= clock_timestamp())
            and not exists (select 1 from account_leases l where l.account_id = test_accounts.id and l.released_at is null)
          order by device_serial is null, created_at, id for update skip locked limit 1",
     )
-    .bind(project).bind(&settings.env).bind(serial).fetch_optional(&mut *tx).await?;
+    .bind(project).bind(&settings.env).bind(serial).bind(identity).fetch_optional(&mut *tx).await?;
     let Some((account_id, needs_cleanup)) = account else {
         return Ok(None);
     };

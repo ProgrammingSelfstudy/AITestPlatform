@@ -231,6 +231,7 @@ async fn 无口令下载当前审核且导出不含凭证设备号和路径并�
             nickname: "测试账号昵称".into(),
             tags: vec![],
             device_serial: Some(serial.into()),
+            identity: None,
         }],
     )
     .await

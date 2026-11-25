@@ -54,6 +54,9 @@ pub(crate) fn routes(app: AppState, paths: Paths) -> Router {
         .route("/api/configs", get(crate::configs::api_list_types).post(crate::configs::api_create_type))
         .route("/api/configs/export", get(crate::configs::api_export))
         .route("/api/configs/import", post(crate::configs::api_import).layer(axum::extract::DefaultBodyLimit::max(2 * 1024 * 1024)))
+        // 账号池元数据（昵称、状态、身份）；不用 /api/accounts——那条路径有测试保证一直是 404，防止误开账号凭证接口
+        .route("/api/account-pool", get(crate::account_api::api_list_accounts))
+        .route("/api/account-pool/{id}/identity", post(crate::account_api::api_set_account_identity))
         .route("/api/configs/{code}", get(crate::configs::api_type_detail))
         // 写入全用 POST：浏览器写入守卫（来源、Content-Type、X-Requested-With）只管 POST
         .route("/api/configs/{code}/update", post(crate::configs::api_update_type))

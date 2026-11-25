@@ -333,7 +333,7 @@ async fn recovery_case(fault: Fault, serial: &str, real: bool) {
     server::cases::import(pool, "isolated", &[case], &BTreeMap::new()).await.unwrap();
     server::accounts::import_accounts(pool, &test_key(), "isolated", "debug", &[NewAccount {
         username: "synthetic-account".into(), password: "not-a-live-password".into(), nickname: "测试租约".into(),
-        tags: vec![], device_serial: Some(serial.into()),
+        tags: vec![], device_serial: Some(serial.into()), identity: None,
     }]).await.unwrap();
     let role = |source| RoleModel { source, model: None, effort: None };
     let task = server::runs::create_task(pool, &NewTask {

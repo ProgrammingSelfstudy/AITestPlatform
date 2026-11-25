@@ -44,6 +44,7 @@ fn account(suffix: &str) -> NewAccount {
         nickname: "合成样例".into(),
         tags: vec!["voice_room".into()],
         device_serial: None,
+        identity: None,
     }
 }
 
@@ -1213,4 +1214,108 @@ async fn 解密失败不消费一次性机会且追踪日志和响应头不含�
     let captured = String::from_utf8_lossy(&captured);
     assert!(captured.contains("解密账号凭证失败"));
     assert!(!captured.contains(USER) && !captured.contains(PASSWORD) && !captured.contains(TOKEN));
+}
+
+// ---------------------------------------------------------------- 账号身份
+
+fn identity_account(suffix: &str, identity: &str) -> NewAccount {
+    NewAccount {
+        identity: Some(identity.into()),
+        ..account(suffix)
+    }
+}
+
+impl World {
+    /// 在参数配置「账号身份」下登记身份（生产里由管理员在页面上加）。
+    async fn add_identities(&self, codes: &[&str]) {
+        for code in codes {
+            sqlx::query(
+                "insert into config_items (type_id, name, code, value) select id, $1, $1, $1 from config_types where code = 'account_identity'",
+            )
+            .bind(*code)
+            .execute(self.pool())
+            .await
+            .unwrap();
+        }
+    }
+
+    async fn set_case_identity(&self, case: &str, identity: &str) {
+        sqlx::query("update test_cases set account_identity = $2 where code = $1")
+            .bind(case)
+            .bind(identity)
+            .execute(self.pool())
+            .await
+            .unwrap();
+    }
+
+    async fn leased_identity(&self, lease: Uuid) -> Option<String> {
+        sqlx::query_scalar("select a.identity from account_leases l join test_accounts a on a.id = l.account_id where l.id = $1")
+            .bind(lease)
+            .fetch_one(self.pool())
+            .await
+            .unwrap()
+    }
+}
+
+#[tokio::test]
+async fn 用例指定身份只会领到该身份的账号() {
+    let w = World::new(1, Some(key()), "debug").await;
+    w.add_identities(&["normal", "vip"]).await;
+    // 普通账号入库更早，按原规则会先被选中
+    w.import("debug", &[identity_account("-normal", "normal"), identity_account("-vip", "vip")]).await;
+    // 用例 B 文本里没有 {{account.}}，只靠身份字段也要领账号
+    w.set_case_identity("B", "vip").await;
+    w.queue(&["B"]).await;
+    let claimed = w.claim().await.unwrap();
+    let lease = claimed.lease_id.expect("指定身份的用例必须领到账号租约");
+    assert_eq!(w.leased_identity(lease).await.as_deref(), Some("vip"));
+}
+
+#[tokio::test]
+async fn 指定身份的账号被占用时保持排队而不是借其他身份() {
+    let w = World::new(2, Some(key()), "debug").await;
+    w.add_identities(&["normal", "vip"]).await;
+    w.import("debug", &[identity_account("-normal", "normal"), identity_account("-vip", "vip")]).await;
+    w.set_case_identity("B", "vip").await;
+    let first = w.queue(&["B"]).await[0];
+    assert!(w.claim().await.unwrap().lease_id.is_some());
+    let second = w.queue(&["B"]).await[0];
+    assert!(w.claim().await.is_none(), "唯一的 vip 账号已被租用，第二条不能借 normal 账号");
+    w.assert_queued_and_unassigned(second).await;
+    let _ = first;
+}
+
+#[tokio::test]
+async fn 没有指定身份的用例仍可领任意账号() {
+    let w = World::new(1, Some(key()), "debug").await;
+    w.add_identities(&["vip"]).await;
+    w.import("debug", &[identity_account("-vip", "vip")]).await;
+    w.queue(&["A"]).await;
+    assert!(w.claim().await.unwrap().lease_id.is_some());
+}
+
+#[tokio::test]
+async fn 导入账号时身份不在参数配置里就整批拒绝() {
+    let w = World::new(1, Some(key()), "debug").await;
+    let err = import_accounts(w.pool(), &key(), PROJECT, "debug", &[identity_account("", "ghost")]).await.unwrap_err();
+    assert!(matches!(err, accounts::ImportError::UnknownIdentity(1)), "{err:?}");
+    let count: i64 = sqlx::query_scalar("select count(*) from test_accounts").fetch_one(w.pool()).await.unwrap();
+    assert_eq!(count, 0);
+}
+
+#[tokio::test]
+async fn 用例要的身份在账号池里不存在时创建任务就报错() {
+    let w = World::new(1, Some(key()), "debug").await;
+    w.add_identities(&["vip"]).await;
+    w.import("debug", &[account("")]).await; // 只有无身份账号
+    w.set_case_identity("B", "vip").await;
+    let role = RoleModel { source: ModelSource::CodexExec, model: None, effort: None };
+    let err = runs::create_task(
+        w.pool(),
+        &NewTask { project: PROJECT.into(), node_id: w.node, case_codes: vec!["B".into()], executor: role.clone(), judge: role },
+    )
+    .await
+    .unwrap_err();
+    let message = err.to_string();
+    assert!(message.contains("vip") && message.contains("账号池里没有"), "{message}");
 }

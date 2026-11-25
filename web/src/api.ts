@@ -208,6 +208,8 @@ export interface LatestRun {
 }
 
 export interface ModuleCase {
+  /** 要用哪个身份的测试账号（参数配置「账号身份」里的编码）；null = 不限 */
+  account_identity?: string | null;
   code: string;
   title: string;
   /** 运行环境：app / h5 / browser（和 CSV 里的「运行环境」一致） */
@@ -782,6 +784,37 @@ export async function fetchRoleLimits(signal?: AbortSignal): Promise<Record<stri
   return limits;
 }
 
+export interface AccountIdentityOption {
+  code: string;
+  name: string;
+}
+
+/** 账号身份清单：只来自参数配置「账号身份」里启用的配置项，代码里不放任何固定身份。canWrite = 当前用户是管理员 */
+export async function fetchAccountIdentities(userName = "", signal?: AbortSignal): Promise<{ options: AccountIdentityOption[]; canWrite: boolean }> {
+  const detail = await getWith<ConfigTypeDetail>("/api/configs/account_identity?page=1&page_size=100", userName, signal);
+  if (detail.type.status !== "normal") return { options: [], canWrite: detail.can_write };
+  const rows = [...detail.items.rows].filter((item) => item.status === "normal").sort((a, b) => a.sort - b.sort || a.code.localeCompare(b.code));
+  return { options: rows.map((item) => ({ code: item.code, name: item.name })), canWrite: detail.can_write };
+}
+
+/** 账号池里一个账号的元数据：没有用户名、密码，也没有密文 */
+export interface PoolAccount {
+  id: string;
+  project: string;
+  env: string;
+  nickname: string;
+  status: "idle" | "leased" | "cooling" | "quarantined";
+  device_serial: string | null;
+  identity: string | null;
+}
+
+export const fetchPoolAccounts = (signal?: AbortSignal) => get<PoolAccount[]>("/api/account-pool", signal);
+
+/** 给账号勾选身份（管理员）；identity 传 null 表示清除 */
+export const setAccountIdentity = async (id: string, identity: string | null, userName: string) => {
+  await adminPost(`/api/account-pool/${encodeURIComponent(id)}/identity`, { identity }, userName);
+};
+
 export interface ConfigDocument {
   types: { name: string; code: string; remark?: string; status?: ConfigStatus; items?: { name: string; code: string; value: string; label?: string; group_name?: string; sort?: number; remark?: string; status?: ConfigStatus }[] }[];
 }
@@ -909,6 +942,7 @@ export interface ModuleCaseInput {
   preconditions: string[];
   steps: string[];
   expected: string[];
+  account_identity?: string | null;
 }
 
 /** 在模块下在线新增一条用例（自动已批准，与 CSV 导入一致） */

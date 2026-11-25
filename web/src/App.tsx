@@ -8,6 +8,7 @@ import RolesPage from "./RolesPage";
 import ModulesPage from "./ModulesPage";
 import ConfigsPage from "./ConfigsPage";
 import ConfigDetailPage from "./ConfigDetailPage";
+import AccountsPage from "./AccountsPage";
 import ModuleDetailPage from "./ModuleDetailPage";
 import RunPage from "./RunPage";
 import { TaskPage, TasksPage } from "./TasksPage";
@@ -15,7 +16,7 @@ import "./styles.css";
 import "./configs.css";
 
 type Mode = "light" | "dark";
-type Route = { page: "nodes" | "tasks" | "scripts" | "roles" | "modules" | "configs" | "admin" | "missing" } | { page: "task" | "run" | "module" | "config"; id: string };
+type Route = { page: "nodes" | "tasks" | "scripts" | "roles" | "modules" | "configs" | "accounts" | "admin" | "missing" } | { page: "task" | "run" | "module" | "config"; id: string };
 
 function readRoute(): Route {
   const hash = window.location.hash;
@@ -25,6 +26,7 @@ function readRoute(): Route {
   if (hash === "#/roles") return { page: "roles" };
   if (hash === "#/modules") return { page: "modules" };
   if (hash === "#/configs") return { page: "configs" };
+  if (hash === "#/configs/accounts") return { page: "accounts" };
   if (hash === "#/admin") return { page: "admin" };
   const configMatch = /^#\/configs\/([A-Za-z0-9_-]+)$/.exec(hash);
   if (configMatch) return { page: "config", id: configMatch[1] };
@@ -54,6 +56,7 @@ const BREADCRUMB: Record<Route["page"], string> = {
   modules: "模块",
   configs: "参数配置",
   config: "配置详情",
+  accounts: "账号",
   admin: "管理员",
   module: "模块详情",
   task: "任务详情",
@@ -256,6 +259,7 @@ function Shell({ mode, onToggle }: { mode: Mode; onToggle: () => void }) {
           {route.page === "roles" && <RolesPage />}
           {route.page === "modules" && <ModulesPage />}
           {route.page === "configs" && <ConfigsPage />}
+          {route.page === "accounts" && <AccountsPage />}
           {route.page === "config" && <ConfigDetailPage key={route.id} code={route.id} />}
           {route.page === "admin" && <AdminPage />}
           {route.page === "module" && <ModuleDetailPage key={route.id} id={route.id} />}

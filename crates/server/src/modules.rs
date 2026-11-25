@@ -821,6 +821,8 @@ pub struct ModuleCase {
     pub review_note: String,
     pub steps: Vec<String>,
     pub expected: Vec<String>,
+    /// 要用哪个身份的测试账号（null = 不限）
+    pub account_identity: Option<String>,
     /// 这条用例最近一次执行（还没执行过为 null）
     pub latest_run: Option<LatestRun>,
 }
@@ -843,7 +845,7 @@ pub async fn module_cases(pool: &PgPool, module_id: Uuid) -> Res<Vec<ModuleCase>
         return Err(ModuleError::NotFound("没有这个模块".into()));
     }
     let rows = sqlx::query(
-        "select c.code, c.title, c.level, c.platforms, c.preconditions, c.origin, c.review_status, c.review_note, c.steps, c.expected,
+        "select c.code, c.title, c.level, c.platforms, c.preconditions, c.origin, c.review_status, c.review_note, c.steps, c.expected, c.account_identity,
                 r.id as run_id, r.task_id, r.status as run_status, r.final_result, r.blocked_reason, r.executor_reason, r.queued_at
          from test_cases c
          left join lateral (select * from runs x where x.case_id = c.id order by x.seq desc limit 1) r on true
@@ -866,6 +868,7 @@ pub async fn module_cases(pool: &PgPool, module_id: Uuid) -> Res<Vec<ModuleCase>
             review_note: r.get("review_note"),
             steps: strings(r.get("steps")),
             expected: r.get::<serde_json::Value, _>("expected").as_array().map(|a| a.iter().filter_map(|e| e["text"].as_str().map(str::to_owned)).collect()).unwrap_or_default(),
+            account_identity: r.get("account_identity"),
             latest_run: r.get::<Option<Uuid>, _>("run_id").map(|run_id| LatestRun {
                 run_id,
                 task_id: r.get("task_id"),

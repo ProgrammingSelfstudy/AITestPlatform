@@ -2,6 +2,7 @@
 //!
 //! 服务默认只监听本机（`PLATFORM_ALLOW_LAN=1` 才允许放开局域网，见 main.rs）。账号明文只经节点令牌认证的一次性接口交给执行节点。
 
+mod account_api;
 pub mod accounts;
 mod admin;
 mod api;

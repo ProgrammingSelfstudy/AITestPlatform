@@ -180,6 +180,7 @@ export default function ConfigsPage() {
       <div className="config-toolbar">
         <Tooltip title={canWrite ? undefined : NEED_ADMIN_HINT}><span><Button type="primary" disabled={!canWrite} onClick={() => setDrawer({ open: true, editing: null })}>新增</Button></span></Tooltip>
         <Tooltip title={canWrite ? undefined : NEED_ADMIN_HINT}><span><Button disabled={!canWrite} onClick={() => setImporting(true)}>导入</Button></span></Tooltip>
+        <Button href="#/configs/accounts">账号</Button>
         <Button onClick={reload}>刷新</Button>
       </div>
 

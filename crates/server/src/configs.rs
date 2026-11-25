@@ -199,7 +199,7 @@ async fn admin_user(state: &ApiState, headers: &HeaderMap) -> Result<Option<Stri
     Ok(row.map(|(name,)| name))
 }
 
-async fn require_admin(state: &ApiState, headers: &HeaderMap) -> Result<String, ApiError> {
+pub(crate) async fn require_admin(state: &ApiState, headers: &HeaderMap) -> Result<String, ApiError> {
     admin_user(state, headers).await?.ok_or((StatusCode::FORBIDDEN, NEED_ADMIN.to_string()))
 }
 
@@ -426,6 +426,9 @@ pub(crate) async fn api_update_item(State(state): State<ApiState>, headers: Head
         .map_err(|e| internal("查询配置项失败", e))?
         .ok_or((StatusCode::NOT_FOUND, "没有这个配置项".to_string()))?;
     check_known_value(&code, &item_code, &clean.value)?;
+    if status != "normal" {
+        guard_identity_in_use(&state, &code, &item_code).await?;
+    }
     let done = sqlx::query(
         "update config_items set name=$3, value=$4, label=$5, group_name=$6, sort=$7, remark=$8, status=$9, updated_at=now(), updated_by=$10
          where id=$2 and type_id=$1",
@@ -442,9 +445,35 @@ pub(crate) async fn api_update_item(State(state): State<ApiState>, headers: Head
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// 「账号身份」类型下的身份还被账号或用例用着时，不允许删除或停用，否则账号和用例会悬空、永远领不到号。
+async fn guard_identity_in_use(state: &ApiState, type_code: &str, item_code: &str) -> Result<(), ApiError> {
+    if type_code != "account_identity" {
+        return Ok(());
+    }
+    let (accounts, cases): (i64, i64) = sqlx::query_as(
+        "select (select count(*) from test_accounts where identity = $1), (select count(*) from test_cases where account_identity = $1 and status != 'archived')",
+    )
+    .bind(item_code)
+    .fetch_one(state.app.pool())
+    .await
+    .map_err(|e| internal("查询身份引用失败", e))?;
+    if accounts > 0 || cases > 0 {
+        return Err((StatusCode::CONFLICT, format!("这个身份还被 {accounts} 个账号、{cases} 条用例使用，请先改掉它们再删除或停用")));
+    }
+    Ok(())
+}
+
 pub(crate) async fn api_delete_item(State(state): State<ApiState>, headers: HeaderMap, Path((code, item)): Path<(String, i64)>) -> Result<StatusCode, ApiError> {
     require_admin(&state, &headers).await?;
     let id = type_id(&state, &code).await?;
+    let item_code: Option<String> = sqlx::query_scalar("select code from config_items where id = $2 and type_id = $1")
+        .bind(id).bind(item)
+        .fetch_optional(state.app.pool())
+        .await
+        .map_err(|e| internal("查询配置项失败", e))?;
+    if let Some(item_code) = &item_code {
+        guard_identity_in_use(&state, &code, item_code).await?;
+    }
     let done = sqlx::query("delete from config_items where id = $2 and type_id = $1")
         .bind(id).bind(item)
         .execute(state.app.pool())

@@ -203,7 +203,7 @@ pub async fn create_task_with_judges(pool: &PgPool, t: &NewTask, extra_judges: &
     // 这个节点上登记过的设备平台（不管现在在线还是忙）：判断用例要的设备有没有
     let node_platforms: Vec<String> = sqlx::query_scalar("select distinct platform from devices where node_id = $1").bind(t.node_id).fetch_all(&mut *tx).await?;
     for code in &t.case_codes {
-        let Some(r) = sqlx::query("select id, status, blocked_reason, version, review_status, platforms from test_cases where project_id = $1 and code = $2").bind(project_id).bind(code).fetch_optional(&mut *tx).await? else {
+        let Some(r) = sqlx::query("select id, status, blocked_reason, version, review_status, platforms, account_identity from test_cases where project_id = $1 and code = $2").bind(project_id).bind(code).fetch_optional(&mut *tx).await? else {
             problems.push(format!("{code} 不存在"));
             continue;
         };
@@ -218,6 +218,19 @@ pub async fn create_task_with_judges(pool: &PgPool, t: &NewTask, extra_judges: &
         if review != "approved" {
             problems.push(format!("{code} 还没有通过复核和人工确认（当前：{review}）"));
             continue;
+        }
+        // 用例指定了账号身份：账号池里至少要有一个这个身份的账号，否则永远领不到，不如创建时就说清楚
+        let account_identity: Option<String> = r.get("account_identity");
+        if let Some(identity) = &account_identity {
+            let has: bool = sqlx::query_scalar("select exists(select 1 from test_accounts where project_id = $1 and identity = $2)")
+                .bind(project_id)
+                .bind(identity)
+                .fetch_one(&mut *tx)
+                .await?;
+            if !has {
+                problems.push(format!("{code} 需要身份「{identity}」的账号，但账号池里没有这个身份的账号"));
+                continue;
+            }
         }
         let case_id: Uuid = r.get("id");
         let (spec, version) = crate::cases::spec_by_id(&mut tx, case_id).await?;
@@ -239,12 +252,13 @@ pub async fn create_task_with_judges(pool: &PgPool, t: &NewTask, extra_judges: &
             skipped.push(SkippedCase { code: code.clone(), reason });
             continue;
         }
-        let id: Uuid = sqlx::query_scalar("insert into runs (task_id, case_id, case_version, case_spec, node_id) values ($1,$2,$3,$4,$5) returning id")
+        let id: Uuid = sqlx::query_scalar("insert into runs (task_id, case_id, case_version, case_spec, node_id, account_identity) values ($1,$2,$3,$4,$5,$6) returning id")
             .bind(task_id)
             .bind(case_id)
             .bind(version)
             .bind(serde_json::to_value(&spec).expect("可序列化"))
             .bind(t.node_id)
+            .bind(&account_identity)
             .fetch_one(&mut *tx)
             .await?;
         run_ids.push(id);
@@ -266,7 +280,7 @@ pub async fn skip_account_runs(pool: &PgPool, task_id: Uuid) -> Res<Vec<SkippedC
     let reason = "这条用例要用测试账号，但平台还没有配置账号池，已跳过";
     let rows = sqlx::query(
         "update runs set status = 'blocked', final_result = 'blocked', blocked_reason = 'skipped', executor_reason = $2, finished_at = now()
-         where task_id = $1 and status = 'queued' and strpos(case_spec::text, '{{account.') > 0
+         where task_id = $1 and status = 'queued' and (strpos(case_spec::text, '{{account.') > 0 or account_identity is not null)
          returning (case_spec->>'code') as code",
     )
     .bind(task_id)
@@ -306,10 +320,10 @@ pub(crate) async fn claim_next_with_accounts(pool: &PgPool, node_id: Uuid, accou
         let mut tx = pool.begin().await?;
         let run = sqlx::query(
             "select r.id, r.task_id, r.case_version, r.case_spec, r.seq, t.executor, t.judge, t.extra_judges,
-                    strpos(r.case_spec::text, '{{account.') > 0 as needs_account
+                    (strpos(r.case_spec::text, '{{account.') > 0 or r.account_identity is not null) as needs_account
              from runs r join tasks t on t.id = r.task_id
              where r.node_id = $1 and r.status = 'queued' and r.seq > $2
-               and ($3 or strpos(r.case_spec::text, '{{account.') = 0)
+               and ($3 or (strpos(r.case_spec::text, '{{account.') = 0 and r.account_identity is null))
              order by r.seq for update of r skip locked limit 1",
         )
         .bind(node_id).bind(after_seq).bind(accounts.is_some()).fetch_optional(&mut *tx).await?;

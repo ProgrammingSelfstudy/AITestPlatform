@@ -4,9 +4,11 @@ import { useEffect, useState } from "react";
 import {
   createModuleCase,
   deleteModuleCase,
+  fetchAccountIdentities,
   importModuleCases,
   moduleCasesCsvUrl,
   updateModuleCase,
+  type AccountIdentityOption,
   type LatestRun,
   type ModuleCase,
   type ReviewStatus,
@@ -134,6 +136,8 @@ function CaseEditorDialog({
   const [title, setTitle] = useState("");
   const [runEnv, setRunEnv] = useState<ModuleCase["run_env"]>("app");
   const [level, setLevel] = useState("");
+  const [identity, setIdentity] = useState<string | undefined>(undefined);
+  const [identities, setIdentities] = useState<AccountIdentityOption[]>([]);
   const [preconditions, setPreconditions] = useState("");
   const [steps, setSteps] = useState("");
   const [expected, setExpected] = useState("");
@@ -146,12 +150,23 @@ function CaseEditorDialog({
     setTitle(editing?.title ?? "");
     setRunEnv(editing?.run_env ?? "app");
     setLevel(editing?.level ?? "");
+    setIdentity(editing?.account_identity ?? undefined);
     setPreconditions((editing?.preconditions ?? []).join("\n"));
     setSteps((editing?.steps ?? []).join("\n"));
     setExpected((editing?.expected ?? []).join("\n"));
     setDirty(false);
     write.setError(null);
   }, [open, editing]);
+
+  // 身份下拉的选项只来自参数配置「账号身份」；读不到就不给选，不影响其他字段
+  useEffect(() => {
+    if (!open) return;
+    const controller = new AbortController();
+    fetchAccountIdentities(userName.trim(), controller.signal)
+      .then((r) => setIdentities(r.options))
+      .catch(() => setIdentities([]));
+    return () => controller.abort();
+  }, [open, userName]);
 
   useUnsavedWarning(open && dirty);
 
@@ -160,6 +175,7 @@ function CaseEditorDialog({
       title: title.trim(),
       run_env: runEnv,
       level: level.trim(),
+      account_identity: identity ?? null,
       preconditions: splitLines(preconditions),
       steps: splitLines(steps),
       expected: splitLines(expected),
@@ -242,6 +258,23 @@ function CaseEditorDialog({
             />
           </label>
         </div>
+        <label>
+          <div className="mod-field-meta">账号身份（可选；选了就只用该身份的测试账号，选项在参数配置「账号身份」里维护）</div>
+          <Select<string>
+            aria-label="账号身份"
+            style={{ width: "100%" }}
+            value={identity}
+            allowClear
+            disabled={write.busy}
+            placeholder={identities.length === 0 ? "还没有配置账号身份" : "不限身份"}
+            onChange={(v) => { setIdentity(v); setDirty(true); }}
+            options={[
+              ...identities.map((i) => ({ value: i.code, label: `${i.name}（${i.code}）` })),
+              // 用例上已有的身份被停用/删除后仍要能看到，不能悄悄变成「不限」
+              ...(identity && !identities.some((i) => i.code === identity) ? [{ value: identity, label: `${identity}（已不在配置里）` }] : []),
+            ]}
+          />
+        </label>
         <label>
           <div className="mod-field-meta">前置条件（一行一条，可选；账号密码只能用 {"{{account.xxx}}"} 占位符）</div>
           <Input.TextArea

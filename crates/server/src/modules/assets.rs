@@ -614,6 +614,9 @@ pub(crate) struct SingleCaseInput {
     preconditions: Vec<String>,
     steps: Vec<String>,
     expected: Vec<String>,
+    /// 要用哪个身份的测试账号（参数配置「账号身份」里的编码）；空 = 不限身份
+    #[serde(default)]
+    account_identity: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -628,6 +631,19 @@ pub(crate) struct UpdateCaseInput {
     preconditions: Vec<String>,
     steps: Vec<String>,
     expected: Vec<String>,
+    #[serde(default)]
+    account_identity: Option<String>,
+}
+
+/// 校验账号身份：空白当作不限；非空必须是参数配置「账号身份」里启用的配置项。
+async fn checked_identity(tx: &mut sqlx::PgConnection, raw: &Option<String>) -> Result<Option<String>, ApiError> {
+    let Some(identity) = raw.as_deref().map(str::trim).filter(|v| !v.is_empty()) else {
+        return Ok(None);
+    };
+    if !crate::accounts::identity_exists(tx, identity).await.map_err(|e| internal("校验账号身份失败", e))? {
+        return Err(bad("账号身份不在参数配置「账号身份」里，请先在参数配置里添加"));
+    }
+    Ok(Some(identity.to_string()))
 }
 
 /// 在模块下在线新增一条用例：人手工录入默认已批准，与 CSV 导入口径一致；同项目内编号唯一。
@@ -664,10 +680,11 @@ pub(crate) async fn api_create_case(
         };
         return Err((StatusCode::CONFLICT, msg));
     }
+    let account_identity = checked_identity(&mut tx, &input.account_identity).await?;
     let expected: Vec<serde_json::Value> = case.expected.iter().enumerate().map(|(i, t)| serde_json::json!({ "idx": i + 1, "text": t })).collect();
     sqlx::query(
-        "insert into test_cases (project_id, code, title, level, platforms, preconditions, steps, expected, should_fail, status, module_id, origin, review_status)
-         values ($1,$2,$3,$4,$5,$6,$7,$8,$9,'active',$10,'imported','approved')",
+        "insert into test_cases (project_id, code, title, level, platforms, preconditions, steps, expected, should_fail, status, module_id, origin, review_status, account_identity)
+         values ($1,$2,$3,$4,$5,$6,$7,$8,$9,'active',$10,'imported','approved',$11)",
     )
     .bind(project_id)
     .bind(&case.code)
@@ -679,6 +696,7 @@ pub(crate) async fn api_create_case(
     .bind(serde_json::Value::Array(expected))
     .bind(case.level == crate::cases::NEGATIVE_LEVEL)
     .bind(module)
+    .bind(&account_identity)
     .execute(&mut *tx)
     .await
     .map_err(|e| internal("新增用例失败", e))?;
@@ -711,14 +729,15 @@ pub(crate) async fn api_update_case(
     let Some((case_id, old_version)) = current else {
         return Err((StatusCode::NOT_FOUND, "这个模块里没有这条用例".to_string()));
     };
+    let account_identity = checked_identity(&mut tx, &input.account_identity).await?;
     let expected: Vec<serde_json::Value> = case.expected.iter().enumerate().map(|(i, t)| serde_json::json!({ "idx": i + 1, "text": t })).collect();
     let new_version: Option<i32> = sqlx::query_scalar(
         "update test_cases set
-           title = $2, level = $3, platforms = $4, preconditions = $5, steps = $6, expected = $7, should_fail = $8,
+           title = $2, level = $3, platforms = $4, preconditions = $5, steps = $6, expected = $7, should_fail = $8, account_identity = $9,
            version = version + 1, updated_at = now()
          where id = $1
-           and (title, level, platforms, preconditions, steps, expected, should_fail)
-               is distinct from ($2, $3, $4, $5, $6, $7, $8)
+           and (title, level, platforms, preconditions, steps, expected, should_fail, account_identity)
+               is distinct from ($2, $3, $4, $5, $6, $7, $8, $9)
          returning version",
     )
     .bind(case_id)
@@ -729,6 +748,7 @@ pub(crate) async fn api_update_case(
     .bind(serde_json::json!(case.steps))
     .bind(serde_json::Value::Array(expected))
     .bind(case.level == crate::cases::NEGATIVE_LEVEL)
+    .bind(&account_identity)
     .fetch_optional(&mut *tx)
     .await
     .map_err(|e| internal("修改用例失败", e))?;
