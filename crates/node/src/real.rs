@@ -14,7 +14,8 @@ use agent::claude_cli::ClaudeOpts;
 use agent::codex_exec::command::DeviceMcp;
 use agent::codex_exec::{run_executor, CodexOpts};
 use agent::judge::{run_judge, run_judge_agy};
-use agent::prompts::{build_task_prompt, device_hints, AppKnowledge, DEVICE_TOOLS, SYSTEM_PROMPT};
+use agent::prompts::{build_task_prompt, device_hints, generic_device_hints, AppKnowledge, DEVICE_TOOLS, SYSTEM_PROMPT};
+use device::api::DeviceApi;
 use protocol::{BlockedReason, FinalResult, JudgeOpinion, JudgeStatus, LeaseCredentials, ModelSource, RoleModel, RunAssign, Verdict};
 use serde_json::json;
 use uuid::Uuid;
@@ -24,10 +25,23 @@ use crate::runner::{Reporter, RunExecutor};
 use crate::setup_runner::{run_setup, AccountArg, SetupResult, SetupSpec};
 use crate::uploader::{Execution, track_execution, upload_recordings};
 
+/// 前置/收尾准备方式：
+/// - `HafaScript`：调 Python 自动化脚本（`automation/hafa_automation`），用于有定制前置流程的 Hafa 用例；
+/// - `Generic`：纯 Rust 通用 App 准备（唤醒解锁 → 启动被测应用；收尾停应用），不依赖 Python 和测试音频。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SetupMode {
+    #[default]
+    HafaScript,
+    Generic,
+}
+
 #[derive(Clone)]
 pub struct RealConfig {
     pub platform_http: reqwest::Url,
     pub node_token: String,
+    pub setup_mode: SetupMode,
+    /// 是否把 Hafa 语聊房专属坐标提示注入任务提示词；非 Hafa 应用或显式关闭时只传通用屏幕信息
+    pub hafa_hints: bool,
     pub python: String,
     pub automation_dir: PathBuf,
     pub audio_dir: PathBuf,
@@ -50,9 +64,72 @@ pub struct RealExecutor(pub RealConfig);
 
 impl RealExecutor {
     async fn teardown(&self, serial: &str) -> SetupResult {
+        if self.0.setup_mode == SetupMode::Generic {
+            return self.teardown_generic(&device::Android::new(serial)).await;
+        }
         let mut t = self.spec(serial);
         t.teardown = true;
         run_setup(&t, |_| {}).await
+    }
+
+    pub(crate) async fn teardown_generic(&self, dev: &dyn DeviceApi) -> SetupResult {
+        if self.0.package.is_empty() {
+            return SetupResult::Ok;
+        }
+        match dev.stop_app(&self.0.package).await {
+            Ok(()) => SetupResult::Ok,
+            Err(e) => SetupResult::StepFailed { msg: format!("停止被测应用失败：{e}"), page: vec![] },
+        }
+    }
+
+    /// 通用 App 前置准备（纯 Rust）：唤醒解锁 →（按需强停）→ 启动被测应用。
+    /// 若用例绑定了账号租约，同样一次性拉取凭证并作为脱敏/注入清单传给设备 MCP（由 `input_text` 注入）。
+    pub(crate) async fn setup_generic<F>(
+        &self, a: &RunAssign, rep: &Reporter, dev: &dyn DeviceApi, send: impl FnOnce(reqwest::RequestBuilder) -> F + Send,
+    ) -> Option<(i32, Vec<(String, String)>)>
+    where
+        F: Future<Output = reqwest::Result<reqwest::Response>> + Send,
+    {
+        let mut secrets = Vec::new();
+        if let Some(lease_id) = a.lease_id {
+            match self.fetch_account(lease_id, rep.node_id(), send).await {
+                Ok(acc) => {
+                    secrets.push((acc.username, "{{account.username}}".into()));
+                    secrets.push((acc.password, "{{account.password}}".into()));
+                }
+                Err(detail) => {
+                    rep.blocked(BlockedReason::Setup, detail);
+                    return None;
+                }
+            }
+        }
+        rep.log("info", format!("通用前置准备开始：{}", a.case.code));
+        match dev.ensure_awake().await {
+            Ok(true) => rep.log("info", "[setup] 屏幕已唤醒并解锁".into()),
+            Ok(false) => {
+                rep.blocked(BlockedReason::Setup, "屏幕仍然锁定（可能设了 PIN / 图案），需要人工解锁".into());
+                return None;
+            }
+            Err(e) => {
+                rep.blocked(BlockedReason::Setup, format!("唤醒解锁设备失败：{e}"));
+                return None;
+            }
+        }
+        if a.needs_cleanup && !self.0.package.is_empty() {
+            if let Err(e) = dev.stop_app(&self.0.package).await {
+                rep.blocked(BlockedReason::Setup, format!("执行前停止被测应用失败：{e}"));
+                return None;
+            }
+        }
+        if !self.0.package.is_empty() && !self.0.activity.is_empty() {
+            if let Err(e) = dev.launch_app(&self.0.package, &self.0.activity).await {
+                rep.blocked(BlockedReason::Setup, format!("启动被测应用失败：{e}"));
+                return None;
+            }
+            rep.log("info", format!("[setup] 已启动被测应用 {}/{}", self.0.package, self.0.activity));
+        }
+        let bottom_shift = self.0.bottom_shift.get(&a.device_serial).copied().unwrap_or(0);
+        Some((bottom_shift, secrets))
     }
 
     fn spec(&self, serial: &str) -> SetupSpec {
@@ -90,6 +167,9 @@ impl RealExecutor {
     where
         F: Future<Output = reqwest::Result<reqwest::Response>> + Send,
     {
+        if self.0.setup_mode == SetupMode::Generic {
+            return self.setup_generic(a, rep, &device::Android::new(&a.device_serial), send).await;
+        }
         let serial = &a.device_serial;
         let mut s = self.spec(serial);
         s.case = Some(a.case.code.clone());
@@ -215,7 +295,11 @@ impl RealExecutor {
         o.reasoning_effort = a.executor.effort.clone();
         o.timeout = Duration::from_secs(u64::from(a.limits.timeout_s));
         let know = AppKnowledge { info: c.app_info.clone(), verified: vec![] };
-        let hints = device_hints(c.screen.0, c.screen.1, bottom_shift);
+        let hints = if c.hafa_hints {
+            device_hints(c.screen.0, c.screen.1, bottom_shift)
+        } else {
+            generic_device_hints(c.screen.0, c.screen.1, bottom_shift)
+        };
         let prompt = build_task_prompt(&a.case, &know, &hints);
         let warnings = rep.clone();
         let upload = {

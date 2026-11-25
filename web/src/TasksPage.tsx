@@ -140,7 +140,8 @@ export function TasksPage() {
             </div>
           </div>
           <Table<TaskSummary>
-            rowKey="task_id" columns={taskColumns} dataSource={rows} pagination={false} scroll={{ x: 980 }}
+            rowKey="task_id" columns={taskColumns} dataSource={rows} scroll={{ x: 980 }}
+            pagination={{ pageSize: 20, showSizeChanger: true, pageSizeOptions: [10, 20, 50], hideOnSinglePage: true, showTotal: (n) => `共 ${n} 个任务` }}
             locale={{
               emptyText: (
                 <div className="table-empty-box">
@@ -179,6 +180,20 @@ export function TasksPage() {
 
 const taskInProgress = (task: TaskDetail) => task.runs.some((run) => !isTerminal(run));
 
+/** 筛出可以一键重跑的用例编号：已结束、未通过、且不是「条件不足已跳过」的用例（去重保序） */
+export function retryableRunCodes(runs: Pick<RunView, "code" | "status" | "final_result" | "blocked_reason">[]): string[] {
+  const seen = new Set<string>();
+  const codes: string[] = [];
+  for (const run of runs) {
+    if (!isTerminal(run) || run.final_result === "passed" || run.blocked_reason === "skipped") continue;
+    if (!seen.has(run.code)) {
+      seen.add(run.code);
+      codes.push(run.code);
+    }
+  }
+  return codes;
+}
+
 function countRuns(runs: RunView[]): VerdictCounts {
   const counts: VerdictCounts = { passed: 0, failed: 0, uncertain: 0, blocked: 0, running: 0, cancelled: 0 };
   for (const run of runs) {
@@ -210,6 +225,8 @@ export function TaskPage({ id }: { id: string }) {
   const [actionError, setActionError] = useState<string | null>(null);
   const [cancelling, setCancelling] = useState<string | null>(null);
   const [pendingCancel, setPendingCancel] = useState<string | null>(null);
+  const [rerunOpen, setRerunOpen] = useState(false);
+  const rerunCodes = useMemo(() => (task ? retryableRunCodes(task.runs) : []), [task]);
 
   async function cancel(runId: string, enteredToken?: string) {
     const token = enteredToken ?? readReviewToken();
@@ -279,6 +296,11 @@ export function TaskPage({ id }: { id: string }) {
           <Typography.Title level={3}>任务详情</Typography.Title>
           <p className="page-desc">查看任务配置、执行节点与各用例运行结果，点击用例编号进入完整时间线与审核页。</p>
         </div>
+        {rerunCodes.length > 0 && (
+          <Button type="primary" onClick={() => setRerunOpen(true)}>
+            重跑未通过用例（{rerunCodes.length}）
+          </Button>
+        )}
       </div>
       {error ? <LoadError title="无法加载任务详情" error={error} /> : !task ? <Skeleton active /> : (() => {
         const counts = countRuns(task.runs);
@@ -342,6 +364,16 @@ export function TaskPage({ id }: { id: string }) {
           </div>
         );
       })()}
+      {rerunOpen && task && (
+        <NewTaskDialog
+          initialCases={rerunCodes}
+          initialNode={task.node_id}
+          onClose={() => {
+            setRerunOpen(false);
+            reload();
+          }}
+        />
+      )}
       {pendingCancel && (
         <ReviewTokenDialog onConfirm={(token) => cancel(pendingCancel, token)} onCancel={() => setPendingCancel(null)} />
       )}

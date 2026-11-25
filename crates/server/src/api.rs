@@ -72,9 +72,16 @@ pub(crate) fn routes(app: AppState, paths: Paths) -> Router {
         .route("/api/casegen-requests/{id}", get(crate::modules::api_request_detail))
         .route("/api/node/casegen-requests/claim", put(crate::modules::api_claim))
         .route("/api/casegen-requests/{id}/review", put(crate::modules::api_review).layer(axum::extract::DefaultBodyLimit::max(1024 * 1024)))
-        .route("/api/modules/{id}/cases", get(crate::modules::api_module_cases))
+        .route(
+            "/api/modules/{id}/cases",
+            post(crate::modules::assets::api_create_case)
+                .route_layer(authorize_write.clone())
+                .get(crate::modules::api_module_cases),
+        )
         .route("/api/modules/{id}/cases.csv", get(crate::modules::assets::api_cases_csv))
         .route("/api/modules/{id}/cases/import", post(crate::modules::assets::api_import_cases).route_layer(authorize_write.clone()).layer(axum::extract::DefaultBodyLimit::max(2 * 1024 * 1024)))
+        .route("/api/modules/{id}/cases/{code}/update", post(crate::modules::assets::api_update_case).route_layer(authorize_write.clone()))
+        .route("/api/modules/{id}/cases/{code}/delete", post(crate::modules::assets::api_delete_case).route_layer(authorize_write.clone()))
         .route("/api/modules/{id}/recordings", get(crate::modules::assets::api_module_recordings))
         .route(
             "/api/modules/{id}/screenshots",

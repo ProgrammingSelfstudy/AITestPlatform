@@ -38,7 +38,7 @@ interface Fields {
   userName: string;
 }
 
-export default function NewTaskDialog({ onClose, initialCases }: { onClose: () => void; initialCases?: string[] }) {
+export default function NewTaskDialog({ onClose, initialCases, initialNode }: { onClose: () => void; initialCases?: string[]; initialNode?: string }) {
   const [form] = Form.useForm<Fields>();
   const { data, error } = usePolling(loadChoices, REFRESH_MS, onceLoaded);
   const { data: nodes, error: nodeError } = usePolling(fetchNodes);
@@ -52,6 +52,13 @@ export default function NewTaskDialog({ onClose, initialCases }: { onClose: () =
   const userName = Form.useWatch("userName", form) ?? "";
   const hasOnlineNodes = nodes?.some((candidate) => candidate.online);
   const nodeUnavailable = Boolean(node && nodes && !nodes.some((candidate) => candidate.node_id === node && candidate.online));
+  // 从任务详情一键重跑时，若原执行节点仍在线则默认选中（只填一次，不覆盖用户手动切换）
+  useEffect(() => {
+    if (!initialNode || !nodes || form.getFieldValue("node")) return;
+    if (nodes.some((candidate) => candidate.node_id === initialNode && candidate.online)) {
+      form.setFieldValue("node", initialNode);
+    }
+  }, [initialNode, nodes, form]);
   const executorRoleId = Form.useWatch("executorRole", form);
   const judgeRoleId = Form.useWatch("judgeRole", form);
   // 判定员最多同时几个：读参数配置里的岗位上限，读不到用默认

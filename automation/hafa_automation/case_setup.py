@@ -35,6 +35,11 @@ def spec_for(case_id: str) -> dict:
     return SPECS.get(case_id, DEFAULT)
 
 
+def has_spec(case_id: str) -> bool:
+    """是否有该用例的专属 Hafa 语聊房前置规格；新模块生成的 GEN-* 等用例不在表里，走通用准备。"""
+    return case_id in SPECS
+
+
 # 无人值守时用来「模拟人工」的动作。真人场景用 run.py --human prompt 在终端处理。
 # 这只是为了让流程能自动跑通，结果里会标注 human_mode=sim，不能当作「真人介入已验证」。
 def _sim_delete_del_song() -> str:

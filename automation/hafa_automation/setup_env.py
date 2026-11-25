@@ -434,6 +434,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--teardown", action="store_true", help="只做收尾：关房回首页")
     ap.add_argument("--keep-room", action="store_true", help="setup 后保留房间")
     ap.add_argument("--case", help="按 case_setup.py 里该用例的规格准备前置状态，如 TC-02")
+    ap.add_argument("--generic", action="store_true", help="通用 App 模式：只唤醒并启动被测应用，不推测试音频也不开 Hafa 语聊房")
     ap.add_argument("--force-login", action="store_true", help="不信任登录态缓存，强制重新登录")
     args = ap.parse_args(argv)
 
@@ -446,8 +447,28 @@ def main(argv: list[str] | None = None) -> int:
     try:
         ensure_awake()
         if args.teardown:
-            close_room()
+            if args.generic:
+                dev.stop_app(ui.PKG)
+                step("已关闭被测应用")
+            else:
+                close_room()
             emit("done", phase="teardown")
+            return 0
+
+        from .case_setup import has_spec, spec_for
+        # 新模块用例（不在 Hafa 语聊房规格表里的 GEN-* / 导入用例）或显式 --generic：
+        # 走通用 App 准备，不再强行推 64MB 音频或开语聊房。
+        generic_case = args.generic or (bool(args.case) and not has_spec(args.case))
+        if generic_case:
+            if not args.skip_login:
+                if not args.account_id:
+                    emit("error", msg="需要 --account-id（或 --skip-login）", code="usage")
+                    return EXIT_USAGE
+                ensure_account(args.account_id, force=args.force_login)
+            else:
+                dev.launch_app(ui.PKG, ui.ACT)
+                step("已启动被测应用")
+            emit("done", phase="setup", case=args.case, generic=True)
             return 0
 
         if AUDIO_DIR is None:
@@ -460,7 +481,6 @@ def main(argv: list[str] | None = None) -> int:
                 return EXIT_USAGE
             ensure_account(args.account_id, force=args.force_login)
         if args.case:
-            from .case_setup import spec_for
             spec = spec_for(args.case)
             go_home()
             close_room()                 # 先保证没有残留房间

@@ -195,3 +195,19 @@ def test_用例规格():
     assert case_setup.spec_for("TC-08")["volume"] == 50
     assert case_setup.spec_for("TC-10")["library"] == ["tst_normal_del", "tst_normal_01"]
     assert case_setup.spec_for("TC-不存在") == case_setup.DEFAULT
+    assert case_setup.has_spec("TC-04") and not case_setup.has_spec("GEN-abc123-1")
+
+
+def test_新模块用例走通用准备_不要求音频也不开语聊房(install, monkeypatch, capsys):
+    dev = install(FakeDev({"home": HOME}, "home"))
+    monkeypatch.setattr(setup_env, "ensure_awake", lambda: None)
+    monkeypatch.setattr(setup_env, "AUDIO_DIR", None)
+    called = []
+    monkeypatch.setattr(setup_env, "push_audio", lambda: called.append("push_audio"))
+    monkeypatch.setattr(setup_env, "open_room", lambda: called.append("open_room"))
+    rc = setup_env.main(["--case", "GEN-abc123-1", "--skip-login"])
+    assert rc == 0
+    assert called == [], f"通用新模块用例不应调用 Hafa 语聊房逻辑：{called}"
+    ev = events(capsys)
+    assert ev[-1] == {"type": "done", "phase": "setup", "case": "GEN-abc123-1", "generic": True}
+    assert dev.launched, "通用准备应启动被测应用"

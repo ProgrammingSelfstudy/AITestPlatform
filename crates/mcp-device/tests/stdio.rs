@@ -42,7 +42,9 @@ async fn 列出工具和参数模式() {
     let tap = tools.iter().find(|t| t.name == "tap").unwrap();
     let schema = serde_json::to_string(&tap.input_schema).unwrap();
     assert!(schema.contains("element_id"), "tap 的参数模式里应有 element_id：{schema}");
-    assert!(!names.iter().any(|n| n == "input_text"), "文字输入还没做，不能假装有这个工具");
+    let input = tools.iter().find(|t| t.name == "input_text").expect("应暴露 input_text 文字输入工具");
+    let input_schema = serde_json::to_string(&input.input_schema).unwrap();
+    assert!(input_schema.contains("text") && input_schema.contains("element_id") && input_schema.contains("clear"), "input_text 参数模式不完整：{input_schema}");
     assert!(tools.iter().all(|t| t.description.is_some()), "每个工具都要有描述，模型才知道怎么用");
     client.cancel().await.unwrap();
 }

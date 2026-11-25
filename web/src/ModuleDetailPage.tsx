@@ -516,6 +516,7 @@ export default function ModuleDetailPage({ id }: { id: string }) {
   const [filter, setFilter] = useState<ReviewFilter>("all");
   const [reviewPanelExpanded, setReviewPanelExpanded] = useState(false);
   const [taskDialogOpen, setTaskDialogOpen] = useState(false);
+  const [taskInitialCases, setTaskInitialCases] = useState<string[] | null>(null);
 
   // 批准（needs_human 必填备注）/ 拒绝（可选备注）弹窗
   const [decisionModal, setDecisionModal] = useState<DecisionModalState | null>(null);
@@ -1092,7 +1093,15 @@ export default function ModuleDetailPage({ id }: { id: string }) {
       {tab === "shots" && <>{tokenBar}<ModuleShots moduleId={id} userName={userName} /></>}
       {tab === "cases" && <>{tokenBar}<ModuleCases moduleId={id} cases={cases} userName={userName} onChanged={reloadAll} /></>}
       {tab === "recordings" && <ModuleRecordings moduleId={id} />}
-      {tab === "results" && <ModuleResults cases={cases} />}
+      {tab === "results" && (
+        <ModuleResults
+          cases={cases}
+          onRerun={(codes) => {
+            setTaskInitialCases(codes);
+            setTaskDialogOpen(true);
+          }}
+        />
+      )}
       {tab === "overview" && (isTesting ? (
         /* ========================= 测试中：指挥台布局 ========================= */
         <>
@@ -1521,7 +1530,10 @@ export default function ModuleDetailPage({ id }: { id: string }) {
                 <Button
                   type="primary"
                   disabled={approvedCodes.length === 0}
-                  onClick={() => setTaskDialogOpen(true)}
+                  onClick={() => {
+                    setTaskInitialCases(null);
+                    setTaskDialogOpen(true);
+                  }}
                 >
                   对已批准的用例发起测试（{approvedCodes.length}）
                 </Button>
@@ -1609,12 +1621,13 @@ export default function ModuleDetailPage({ id }: { id: string }) {
         </Modal>
       )}
 
-      {/* 发起测试弹窗（传入本模块已批准用例的 code 列表） */}
+      {/* 发起测试弹窗（默认传入本模块已批准用例；从测试结果一键重跑时传入指定未通过用例） */}
       {taskDialogOpen && (
         <TaskDialogWithCases
-          initialCases={approvedCodes}
+          initialCases={taskInitialCases ?? approvedCodes}
           onClose={() => {
             setTaskDialogOpen(false);
+            setTaskInitialCases(null);
             reloadAll();
           }}
         />

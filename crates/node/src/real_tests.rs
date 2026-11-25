@@ -99,6 +99,8 @@ impl Fixture {
         RealConfig {
             platform_http: "http://127.0.0.1/".parse().unwrap(),
             node_token: String::new(),
+            setup_mode: SetupMode::HafaScript,
+            hafa_hints: true,
             python: String::new(),
             automation_dir: PathBuf::new(),
             audio_dir: PathBuf::new(),
@@ -1013,4 +1015,70 @@ async fn 执行员没有留下轨迹时_受阻原因同样带上原始错误() {
     assert!(reason.contains("没有留下轨迹"), "{reason}");
     assert!(reason.contains("创建审计目录失败：Permission denied"), "必须带上原始错误：{reason}");
     assert!(reason.contains("退出码 未知"), "拿不到退出码就如实写未知：{reason}");
+}
+
+struct FakeSetupDev {
+    unlocked: bool,
+    calls: Mutex<Vec<String>>,
+}
+
+#[async_trait::async_trait]
+impl device::api::DeviceApi for FakeSetupDev {
+    async fn dump(&self) -> device::Result<Vec<device::Element>> { Ok(vec![]) }
+    async fn screenshot(&self) -> device::Result<Vec<u8>> { Ok(vec![]) }
+    async fn tap(&self, _x: i32, _y: i32) -> device::Result<()> { Ok(()) }
+    async fn swipe(&self, _x1: i32, _y1: i32, _x2: i32, _y2: i32, _ms: u32) -> device::Result<()> { Ok(()) }
+    async fn back(&self) -> device::Result<()> { Ok(()) }
+    async fn screen_size(&self) -> device::Result<(i32, i32)> { Ok((1080, 2400)) }
+    async fn launch_app(&self, package: &str, activity: &str) -> device::Result<()> {
+        self.calls.lock().unwrap().push(format!("launch:{package}/{activity}"));
+        Ok(())
+    }
+    async fn stop_app(&self, package: &str) -> device::Result<()> {
+        self.calls.lock().unwrap().push(format!("stop:{package}"));
+        Ok(())
+    }
+    async fn shell(&self, cmd: &str) -> device::Result<String> {
+        self.calls.lock().unwrap().push(format!("shell:{cmd}"));
+        if cmd.contains("dumpsys window") {
+            Ok(if self.unlocked { "isKeyguardShowing=false".into() } else { "isKeyguardShowing=true".into() })
+        } else {
+            Ok("mWakefulness=Awake".into())
+        }
+    }
+}
+
+#[tokio::test]
+async fn 通用模式前置准备唤醒解锁并启动自定义应用_锁屏时如实受阻() {
+    let mut f = Fixture::new();
+    let mut cfg = f.config(PathBuf::new());
+    cfg.setup_mode = SetupMode::Generic;
+    cfg.hafa_hints = false;
+    cfg.package = "com.example.shop".into();
+    cfg.activity = ".MainActivity".into();
+    cfg.bottom_shift.insert(f.assign.device_serial.clone(), -48);
+    let exec = RealExecutor(cfg);
+
+    // 1. 已解锁 + needs_cleanup=true：先强停再启动自定义应用，不依赖 Python 或音频
+    f.assign.needs_cleanup = true;
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let rep = Reporter::for_test(Uuid::nil(), f.assign.run_id, tx);
+    let dev = FakeSetupDev { unlocked: true, calls: Mutex::new(vec![]) };
+    let res = exec.setup_generic(&f.assign, &rep, &dev, |b| async { b.send().await }).await;
+    assert_eq!(res, Some((-48, vec![])));
+    let calls = dev.calls.lock().unwrap().clone();
+    assert!(calls.contains(&"stop:com.example.shop".to_string()), "needs_cleanup 应先停止应用：{calls:?}");
+    assert!(calls.contains(&"launch:com.example.shop/.MainActivity".to_string()), "应启动自定义应用：{calls:?}");
+    assert_eq!(exec.teardown_generic(&dev).await, SetupResult::Ok);
+    assert_eq!(dev.calls.lock().unwrap().last().map(String::as_str), Some("stop:com.example.shop"));
+    let _ = rx.try_recv();
+
+    // 2. 锁屏解不开：明确报受阻，不启动应用
+    let (tx2, mut rx2) = mpsc::unbounded_channel();
+    let rep2 = Reporter::for_test(Uuid::nil(), f.assign.run_id, tx2);
+    let locked = FakeSetupDev { unlocked: false, calls: Mutex::new(vec![]) };
+    assert!(exec.setup_generic(&f.assign, &rep2, &locked, |b| async { b.send().await }).await.is_none());
+    let msgs: Vec<NodeMsg> = std::iter::from_fn(|| rx2.try_recv().ok()).collect();
+    assert!(blocked_reason(&msgs).contains("屏幕仍然锁定"));
+    assert!(!locked.calls.lock().unwrap().iter().any(|c| c.starts_with("launch:")));
 }

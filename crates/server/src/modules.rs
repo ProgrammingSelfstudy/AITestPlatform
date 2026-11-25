@@ -229,9 +229,9 @@ pub async fn list(pool: &PgPool, project: &str) -> Res<Vec<ModuleView>> {
     let project_id = project_id(pool, project).await?;
     let rows = sqlx::query(
         "select m.id, m.name, m.created_at,
-                (select count(*) from test_cases c where c.module_id = m.id) as case_count,
-                (select count(*) from test_cases c where c.module_id = m.id and c.review_status = 'approved') as approved_count,
-                (select count(*) from test_cases c where c.module_id = m.id and c.review_status = 'needs_human') as needs_human_count,
+                (select count(*) from test_cases c where c.module_id = m.id and c.status != 'archived') as case_count,
+                (select count(*) from test_cases c where c.module_id = m.id and c.status != 'archived' and c.review_status = 'approved') as approved_count,
+                (select count(*) from test_cases c where c.module_id = m.id and c.status != 'archived' and c.review_status = 'needs_human') as needs_human_count,
                 (select count(*) from runs x join test_cases c on c.id = x.case_id
                   where c.module_id = m.id and x.status in ('queued','assigned','running','judging')) as active_runs,
                 r.id as req_id, r.status as req_status, r.detail as req_detail, r.requested_at as req_at
@@ -847,7 +847,7 @@ pub async fn module_cases(pool: &PgPool, module_id: Uuid) -> Res<Vec<ModuleCase>
                 r.id as run_id, r.task_id, r.status as run_status, r.final_result, r.blocked_reason, r.executor_reason, r.queued_at
          from test_cases c
          left join lateral (select * from runs x where x.case_id = c.id order by x.seq desc limit 1) r on true
-         where c.module_id = $1 order by c.code",
+         where c.module_id = $1 and c.status != 'archived' order by c.code",
     )
         .bind(module_id)
         .fetch_all(pool)

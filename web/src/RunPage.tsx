@@ -14,6 +14,7 @@ const tools: Record<string, string> = {
   tap_xy: "按坐标点击",
   swipe: "滑动",
   drag: "拖动",
+  input_text: "输入文字",
   back: "返回",
   launch_app: "启动应用",
   restart_app: "重启应用",

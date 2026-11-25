@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use anyhow::{bail, Context};
-use node::real::{RealConfig, RealExecutor};
+use node::real::{RealConfig, RealExecutor, SetupMode};
 use node::{run, AdbDevices, NoExecutor, NodeConfig, Only};
 use reqwest::Url;
 use tracing_subscriber::EnvFilter;
@@ -245,12 +245,12 @@ async fn main() -> anyhow::Result<()> {
             node::casegen_run::serve(node::casegen_run::CasegenConfig { platform_http: platform, node_token: token, node_id, state_dir }, std::time::Duration::from_secs(5)).await;
         });
     }
-    // 配了 HAFA_PYTHON 就具备真实执行能力；否则领到任务只会如实报受阻
+    // 配了 HAFA_PYTHON（Hafa 定制脚本）或 HAFA_MCP_BIN（通用纯 Rust 模式）即具备真实执行能力；否则领到任务只会如实报受阻
     match real_config(&cfg)? {
         Some(rc) => {
-            tracing::info!("真实执行器已启用");
-            // 只有一台确定的设备时才接页面发起的回归（多台设备要显式指定用哪台：`node regress --serial`）
-            if allow.len() == 1 {
+            tracing::info!("真实执行器已启用（模式：{:?}，应用：{}/{}）", rc.setup_mode, rc.package, rc.activity);
+            // 只有一台确定的设备且配置了 Python 自动化脚本时才接页面发起的回归
+            if allow.len() == 1 && !rc.python.is_empty() {
                 // node_id 要等节点第一次连上服务端才有，所以配置拿不到时隔几秒重试，而不是放弃
                 tokio::spawn(async {
                     let check = loop {
@@ -265,6 +265,8 @@ async fn main() -> anyhow::Result<()> {
                     tracing::info!("接收页面发起的回归，使用设备 {}", check.serial);
                     node::regress_poll::serve(check, std::time::Duration::from_secs(5)).await;
                 });
+            } else if rc.python.is_empty() {
+                tracing::info!("未配置 HAFA_PYTHON（通用模式），不接收页面发起的 pytest 脚本回归");
             } else {
                 tracing::info!("HAFA_DEVICE_ALLOW 不是恰好一台设备，不接收页面发起的回归");
             }
@@ -274,7 +276,7 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         None => {
-            tracing::warn!("没有配置 HAFA_PYTHON，节点没有执行能力");
+            tracing::warn!("没有配置 HAFA_PYTHON 或 HAFA_MCP_BIN，节点没有执行能力");
             tokio::select! {
                 r = run(cfg, Only { inner: AdbDevices::default(), serials: allow }, NoExecutor) => r?,
                 _ = tokio::signal::ctrl_c() => tracing::info!("收到退出信号，节点停止"),
@@ -310,32 +312,90 @@ fn platform_http(ws: &str, allow_insecure: bool) -> anyhow::Result<Url> {
     Ok(url)
 }
 
-/// 环境变量：HAFA_PYTHON、HAFA_AUTOMATION_DIR、HAFA_AUDIO_DIR、HAFA_MCP_BIN、HAFA_APP_INFO（app_info.yaml 路径）、
-/// HAFA_RUNS_DIR、HAFA_BOTTOM_SHIFTS（如 `15064060=-84,其它=0`）、HAFA_EVIDENCE_BIN（配置后启用独立判定）。
+/// 解析屏幕分辨率 `宽x高`（如 `1080x2400`）。
+fn parse_screen(raw: &str) -> anyhow::Result<(i32, i32)> {
+    let (w, h) = raw.trim().split_once(['x', 'X']).ok_or_else(|| anyhow::anyhow!("HAFA_SCREEN 格式是 宽x高（如 1080x2400）"))?;
+    let (w, h): (i32, i32) = (w.trim().parse().context("HAFA_SCREEN 宽度必须是正整数")?, h.trim().parse().context("HAFA_SCREEN 高度必须是正整数")?);
+    if w <= 0 || h <= 0 {
+        bail!("HAFA_SCREEN 宽高必须大于 0");
+    }
+    Ok((w, h))
+}
+
+/// 环境变量：
+/// - 通用模式：设 `HAFA_MCP_BIN`（可选 `HAFA_SETUP_MODE=generic`、`HAFA_APP_PACKAGE`、`HAFA_APP_ACTIVITY`、`HAFA_SCREEN`、`HAFA_APP_INFO`、`HAFA_HINTS=0`），
+///   无需 Python 和测试音频即可跑任意 Android App；
+/// - Hafa 脚本模式：设 `HAFA_PYTHON`、`HAFA_AUTOMATION_DIR`、`HAFA_AUDIO_DIR`、`HAFA_MCP_BIN`；
+/// - 公共：设 `HAFA_RUNS_DIR`、`HAFA_BOTTOM_SHIFTS`（如 `15064060=-84`）、`HAFA_EVIDENCE_BIN`（配置后启用独立判定）。
 fn real_config(node: &NodeConfig) -> anyhow::Result<Option<RealConfig>> {
-    let get = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
-    let Some(python) = get("HAFA_PYTHON") else { return Ok(None) };
-    let need = |k: &str| get(k).ok_or_else(|| anyhow::anyhow!("配置了 HAFA_PYTHON 就必须同时设置 {k}"));
-    let app_info = std::fs::read_to_string(need("HAFA_APP_INFO")?)?;
+    real_config_with(node, |k| std::env::var(k).ok().filter(|v| !v.is_empty()), |p| std::fs::read_to_string(p))
+}
+
+fn real_config_with(
+    node: &NodeConfig,
+    get: impl Fn(&str) -> Option<String>,
+    read_file: impl Fn(&str) -> std::io::Result<String>,
+) -> anyhow::Result<Option<RealConfig>> {
+    let python = get("HAFA_PYTHON");
+    let mcp_bin = get("HAFA_MCP_BIN");
+    let mode = match get("HAFA_SETUP_MODE").as_deref().map(str::to_lowercase).as_deref() {
+        Some("generic") => SetupMode::Generic,
+        Some("hafa") | None if python.is_some() => SetupMode::HafaScript,
+        None if mcp_bin.is_some() => SetupMode::Generic,
+        None => return Ok(None),
+        Some("hafa") => bail!("HAFA_SETUP_MODE=hafa 必须同时设置 HAFA_PYTHON"),
+        Some(other) => bail!("未知的 HAFA_SETUP_MODE：{other}（只能是 generic 或 hafa）"),
+    };
+    let need = |k: &str| get(k).ok_or_else(|| anyhow::anyhow!("启用真实执行必须设置 {k}"));
+    let mcp_bin = PathBuf::from(need("HAFA_MCP_BIN")?);
+    let (python, automation_dir, audio_dir) = match mode {
+        SetupMode::HafaScript => (
+            need("HAFA_PYTHON")?,
+            PathBuf::from(need("HAFA_AUTOMATION_DIR")?),
+            PathBuf::from(need("HAFA_AUDIO_DIR")?),
+        ),
+        SetupMode::Generic => (
+            python.unwrap_or_default(),
+            get("HAFA_AUTOMATION_DIR").map(PathBuf::from).unwrap_or_default(),
+            get("HAFA_AUDIO_DIR").map(PathBuf::from).unwrap_or_default(),
+        ),
+    };
+    let app_info = match get("HAFA_APP_INFO") {
+        Some(path) => read_file(&path).with_context(|| format!("读取 HAFA_APP_INFO 失败：{path}"))?,
+        None => String::new(),
+    };
+    let package = get("HAFA_APP_PACKAGE").unwrap_or_else(|| "com.hafa.pikka".into());
+    let activity = get("HAFA_APP_ACTIVITY").unwrap_or_else(|| "com.hafa.pikka.MainActivity".into());
+    let screen = match get("HAFA_SCREEN") {
+        Some(raw) => parse_screen(&raw)?,
+        None => (720, 1600),
+    };
+    let hafa_hints = match get("HAFA_HINTS").as_deref() {
+        Some("0" | "false" | "FALSE") => false,
+        Some("1" | "true" | "TRUE") => true,
+        _ => package == "com.hafa.pikka",
+    };
     let mut shifts = std::collections::HashMap::new();
     for kv in get("HAFA_BOTTOM_SHIFTS").unwrap_or_default().split(',').filter(|s| !s.is_empty()) {
         let (k, v) = kv.split_once('=').ok_or_else(|| anyhow::anyhow!("HAFA_BOTTOM_SHIFTS 格式是 序列号=偏移,..."))?;
         shifts.insert(k.trim().to_string(), v.trim().parse()?);
     }
     Ok(Some(RealConfig {
-        platform_http: platform_http(&node.url, std::env::var("NODE_ALLOW_INSECURE").is_ok_and(|v| v == "1"))?,
+        platform_http: platform_http(&node.url, get("NODE_ALLOW_INSECURE").is_some_and(|v| v == "1"))?,
         node_token: node.token.clone(),
+        setup_mode: mode,
+        hafa_hints,
         python,
-        automation_dir: need("HAFA_AUTOMATION_DIR")?.into(),
-        audio_dir: need("HAFA_AUDIO_DIR")?.into(),
+        automation_dir,
+        audio_dir,
         state_dir: std::env::temp_dir().join("hafa_node_state"),
         runs_dir: get("HAFA_RUNS_DIR").unwrap_or_else(|| "data/runs".into()).into(),
-        mcp_bin: need("HAFA_MCP_BIN")?.into(),
+        mcp_bin,
         evidence_bin: get("HAFA_EVIDENCE_BIN").unwrap_or_default().into(),
-        package: "com.hafa.pikka".into(),
-        activity: "com.hafa.pikka.MainActivity".into(),
+        package,
+        activity,
         bottom_shift: shifts,
-        screen: (720, 1600),
+        screen,
         app_info,
     }))
 }
@@ -363,5 +423,29 @@ mod tests {
         assert!(platform_http("ws://[::1]:8080/ws/node", false).is_ok());
         assert!(platform_http("ws://192.168.1.5:8080/ws/node", true).is_ok(), "显式放行");
         assert!(platform_http("http://127.0.0.1/ws/node", false).is_err());
+    }
+
+    #[test]
+    fn 通用模式不依赖python和音频且支持自定义包名和屏幕() {
+        let node = NodeConfig::new("ws://127.0.0.1:8080/ws/node".into(), "tok".into(), PathBuf::from("data/node"));
+        let env = std::collections::HashMap::from([
+            ("HAFA_MCP_BIN", "/bin/mcp-device"),
+            ("HAFA_APP_PACKAGE", "com.example.shop"),
+            ("HAFA_APP_ACTIVITY", ".MainActivity"),
+            ("HAFA_SCREEN", "1080x2400"),
+        ]);
+        let cfg = real_config_with(&node, |k| env.get(k).map(|v| (*v).to_string()), |_| Ok(String::new())).unwrap().unwrap();
+        assert_eq!(cfg.setup_mode, SetupMode::Generic);
+        assert_eq!((cfg.package.as_str(), cfg.activity.as_str()), ("com.example.shop", ".MainActivity"));
+        assert_eq!(cfg.screen, (1080, 2400));
+        assert!(!cfg.hafa_hints, "非 Hafa 包名默认不注入 Hafa 房间坐标");
+        assert!(cfg.python.is_empty() && cfg.app_info.is_empty());
+    }
+
+    #[test]
+    fn 屏幕分辨率解析校验() {
+        assert_eq!(parse_screen("1080x2400").unwrap(), (1080, 2400));
+        assert!(parse_screen("0x1600").is_err());
+        assert!(parse_screen("bad").is_err());
     }
 }

@@ -7,7 +7,8 @@
 //! - 轨迹：每一步落盘，账号密码一律脱敏成占位符。
 //!
 //! 定位优先级：content-desc > 坐标。Hafa 是 Flutter，控件树里 text 为空，可读信息全在 content-desc。
-//! 文字输入（`input_text`）还没做：`adb input text` 只支持 ASCII，需要单独解决输入法问题。
+//! 文字输入（`input_text`）经设备层执行（Android 默认支持不含 `%` 的 ASCII 可见字符，不支持的字符明确返回说明）；
+//! 账号凭证通过 `{{account.xxx}}` 占位符在运行时注入，绝不落盘、不回显。
 
 pub mod dev;
 pub mod evidence;
@@ -167,6 +168,17 @@ pub struct DragArgs {
     pub y2: i32,
     /// 拖动时长，毫秒，默认 800（慢速拖动，滑块才跟得上）；限制在 200～5000
     pub duration_ms: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+pub struct InputTextArgs {
+    /// 要输入的文字（Android 默认支持不含 % 的 ASCII 可见字符）。账号凭证请传占位符 {{account.username}} / {{account.password}}，由工具层安全注入
+    pub text: String,
+    /// 可选：先点击 observe 列表里的该元素聚焦输入框，再输入；省略时直接输入到当前聚焦的输入框
+    pub element_id: Option<u32>,
+    /// 输入前是否先清空原内容，默认 true
+    pub clear: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -507,6 +519,73 @@ impl DeviceServer {
         text(me.compose(format!("已拖动 ({}, {}) → ({}, {})", a.x1, a.y1, a.x2, a.y2), &after, true))
     }
 
+    #[tool(description = "往输入框输入文字（Android 默认支持不含 % 的 ASCII 可见字符）。可选 element_id 先点击聚焦输入框再输入，默认先清空原内容并自动收起键盘。账号凭证直接传占位符 {{account.username}} / {{account.password}}，由工具层在运行时注入。")]
+    pub async fn input_text(&self, Parameters(a): Parameters<InputTextArgs>) -> ToolResult {
+        let me = &self.0;
+        let mut st = me.st.lock().await;
+        if let Err(r) = st.guard.begin() {
+            return st.refuse(r);
+        }
+        if a.text.is_empty() {
+            return text("要输入的文字不能为空。");
+        }
+        let (actual, safe_display) = match resolve_input_text(&a.text, &me.cfg.secrets) {
+            Ok(resolved) => resolved,
+            Err(message) => return text(message),
+        };
+        let clear = a.clear.unwrap_or(true);
+        let (before, target, prev_label, point) = if let Some(element_id) = a.element_id {
+            let n = st.last_elements.len();
+            let Some(el) = (element_id as usize).checked_sub(1).and_then(|i| st.last_elements.get(i)).cloned() else {
+                return text(format!("element_id 越界：{}，当前只有 {n} 个元素，请先 observe。", element_id));
+            };
+            let (cx, cy) = el.bounds.center();
+            if (cx, cy) == (0, 0) {
+                return text(format!("元素 {} 没有有效坐标，请先 tap_xy 点击输入框再调用 input_text。", element_id));
+            }
+            let label = observe::label(&el);
+            let before = me.tree_before_touch(&st).await?;
+            if let Some(r) = st.block_risk(&guard::labels_at(&before, cx, cy)).or_else(|| st.block_risk(&label)) {
+                return st.refuse(r);
+            }
+            let Some(index) = before.iter().position(|current| current == &el) else {
+                return text(format!("编号 {} 对应的控件已变化，请先 observe。", element_id));
+            };
+            let prev_label = before[..index].iter().rev().map(|e| e.label().to_string()).find(|l| !l.is_empty());
+            let target = if el.label().is_empty() { None } else { Some(el.label().to_string()) };
+            me.dev.tap(cx, cy).await.map_err(|e| st.device_err(e))?;
+            tokio::time::sleep(me.cfg.settle / 2).await;
+            (before, target, prev_label, Some((cx, cy)))
+        } else {
+            (st.last_elements.clone(), None, None, None)
+        };
+
+        let at_ms = now_ms();
+        let started = Instant::now();
+        match me.dev.input_text(&actual, clear).await {
+            Ok(()) => {}
+            Err(DeviceError::Unsupported(reason)) => {
+                return text(format!(
+                    "无法输入这段文字：{}。如果用例必须输入中文或特殊字符，请调用 need_human 请人工输入，或调用 finish(blocked) 说明原因。",
+                    st.trace.redact(&reason)
+                ));
+            }
+            Err(e) => return Err(st.device_err(e)),
+        }
+        // 轨迹、护栏签名和返回文案永远只写脱敏后的 safe_display，不碰展开后的真实凭证
+        let step = TraceStep {
+            action: "input_text".into(),
+            at_ms,
+            target,
+            prev_label,
+            value: Some(safe_display.clone()),
+            point,
+            ..Default::default()
+        };
+        let after = me.after_action(&mut st, &before, format!("input_text:{safe_display}"), step, started).await?;
+        text(me.compose(format!("已输入「{safe_display}」"), &after, false))
+    }
+
     #[tool(description = "按返回键。")]
     pub async fn back(&self) -> ToolResult {
         let me = &self.0;
@@ -671,6 +750,24 @@ impl DeviceServer {
         let after = me.after_action(&mut st, &before, name.into(), step, started).await?;
         text(me.compose(if stop_first { "已重启应用".into() } else { "已启动应用".into() }, &after, false))
     }
+}
+
+/// 解析要输入的文字：
+/// - 把已登记的 `{{account.xxx}}` 占位符替换成运行节点拿到的真实值，只在调用设备输入时使用；
+/// - 若仍残余未登记的 `{{account.` 占位符，明确拒绝，不把字面占位符输进手机；
+/// - 返回 `(真正发给设备的文本, 脱敏后供轨迹和日志显示的文本)`。
+fn resolve_input_text(raw: &str, secrets: &[(String, String)]) -> Result<(String, String), String> {
+    let mut actual = raw.to_string();
+    for (value, placeholder) in secrets {
+        if !placeholder.is_empty() && actual.contains(placeholder.as_str()) {
+            actual = actual.replace(placeholder.as_str(), value.as_str());
+        }
+    }
+    if actual.contains("{{account.") {
+        return Err("当前执行没有可注入的账号凭证占位符，无法输入账号信息；请确认用例是否绑定了账号租约。".into());
+    }
+    let safe_display = trace::redact_text(raw, secrets);
+    Ok((actual, safe_display))
 }
 
 #[cfg(test)]

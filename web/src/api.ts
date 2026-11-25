@@ -901,6 +901,34 @@ export async function importModuleCases(moduleId: string, csv: string, token: st
   return response.json();
 }
 
+export interface ModuleCaseInput {
+  code: string;
+  title: string;
+  run_env: "app" | "h5" | "browser";
+  level: string;
+  preconditions: string[];
+  steps: string[];
+  expected: string[];
+}
+
+/** 在模块下在线新增一条用例（自动已批准，与 CSV 导入一致） */
+export async function createModuleCase(moduleId: string, input: ModuleCaseInput, token: string, userName: string): Promise<{ code: string }> {
+  const response = await post(`${moduleBase(moduleId)}/cases`, input, token, userHeaders(userName));
+  return response.json();
+}
+
+/** 在线编辑本模块单条用例（编号不变；内容真变了才升版本） */
+export async function updateModuleCase(moduleId: string, code: string, input: Omit<ModuleCaseInput, "code">, token: string, userName: string): Promise<{ updated: boolean; version: number }> {
+  const response = await post(`${moduleBase(moduleId)}/cases/${encodeURIComponent(code)}/update`, input, token, userHeaders(userName));
+  return response.json();
+}
+
+/** 删除本模块单条用例；若有历史执行或脚本则自动归档隐藏，保护历史证据 */
+export async function deleteModuleCase(moduleId: string, code: string, token: string, userName: string): Promise<{ deleted: boolean; archived: boolean }> {
+  const response = await post(`${moduleBase(moduleId)}/cases/${encodeURIComponent(code)}/delete`, {}, token, userHeaders(userName));
+  return response.json();
+}
+
 /** 读文本（导出 CSV 用）：带「我是谁」，错误原样抛出 */
 export async function fetchText(path: string, signal?: AbortSignal): Promise<string> {
   const response = await request(path, { signal });

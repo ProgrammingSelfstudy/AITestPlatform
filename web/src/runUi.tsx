@@ -50,7 +50,7 @@ export function blockedLabel(reason: BlockedReason) {
   return blocked[reason];
 }
 
-export function isTerminal(run: RunView) {
+export function isTerminal(run: Pick<RunView, "status">) {
   return run.status === "finished" || run.status === "blocked" || run.status === "cancelled";
 }
 

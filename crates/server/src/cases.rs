@@ -291,7 +291,7 @@ fn summary(r: &sqlx::postgres::PgRow) -> CaseSummary {
 }
 
 pub async fn projects(pool: &PgPool) -> Result<Vec<ProjectSummary>, sqlx::Error> {
-    let rows = sqlx::query("select p.name, count(c.id) as n from projects p left join test_cases c on c.project_id = p.id group by p.name order by p.name")
+    let rows = sqlx::query("select p.name, count(c.id) as n from projects p left join test_cases c on c.project_id = p.id and c.status != 'archived' group by p.name order by p.name")
         .fetch_all(pool)
         .await?;
     Ok(rows.iter().map(|r| ProjectSummary { name: r.get("name"), cases: r.get("n") }).collect())
@@ -330,7 +330,7 @@ pub async fn list(pool: &PgPool, project: &str) -> Result<Option<Vec<CaseSummary
     }
     let rows = sqlx::query(
         "select c.code, c.title, c.level, c.platforms, c.should_fail, c.status, c.blocked_reason, c.version, c.review_status
-         from test_cases c join projects p on p.id = c.project_id where p.name = $1",
+         from test_cases c join projects p on p.id = c.project_id where p.name = $1 and c.status != 'archived'",
     )
     .bind(project)
     .fetch_all(pool)

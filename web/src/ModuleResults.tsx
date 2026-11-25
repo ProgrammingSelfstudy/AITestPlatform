@@ -1,15 +1,27 @@
-import { Table, Tag } from "antd";
+import { Button, Space, Table, Tag } from "antd";
 import type { TableColumnsType } from "antd";
 import { formatDate } from "./runUi";
 import type { ModuleCase } from "./api";
 import { RESULT_TEXT, RUN_ENV_META, resultText } from "./ModuleCases";
 
 const RESULT_COLOR: Record<string, string> = { passed: "green", failed: "red", uncertain: "orange", blocked: "default" };
+const TERMINAL = new Set(["finished", "blocked", "cancelled"]);
 const skipped = (c: ModuleCase) => c.latest_run?.blocked_reason === "skipped";
 
+/** 筛出模块里可一键重跑的已批准用例：最近一次已结束、未通过且不是条件不足跳过的 */
+export function retryableModuleCaseCodes(cases: ModuleCase[]): string[] {
+  return cases
+    .filter((c) => {
+      const run = c.latest_run;
+      return c.review_status === "approved" && run !== null && TERMINAL.has(run.status) && run.final_result !== "passed" && run.blocked_reason !== "skipped";
+    })
+    .map((c) => c.code);
+}
+
 /** 测试结果：每条用例一行，显示最近一次运行的结果；没跑过的写「未执行」，不会算成通过。 */
-export default function ModuleResults({ cases }: { cases: ModuleCase[] }) {
+export default function ModuleResults({ cases, onRerun }: { cases: ModuleCase[]; onRerun?: (codes: string[]) => void }) {
   const count = (pick: (c: ModuleCase) => boolean) => cases.filter(pick).length;
+  const rerunCodes = retryableModuleCaseCodes(cases);
   const summary = [
     { text: "通过", n: count((c) => c.latest_run?.final_result === "passed"), color: "green" },
     { text: "失败", n: count((c) => c.latest_run?.final_result === "failed"), color: "red" },
@@ -42,7 +54,14 @@ export default function ModuleResults({ cases }: { cases: ModuleCase[] }) {
     <section className="mod-panel" aria-label="测试结果">
       <div className="mod-panel-head">
         <h2 className="mod-panel-title">测试结果</h2>
-        <div>{summary.map((s) => <Tag key={s.text} color={s.color}>{s.text} {s.n}</Tag>)}</div>
+        <Space wrap size={8}>
+          <div>{summary.map((s) => <Tag key={s.text} color={s.color}>{s.text} {s.n}</Tag>)}</div>
+          {onRerun && rerunCodes.length > 0 && (
+            <Button type="primary" size="small" onClick={() => onRerun(rerunCodes)}>
+              重跑未通过用例（{rerunCodes.length}）
+            </Button>
+          )}
+        </Space>
       </div>
       <Table<ModuleCase> rowKey="code" size="small" columns={columns} dataSource={cases} pagination={{ pageSize: 50, showSizeChanger: true, pageSizeOptions: [20, 50, 100, 200], showTotal: (n) => `共 ${n} 条` }} locale={{ emptyText: "这个模块还没有用例" }} />
       <div className="mod-field-meta">结果文字：{Object.values(RESULT_TEXT).join(" / ")}；「未执行」「进行中」「已跳过」都不算通过。</div>

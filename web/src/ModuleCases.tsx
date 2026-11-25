@@ -1,7 +1,16 @@
-import { Alert, Button, Input, Modal, Table, Tag, Upload } from "antd";
+import { Alert, Button, Input, Modal, Popconfirm, Select, Space, Table, Tag, Upload } from "antd";
 import type { TableColumnsType } from "antd";
-import { useState } from "react";
-import { importModuleCases, moduleCasesCsvUrl, type LatestRun, type ModuleCase, type ReviewStatus } from "./api";
+import { useEffect, useState } from "react";
+import {
+  createModuleCase,
+  deleteModuleCase,
+  importModuleCases,
+  moduleCasesCsvUrl,
+  updateModuleCase,
+  type LatestRun,
+  type ModuleCase,
+  type ReviewStatus,
+} from "./api";
 import { useGuardedWrite } from "./useGuardedWrite";
 import { useUnsavedWarning } from "./unsavedWarning";
 
@@ -100,10 +109,197 @@ function ImportDialog({ moduleId, userName, open, onClose, onDone }: { moduleId:
   );
 }
 
-/** 测试用例：CSV 表格形式，前端逐条呈现每一条（不截断、不折叠），可以导出、导入 CSV。 */
+function splitLines(text: string): string[] {
+  return text.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n").map((s) => s.trim()).filter(Boolean);
+}
+
+/** 单条用例新增 / 编辑弹窗：支持在线调整标题、运行环境、级别、前置条件、步骤和预期；离开前有未保存提醒 */
+function CaseEditorDialog({
+  moduleId,
+  editing,
+  open,
+  userName,
+  onClose,
+  onDone,
+}: {
+  moduleId: string;
+  editing: ModuleCase | null;
+  open: boolean;
+  userName: string;
+  onClose: () => void;
+  onDone: (notice: string) => void;
+}) {
+  const isEdit = editing !== null;
+  const [code, setCode] = useState("");
+  const [title, setTitle] = useState("");
+  const [runEnv, setRunEnv] = useState<ModuleCase["run_env"]>("app");
+  const [level, setLevel] = useState("");
+  const [preconditions, setPreconditions] = useState("");
+  const [steps, setSteps] = useState("");
+  const [expected, setExpected] = useState("");
+  const [dirty, setDirty] = useState(false);
+  const write = useGuardedWrite(userName);
+
+  useEffect(() => {
+    if (!open) return;
+    setCode(editing?.code ?? "");
+    setTitle(editing?.title ?? "");
+    setRunEnv(editing?.run_env ?? "app");
+    setLevel(editing?.level ?? "");
+    setPreconditions((editing?.preconditions ?? []).join("\n"));
+    setSteps((editing?.steps ?? []).join("\n"));
+    setExpected((editing?.expected ?? []).join("\n"));
+    setDirty(false);
+    write.setError(null);
+  }, [open, editing]);
+
+  useUnsavedWarning(open && dirty);
+
+  async function submit() {
+    const payload = {
+      title: title.trim(),
+      run_env: runEnv,
+      level: level.trim(),
+      preconditions: splitLines(preconditions),
+      steps: splitLines(steps),
+      expected: splitLines(expected),
+    };
+    await write.run(async (token) => {
+      if (isEdit && editing) {
+        const res = await updateModuleCase(moduleId, editing.code, payload, token, userName);
+        setDirty(false);
+        onDone(res.updated ? `已更新用例 ${editing.code}（版本 v${res.version}）` : `用例 ${editing.code} 内容没有变化`);
+        onClose();
+      } else {
+        const res = await createModuleCase(moduleId, { code: code.trim(), ...payload }, token, userName);
+        setDirty(false);
+        onDone(`已新增用例 ${res.code}（已批准，可直接发起测试）`);
+        onClose();
+      }
+    });
+  }
+
+  return (
+    <Modal
+      title={isEdit ? `编辑用例：${editing?.code}` : "新增用例"}
+      open={open}
+      onCancel={onClose}
+      destroyOnHidden
+      width={680}
+      footer={[
+        <Button key="cancel" disabled={write.busy} onClick={onClose}>取消</Button>,
+        <Button key="save" type="primary" loading={write.busy} onClick={() => void submit()}>{isEdit ? "保存修改" : "保存用例"}</Button>,
+      ]}
+    >
+      <div className="mod-import">
+        <label>
+          <div className="mod-field-meta">编号（字母、数字、- _ .，同项目唯一）</div>
+          <Input
+            aria-label="用例编号"
+            value={code}
+            disabled={isEdit || write.busy}
+            placeholder="例如：PROF-01"
+            maxLength={40}
+            onChange={(e) => { setCode(e.target.value); setDirty(true); }}
+          />
+        </label>
+        <label>
+          <div className="mod-field-meta">标题（必填）</div>
+          <Input
+            aria-label="用例标题"
+            value={title}
+            disabled={write.busy}
+            placeholder="例如：修改昵称后重启应用保持生效"
+            maxLength={200}
+            onChange={(e) => { setTitle(e.target.value); setDirty(true); }}
+          />
+        </label>
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+          <label>
+            <div className="mod-field-meta">运行环境</div>
+            <Select<ModuleCase["run_env"]>
+              aria-label="运行环境"
+              style={{ width: "100%" }}
+              value={runEnv}
+              disabled={write.busy}
+              onChange={(v) => { setRunEnv(v); setDirty(true); }}
+              options={[
+                { value: "app", label: "App" },
+                { value: "h5", label: "H5" },
+                { value: "browser", label: "浏览器" },
+              ]}
+            />
+          </label>
+          <label>
+            <div className="mod-field-meta">级别（可选）</div>
+            <Input
+              aria-label="用例级别"
+              value={level}
+              disabled={write.busy}
+              placeholder="例如：高 / 中 / 简单流程"
+              maxLength={40}
+              onChange={(e) => { setLevel(e.target.value); setDirty(true); }}
+            />
+          </label>
+        </div>
+        <label>
+          <div className="mod-field-meta">前置条件（一行一条，可选；账号密码只能用 {"{{account.xxx}}"} 占位符）</div>
+          <Input.TextArea
+            aria-label="前置条件"
+            rows={2}
+            value={preconditions}
+            disabled={write.busy}
+            placeholder="已登录测试账号 {{account.username}}"
+            onChange={(e) => { setPreconditions(e.target.value); setDirty(true); }}
+          />
+        </label>
+        <label>
+          <div className="mod-field-meta">操作步骤（必填，一行一步）</div>
+          <Input.TextArea
+            aria-label="操作步骤"
+            rows={4}
+            value={steps}
+            disabled={write.busy}
+            placeholder={"点击个人资料\n点击昵称输入框并输入新昵称\n点击保存"}
+            onChange={(e) => { setSteps(e.target.value); setDirty(true); }}
+          />
+        </label>
+        <label>
+          <div className="mod-field-meta">预期结果（必填，一行一条，判定员逐条核对）</div>
+          <Input.TextArea
+            aria-label="预期结果"
+            rows={4}
+            value={expected}
+            disabled={write.busy}
+            placeholder={"页面提示保存成功\n返回个人页显示新昵称"}
+            onChange={(e) => { setExpected(e.target.value); setDirty(true); }}
+          />
+        </label>
+        {write.error && <Alert type="error" showIcon title={write.error} />}
+      </div>
+      {write.dialog}
+    </Modal>
+  );
+}
+
+/** 测试用例：逐条呈现每一条（不截断、不折叠），支持在线新增 / 编辑 / 删除，以及导出、导入 CSV。 */
 export default function ModuleCases({ moduleId, cases, userName, onChanged }: { moduleId: string; cases: ModuleCase[]; userName: string; onChanged: () => void }) {
   const [importing, setImporting] = useState(false);
+  const [editorOpen, setEditorOpen] = useState(false);
+  const [editing, setEditing] = useState<ModuleCase | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
   const [pageSize, setPageSize] = useState(50);
+  const trimmedName = userName.trim();
+  const deleteWrite = useGuardedWrite(trimmedName);
+
+  async function removeCase(code: string) {
+    setNotice(null);
+    await deleteWrite.run(async (token) => {
+      const res = await deleteModuleCase(moduleId, code, token, trimmedName);
+      setNotice(res.archived ? `用例 ${code} 已有历史执行或脚本记录，已归档隐藏（历史数据保留）` : `已删除用例 ${code}`);
+      onChanged();
+    });
+  }
 
   const columns: TableColumnsType<ModuleCase> = [
     { title: "编号", dataIndex: "code", width: 150, fixed: "left", render: (v: string) => <span className="mono" style={{ whiteSpace: "nowrap" }}>{v}</span> },
@@ -115,6 +311,36 @@ export default function ModuleCases({ moduleId, cases, userName, onChanged }: { 
     { title: "预期", dataIndex: "expected", width: 240, render: (v: string[]) => <Lines items={v} /> },
     { title: "复核状态", dataIndex: "review_status", width: 150, render: (v: ReviewStatus) => REVIEW_TEXT[v] },
     { title: "最近结果", key: "result", width: 100, render: (_: unknown, row) => resultText(row.latest_run) },
+    {
+      title: "操作",
+      key: "actions",
+      width: 136,
+      fixed: "right",
+      render: (_: unknown, row) => (
+        <Space size={4}>
+          <Button
+            size="small"
+            onClick={() => {
+              setNotice(null);
+              setEditing(row);
+              setEditorOpen(true);
+            }}
+          >
+            编辑
+          </Button>
+          <Popconfirm
+            title={`删除用例 ${row.code}？`}
+            description="若有历史执行或脚本，将自动归档隐藏以保留证据。"
+            okText="删除"
+            cancelText="取消"
+            okButtonProps={{ danger: true }}
+            onConfirm={() => void removeCase(row.code)}
+          >
+            <Button size="small" danger disabled={deleteWrite.busy}>删除</Button>
+          </Popconfirm>
+        </Space>
+      ),
+    },
   ];
 
   return (
@@ -122,20 +348,44 @@ export default function ModuleCases({ moduleId, cases, userName, onChanged }: { 
       <div className="mod-panel-head">
         <h2 className="mod-panel-title">测试用例（共 {cases.length} 条）</h2>
         <div className="mod-actions">
+          <Button
+            type="primary"
+            onClick={() => {
+              setNotice(null);
+              setEditing(null);
+              setEditorOpen(true);
+            }}
+          >
+            新增用例
+          </Button>
           <a className="ant-btn ant-btn-default" href={moduleCasesCsvUrl(moduleId)} download="cases.csv">导出 CSV</a>
-          <Button type="primary" onClick={() => setImporting(true)}>导入 CSV</Button>
+          <Button onClick={() => setImporting(true)}>导入 CSV</Button>
         </div>
       </div>
+      {notice && <Alert type="success" showIcon closable onClose={() => setNotice(null)} title={notice} style={{ margin: "0 20px 12px" }} />}
+      {deleteWrite.error && <Alert type="error" showIcon closable onClose={() => deleteWrite.setError(null)} title={deleteWrite.error} style={{ margin: "0 20px 12px" }} />}
       <Table<ModuleCase>
         rowKey="code"
         size="small"
         columns={columns}
         dataSource={cases}
-        scroll={{ x: 1400 }}
-        locale={{ emptyText: "这个模块还没有用例：新建任务生成用例，或点「导入 CSV」" }}
+        scroll={{ x: 1560 }}
+        locale={{ emptyText: "这个模块还没有用例：点「新增用例」、新建任务生成用例，或点「导入 CSV」" }}
         pagination={{ pageSize, showSizeChanger: true, pageSizeOptions: [20, 50, 100, 200], showTotal: (n) => `共 ${n} 条`, onShowSizeChange: (_p, size) => setPageSize(size) }}
       />
-      <ImportDialog moduleId={moduleId} userName={userName.trim()} open={importing} onClose={() => setImporting(false)} onDone={onChanged} />
+      <CaseEditorDialog
+        moduleId={moduleId}
+        editing={editing}
+        open={editorOpen}
+        userName={trimmedName}
+        onClose={() => setEditorOpen(false)}
+        onDone={(msg) => {
+          setNotice(msg);
+          onChanged();
+        }}
+      />
+      <ImportDialog moduleId={moduleId} userName={trimmedName} open={importing} onClose={() => setImporting(false)} onDone={onChanged} />
+      {deleteWrite.dialog}
     </section>
   );
 }

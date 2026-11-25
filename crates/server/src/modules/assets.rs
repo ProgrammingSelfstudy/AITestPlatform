@@ -359,6 +359,59 @@ pub(crate) struct CsvCase {
     pub expected: Vec<String>,
 }
 
+/// 校验单条用例的全部字段（CSV 导入和单条在线新增/编辑共用同一套规则，保证口径完全一致）。
+pub(crate) fn validate_case_fields(
+    raw_code: &str,
+    raw_title: &str,
+    raw_env: &str,
+    raw_level: &str,
+    raw_preconditions: &[String],
+    raw_steps: &[String],
+    raw_expected: &[String],
+) -> Result<CsvCase, Vec<String>> {
+    let code = raw_code.trim().to_string();
+    let title = raw_title.trim().to_string();
+    let mut problems = Vec::new();
+    if code.is_empty() || !code.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')) || code.len() > 40 {
+        problems.push("编号只能用字母、数字、- _ .，不超过 40 位，且不能为空".to_string());
+    }
+    if title.is_empty() || title.chars().count() > 200 {
+        problems.push("标题不能为空，也不超过 200 个字".into());
+    }
+    let env_text = raw_env.trim().to_lowercase();
+    let env = match env_text.as_str() {
+        "" | "app" => "app",
+        "h5" => "h5",
+        "browser" | "浏览器" => "browser",
+        _ => {
+            problems.push("运行环境只能是 app、h5、browser（或留空按 app）".into());
+            "app"
+        }
+    };
+    let level = raw_level.trim().to_string();
+    if level.chars().count() > 40 {
+        problems.push("级别不超过 40 个字".into());
+    }
+    let clean = |items: &[String]| -> Vec<String> { items.iter().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect() };
+    let (preconditions, steps, expected) = (clean(raw_preconditions), clean(raw_steps), clean(raw_expected));
+    if steps.is_empty() {
+        problems.push("步骤不能为空（一行一步，单元格里换行）".into());
+    }
+    if expected.is_empty() {
+        problems.push("预期不能为空（一行一条，评审员要逐条判定）".into());
+    }
+    // 规则 2：明文密码一律拒绝，错误里不回显值
+    let all = [title.as_str(), &preconditions.join("\n"), &steps.join("\n"), &expected.join("\n")].join("\n");
+    if plain_password_line(&all).is_some() {
+        problems.push("里面有明文密码：账号密码只能写成 {{account.xxx}} 占位符（值未显示）".into());
+    }
+    if problems.is_empty() {
+        Ok(CsvCase { code, title, env, level, preconditions, steps, expected })
+    } else {
+        Err(problems)
+    }
+}
+
 /// 把 CSV 文本整个校验成用例；任何一行不合格就返回全部问题（带行号），一条都不导入。
 pub(crate) fn parse_cases(text: &str) -> Result<Vec<CsvCase>, Vec<String>> {
     let rows = parse_csv(text).map_err(|e| vec![e])?;
@@ -386,46 +439,29 @@ pub(crate) fn parse_cases(text: &str) -> Result<Vec<CsvCase>, Vec<String>> {
     for (i, row) in body.iter().enumerate() {
         let line = i + 2; // 表头是第 1 行
         let code = get(row, c_code).trim().to_string();
-        let title = unguard(get(row, c_title)).trim().to_string();
-        let mut problems = Vec::new();
-        if code.is_empty() || !code.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')) || code.len() > 40 {
-            problems.push("编号只能用字母、数字、- _ .，不超过 40 位，且不能为空".to_string());
-        } else if !seen.insert(code.clone()) {
-            problems.push(format!("编号 {code} 在文件里重复了"));
-        }
-        if title.is_empty() || title.chars().count() > 200 {
-            problems.push("标题不能为空，也不超过 200 个字".into());
-        }
-        let env_text = get(row, c_env).trim().to_lowercase();
-        let env = match env_text.as_str() {
-            "" | "app" => "app",
-            "h5" => "h5",
-            "browser" | "浏览器" => "browser",
-            _ => {
-                problems.push("运行环境只能是 app、h5、browser（或留空按 app）".into());
-                "app"
+        let title = unguard(get(row, c_title));
+        let env_text = get(row, c_env);
+        let level = unguard(get(row, c_level));
+        let (preconditions, steps, expected) = (lines_of(get(row, c_pre)), lines_of(get(row, c_steps)), lines_of(get(row, c_exp)));
+        let mut problems = match validate_case_fields(&code, title, env_text, level, &preconditions, &steps, &expected) {
+            Ok(validated) => {
+                if !seen.insert(validated.code.clone()) {
+                    vec![format!("编号 {} 在文件里重复了", validated.code)]
+                } else {
+                    cases.push(validated);
+                    Vec::new()
+                }
+            }
+            Err(mut errs) => {
+                let code_ok = !code.is_empty() && code.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')) && code.len() <= 40;
+                if code_ok && !seen.insert(code.clone()) {
+                    errs.insert(0, format!("编号 {code} 在文件里重复了"));
+                }
+                errs
             }
         };
-        let level = unguard(get(row, c_level)).trim().to_string();
-        if level.chars().count() > 40 {
-            problems.push("级别不超过 40 个字".into());
-        }
-        let (preconditions, steps, expected) = (lines_of(get(row, c_pre)), lines_of(get(row, c_steps)), lines_of(get(row, c_exp)));
-        if steps.is_empty() {
-            problems.push("步骤不能为空（一行一步，单元格里换行）".into());
-        }
-        if expected.is_empty() {
-            problems.push("预期不能为空（一行一条，评审员要逐条判定）".into());
-        }
-        // 规则 2：明文密码一律拒绝，错误里不回显值
-        let all = [title.as_str(), &preconditions.join("\n"), &steps.join("\n"), &expected.join("\n")].join("\n");
-        if plain_password_line(&all).is_some() {
-            problems.push("里面有明文密码：账号密码只能写成 {{account.xxx}} 占位符（值未显示）".into());
-        }
-        if problems.is_empty() {
-            cases.push(CsvCase { code, title, env, level, preconditions, steps, expected });
-        } else {
-            errors.extend(problems.into_iter().map(|p| format!("第 {line} 行：{p}")));
+        if !problems.is_empty() {
+            errors.extend(problems.drain(..).map(|p| format!("第 {line} 行：{p}")));
         }
     }
     if errors.is_empty() { Ok(cases) } else { Err(errors) }
@@ -440,7 +476,7 @@ pub(crate) async fn api_cases_csv(State(state): State<ApiState>, Path(id): Path<
                 r.id as run_id, r.final_result, r.blocked_reason
          from test_cases c
          left join lateral (select * from runs x where x.case_id = c.id order by x.seq desc limit 1) r on true
-         where c.module_id = $1 order by c.code",
+         where c.module_id = $1 and c.status != 'archived' order by c.code",
     )
     .bind(module)
     .fetch_all(pool)
@@ -512,15 +548,18 @@ pub(crate) async fn api_import_cases(
         .ok_or((StatusCode::NOT_FOUND, "没有这个模块".to_string()))?;
     let (mut inserted, mut updated, mut unchanged) = (0u32, 0u32, 0u32);
     for c in &cases {
-        let owner: Option<Option<Uuid>> = sqlx::query_scalar("select module_id from test_cases where project_id = $1 and code = $2")
+        let existing: Option<(Option<Uuid>, String)> = sqlx::query_as("select module_id, status from test_cases where project_id = $1 and code = $2")
             .bind(project_id)
             .bind(&c.code)
             .fetch_optional(&mut *tx)
             .await
             .map_err(|e| internal("导入用例失败", e))?;
-        if let Some(other) = owner {
+        if let Some((other, status)) = existing {
             if other != Some(module) {
                 return Err(bad(format!("编号 {} 已经被别的模块（或不属于任何模块的老用例）占用了，请换一个编号", c.code)));
+            }
+            if status == "archived" {
+                return Err(bad(format!("编号 {} 已经被归档，请换一个编号再导入", c.code)));
             }
         }
         let expected: Vec<serde_json::Value> = c.expected.iter().enumerate().map(|(i, t)| serde_json::json!({ "idx": i + 1, "text": t })).collect();
@@ -560,6 +599,191 @@ pub(crate) async fn api_import_cases(
     Ok(Json(serde_json::json!({ "inserted": inserted, "updated": updated, "unchanged": unchanged })))
 }
 
+// ---------------------------------------------------------------- 单条用例在线增删改
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SingleCaseInput {
+    code: String,
+    title: String,
+    #[serde(default)]
+    run_env: String,
+    #[serde(default)]
+    level: String,
+    #[serde(default)]
+    preconditions: Vec<String>,
+    steps: Vec<String>,
+    expected: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct UpdateCaseInput {
+    title: String,
+    #[serde(default)]
+    run_env: String,
+    #[serde(default)]
+    level: String,
+    #[serde(default)]
+    preconditions: Vec<String>,
+    steps: Vec<String>,
+    expected: Vec<String>,
+}
+
+/// 在模块下在线新增一条用例：人手工录入默认已批准，与 CSV 导入口径一致；同项目内编号唯一。
+pub(crate) async fn api_create_case(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    body: Result<Json<SingleCaseInput>, JsonRejection>,
+) -> Result<(StatusCode, Json<serde_json::Value>), ApiError> {
+    let module = module_uuid(&id)?;
+    let Json(input) = body.map_err(|_| bad("用例参数格式无效"))?;
+    let case = validate_case_fields(&input.code, &input.title, &input.run_env, &input.level, &input.preconditions, &input.steps, &input.expected)
+        .map_err(|errs| bad(errs.join("；")))?;
+    writer(&state, &headers).await?;
+    let pool = state.app.pool();
+    let mut tx = pool.begin().await.map_err(|e| internal("新增用例失败", e))?;
+    let project_id: Uuid = sqlx::query_scalar("select project_id from modules where id = $1 for update")
+        .bind(module)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| internal("新增用例失败", e))?
+        .ok_or((StatusCode::NOT_FOUND, "没有这个模块".to_string()))?;
+    let existing: Option<String> = sqlx::query_scalar("select status from test_cases where project_id = $1 and code = $2")
+        .bind(project_id)
+        .bind(&case.code)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| internal("新增用例失败", e))?;
+    if let Some(status) = existing {
+        let msg = if status == "archived" {
+            format!("编号 {} 曾经使用过（已归档），请换一个编号", case.code)
+        } else {
+            format!("编号 {} 已经存在，请换一个编号", case.code)
+        };
+        return Err((StatusCode::CONFLICT, msg));
+    }
+    let expected: Vec<serde_json::Value> = case.expected.iter().enumerate().map(|(i, t)| serde_json::json!({ "idx": i + 1, "text": t })).collect();
+    sqlx::query(
+        "insert into test_cases (project_id, code, title, level, platforms, preconditions, steps, expected, should_fail, status, module_id, origin, review_status)
+         values ($1,$2,$3,$4,$5,$6,$7,$8,$9,'active',$10,'imported','approved')",
+    )
+    .bind(project_id)
+    .bind(&case.code)
+    .bind(&case.title)
+    .bind(&case.level)
+    .bind(platforms_of(case.env))
+    .bind(serde_json::json!(case.preconditions))
+    .bind(serde_json::json!(case.steps))
+    .bind(serde_json::Value::Array(expected))
+    .bind(case.level == crate::cases::NEGATIVE_LEVEL)
+    .bind(module)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| internal("新增用例失败", e))?;
+    tx.commit().await.map_err(|e| internal("新增用例失败", e))?;
+    Ok((StatusCode::CREATED, Json(serde_json::json!({ "code": case.code }))))
+}
+
+/// 在线编辑本模块单条用例：编号不变，内容真变了才把 version + 1。
+pub(crate) async fn api_update_case(
+    State(state): State<ApiState>,
+    Path((id, code)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: Result<Json<UpdateCaseInput>, JsonRejection>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let module = module_uuid(&id)?;
+    let Json(input) = body.map_err(|_| bad("用例参数格式无效"))?;
+    let case = validate_case_fields(&code, &input.title, &input.run_env, &input.level, &input.preconditions, &input.steps, &input.expected)
+        .map_err(|errs| bad(errs.join("；")))?;
+    writer(&state, &headers).await?;
+    let pool = state.app.pool();
+    let mut tx = pool.begin().await.map_err(|e| internal("修改用例失败", e))?;
+    let current: Option<(Uuid, i32)> = sqlx::query_as(
+        "select id, version from test_cases where module_id = $1 and code = $2 and status != 'archived' for update",
+    )
+    .bind(module)
+    .bind(&code)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|e| internal("修改用例失败", e))?;
+    let Some((case_id, old_version)) = current else {
+        return Err((StatusCode::NOT_FOUND, "这个模块里没有这条用例".to_string()));
+    };
+    let expected: Vec<serde_json::Value> = case.expected.iter().enumerate().map(|(i, t)| serde_json::json!({ "idx": i + 1, "text": t })).collect();
+    let new_version: Option<i32> = sqlx::query_scalar(
+        "update test_cases set
+           title = $2, level = $3, platforms = $4, preconditions = $5, steps = $6, expected = $7, should_fail = $8,
+           version = version + 1, updated_at = now()
+         where id = $1
+           and (title, level, platforms, preconditions, steps, expected, should_fail)
+               is distinct from ($2, $3, $4, $5, $6, $7, $8)
+         returning version",
+    )
+    .bind(case_id)
+    .bind(&case.title)
+    .bind(&case.level)
+    .bind(platforms_of(case.env))
+    .bind(serde_json::json!(case.preconditions))
+    .bind(serde_json::json!(case.steps))
+    .bind(serde_json::Value::Array(expected))
+    .bind(case.level == crate::cases::NEGATIVE_LEVEL)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|e| internal("修改用例失败", e))?;
+    tx.commit().await.map_err(|e| internal("修改用例失败", e))?;
+    Ok(Json(serde_json::json!({
+        "updated": new_version.is_some(),
+        "version": new_version.unwrap_or(old_version),
+    })))
+}
+
+/// 删除本模块单条用例：没有历史执行和回归脚本时物理删除；已有历史记录时改为 `archived` 隐藏，保护历史证据和外键完整。
+pub(crate) async fn api_delete_case(
+    State(state): State<ApiState>,
+    Path((id, code)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let module = module_uuid(&id)?;
+    writer(&state, &headers).await?;
+    let pool = state.app.pool();
+    let mut tx = pool.begin().await.map_err(|e| internal("删除用例失败", e))?;
+    let case_id: Option<Uuid> = sqlx::query_scalar(
+        "select id from test_cases where module_id = $1 and code = $2 and status != 'archived' for update",
+    )
+    .bind(module)
+    .bind(&code)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|e| internal("删除用例失败", e))?;
+    let Some(case_id) = case_id else {
+        return Err((StatusCode::NOT_FOUND, "这个模块里没有这条用例".to_string()));
+    };
+    let has_history: bool = sqlx::query_scalar(
+        "select exists(select 1 from runs where case_id = $1) or exists(select 1 from scripts where case_id = $1)",
+    )
+    .bind(case_id)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(|e| internal("删除用例失败", e))?;
+    if has_history {
+        sqlx::query("update test_cases set status = 'archived', updated_at = now() where id = $1")
+            .bind(case_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| internal("归档用例失败", e))?;
+    } else {
+        sqlx::query("delete from test_cases where id = $1")
+            .bind(case_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| internal("删除用例失败", e))?;
+    }
+    tx.commit().await.map_err(|e| internal("删除用例失败", e))?;
+    Ok(Json(serde_json::json!({ "deleted": !has_history, "archived": has_history })))
+}
+
 // ---------------------------------------------------------------- 录屏
 
 #[derive(Serialize)]
@@ -590,7 +814,7 @@ pub(crate) async fn api_module_recordings(State(state): State<ApiState>, Path(id
         "select c.code, c.title, r.id as run_id, r.final_result
          from test_cases c
          join lateral (select * from runs x where x.case_id = c.id order by x.seq desc limit 1) r on true
-         where c.module_id = $1 order by c.code",
+         where c.module_id = $1 and c.status != 'archived' order by c.code",
     )
     .bind(module)
     .fetch_all(pool)

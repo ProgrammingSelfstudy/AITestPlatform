@@ -3,7 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import type { ModuleCase, ModuleShot } from "../src/api";
 import ModuleCases from "../src/ModuleCases";
-import ModuleResults from "../src/ModuleResults";
+import ModuleResults, { retryableModuleCaseCodes } from "../src/ModuleResults";
 import ModuleShots from "../src/ModuleShots";
 import { rememberReviewToken } from "../src/reviewLogic";
 
@@ -126,4 +126,77 @@ test("测试结果：条件不足跳过的单独一类「已跳过」，写出�
   expect(screen.getByText("受阻 1")).toBeInTheDocument();
   expect(screen.getByText("通过 0")).toBeInTheDocument();
   expect(screen.getByText(/平台还没有 H5 执行器，已跳过/)).toBeInTheDocument();
+});
+
+test("测试用例：支持在线新增、编辑和删除（有历史执行返回归档提示）", async () => {
+  const onChanged = vi.fn();
+  fetchMock.mockImplementation(async (input, init) => {
+    const path = String(input);
+    if (init?.method === "POST" && path === `/api/modules/${MOD}/cases`) {
+      return Response.json({ code: "PROF-01" }, { status: 201 });
+    }
+    if (init?.method === "POST" && path === `/api/modules/${MOD}/cases/T-1/update`) {
+      return Response.json({ updated: true, version: 2 });
+    }
+    if (init?.method === "POST" && path === `/api/modules/${MOD}/cases/T-1/delete`) {
+      return Response.json({ deleted: false, archived: true });
+    }
+    return new Response("not found", { status: 404 });
+  });
+  const user = userEvent.setup();
+  render(<ModuleCases moduleId={MOD} cases={[kase("T-1")]} userName="小明" onChanged={onChanged} />);
+
+  // 1. 新增单条用例
+  await user.click(screen.getByRole("button", { name: /新增用例/ }));
+  const createDialog = within(await screen.findByRole("dialog"));
+  await user.type(createDialog.getByLabelText("用例编号"), "PROF-01");
+  await user.type(createDialog.getByLabelText("用例标题"), "修改昵称");
+  await user.type(createDialog.getByLabelText("操作步骤"), "进入编辑页\n输入昵称");
+  await user.type(createDialog.getByLabelText("预期结果"), "提示保存成功");
+  await user.click(createDialog.getByRole("button", { name: /保存用例/ }));
+  expect(await screen.findByText(/已新增用例 PROF-01/)).toBeInTheDocument();
+  const createdBody = JSON.parse(String(posts()[0][1]?.body));
+  expect(createdBody).toMatchObject({ code: "PROF-01", title: "修改昵称", run_env: "app", steps: ["进入编辑页", "输入昵称"], expected: ["提示保存成功"] });
+
+  // 2. 编辑已有用例（编号只读）
+  await user.click(screen.getByRole("button", { name: /编\s*辑/ }));
+  const editDialog = within(await screen.findByRole("dialog"));
+  expect(editDialog.getByLabelText("用例编号")).toBeDisabled();
+  await user.clear(editDialog.getByLabelText("用例标题"));
+  await user.type(editDialog.getByLabelText("用例标题"), "修改后的标题");
+  await user.click(editDialog.getByRole("button", { name: /保存修改/ }));
+  expect(await screen.findByText(/已更新用例 T-1（版本 v2）/)).toBeInTheDocument();
+
+  // 3. 删除已有用例 → 后端返回 archived=true 时展示归档提示
+  await user.click(screen.getByRole("button", { name: /删\s*除/ }));
+  const confirm = await waitFor(() => {
+    const popover = document.querySelector(".ant-popover:not(.ant-popover-hidden)") as HTMLElement | null;
+    if (!popover) throw new Error("确认框还没出现");
+    return within(popover).getByRole("button", { name: /删\s*除/ });
+  });
+  await user.click(confirm);
+  expect(await screen.findByText(/已有历史执行或脚本记录，已归档隐藏/)).toBeInTheDocument();
+  expect(onChanged).toHaveBeenCalledTimes(3);
+}, 20000);
+
+test("测试结果：一键重跑只挑已批准且终态未通过的非跳过用例", async () => {
+  const mkRun = (status: string, final_result: "passed" | "failed" | "uncertain" | "blocked" | null, blocked_reason: string | null = null) => ({
+    run_id: `r-${status}-${final_result ?? "x"}`, task_id: "t1", status, final_result, blocked_reason, skip_reason: null, queued_at: "2026-11-24T00:00:00Z",
+  });
+  const cases = [
+    kase("PASS-1", { latest_run: mkRun("finished", "passed") }),
+    kase("FAIL-1", { latest_run: mkRun("finished", "failed") }),
+    kase("UNC-1", { latest_run: mkRun("finished", "uncertain") }),
+    kase("BLK-1", { latest_run: mkRun("blocked", "blocked", "stuck") }),
+    kase("SKIP-1", { latest_run: mkRun("blocked", "blocked", "skipped") }),
+    kase("RUN-1", { latest_run: mkRun("running", null) }),
+    kase("DRAFT-1", { review_status: "needs_human", latest_run: mkRun("finished", "failed") }),
+    kase("NONE-1", { latest_run: null }),
+  ];
+  expect(retryableModuleCaseCodes(cases)).toEqual(["FAIL-1", "UNC-1", "BLK-1"]);
+  const onRerun = vi.fn();
+  const user = userEvent.setup();
+  render(<ModuleResults cases={cases} onRerun={onRerun} />);
+  await user.click(screen.getByRole("button", { name: /重跑未通过用例（3）/ }));
+  expect(onRerun).toHaveBeenCalledWith(["FAIL-1", "UNC-1", "BLK-1"]);
 });

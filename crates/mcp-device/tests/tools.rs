@@ -7,7 +7,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use device::{Bounds, DeviceError, Element};
 use mcp_device::dev::DeviceApi;
-use mcp_device::{DeviceServer, DragArgs, FinishArgs, NeedHumanArgs, ServerConfig, SwipeArgs, TapArgs, TapXyArgs, WaitArgs};
+use mcp_device::{DeviceServer, DragArgs, FinishArgs, InputTextArgs, NeedHumanArgs, ServerConfig, SwipeArgs, TapArgs, TapXyArgs, WaitArgs};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::CallToolResult;
 
@@ -28,15 +28,23 @@ struct Fake {
     next: NextFn,
     taps: Mutex<Vec<(i32, i32)>>,
     swipes: Mutex<Vec<(i32, i32, i32, i32)>>,
+    typed: Mutex<Vec<(String, bool)>>,
     calls: Mutex<Vec<String>>,
     fail_tap: AtomicBool,
+    fail_input_unsupported: AtomicBool,
+    fail_input_cmd: AtomicBool,
     fail_dump_after_tap: AtomicBool,
     empty_dump: Mutex<Option<String>>,
 }
 
 impl Fake {
     fn new(pages: Vec<Vec<Element>>, next: NextFn) -> Arc<Self> {
-        Arc::new(Self { pages, cur: AtomicUsize::new(0), next, taps: Mutex::new(vec![]), swipes: Mutex::new(vec![]), calls: Mutex::new(vec![]), fail_tap: AtomicBool::new(false), fail_dump_after_tap: AtomicBool::new(false), empty_dump: Mutex::new(None) })
+        Arc::new(Self {
+            pages, cur: AtomicUsize::new(0), next,
+            taps: Mutex::new(vec![]), swipes: Mutex::new(vec![]), typed: Mutex::new(vec![]), calls: Mutex::new(vec![]),
+            fail_tap: AtomicBool::new(false), fail_input_unsupported: AtomicBool::new(false), fail_input_cmd: AtomicBool::new(false),
+            fail_dump_after_tap: AtomicBool::new(false), empty_dump: Mutex::new(None),
+        })
     }
     /// 点击后页面不变的单页设备
     fn still(page: Vec<Element>) -> Arc<Self> {
@@ -94,6 +102,16 @@ impl DeviceApi for Fake {
     }
     async fn screen_size(&self) -> device::Result<(i32, i32)> {
         Ok((720, 1600))
+    }
+    async fn input_text(&self, text: &str, clear: bool) -> device::Result<()> {
+        if self.fail_input_unsupported.load(Ordering::SeqCst) {
+            return Err(DeviceError::Unsupported(format!("`adb input text` 无法输入非 ASCII：{text}")));
+        }
+        if self.fail_input_cmd.load(Ordering::SeqCst) {
+            return Err(DeviceError::Command { cmd: format!("adb shell input text {text}"), code: Some(1), stderr: format!("failed typing {text}") });
+        }
+        self.typed.lock().unwrap().push((text.to_string(), clear));
+        Ok(())
     }
 }
 
@@ -624,4 +642,83 @@ async fn 拖动起点在高危元素上也被拦截() {
     assert!(fake.swipes.lock().unwrap().is_empty(), "高危起点绝不能真的拖下去");
     let m2 = txt(&s.drag(Parameters(DragArgs { x1: 10, y1: 10, x2: 20, y2: 20, duration_ms: None })).await.unwrap());
     assert!(m2.contains("need_human"), "拦截后换个起点也不行：{m2}");
+}
+
+#[tokio::test]
+async fn 输入文字支持直接输入与先聚焦再输入并写轨迹() {
+    let page = vec![el("Title", false, 0, 100, 720, 160), el("Search box", true, 40, 220, 680, 300)];
+    let fake = Fake::still(page);
+    let (s, d) = server(fake.clone(), 40);
+    s.observe().await.unwrap();
+
+    // 传 element_id：先点输入框聚焦再输入，默认 clear=true
+    let m = txt(&s.input_text(Parameters(InputTextArgs { text: "hello world".into(), element_id: Some(2), clear: None })).await.unwrap());
+    assert!(m.contains("已输入「hello world」"), "{m}");
+    assert_eq!(fake.taps(), [(360, 260)], "指定 element_id 应先点击聚焦");
+    assert_eq!(*fake.typed.lock().unwrap(), vec![("hello world".to_string(), true)]);
+    assert_eq!(status(&s).await["steps"], 1);
+
+    // 不传 element_id：直接输入到当前聚焦框，clear=false
+    let m2 = txt(&s.input_text(Parameters(InputTextArgs { text: "2026".into(), element_id: None, clear: Some(false) })).await.unwrap());
+    assert!(m2.contains("已输入「2026」"), "{m2}");
+    assert_eq!(fake.taps().len(), 1, "未指定 element_id 不应额外点击");
+    assert_eq!(fake.typed.lock().unwrap()[1], ("2026".to_string(), false));
+
+    let trace = std::fs::read_to_string(d.join("trace.json")).unwrap();
+    assert!(trace.contains("\"action\": \"input_text\"") && trace.contains("\"target\": \"Search box\"") && trace.contains("\"value\": \"hello world\""), "{trace}");
+}
+
+#[tokio::test]
+async fn 输入文字按占位符注入账号密码且绝不进轨迹或错误() {
+    let d = run_dir();
+    let mut c = cfg(&d, 40);
+    c.secrets = vec![
+        ("tester@example.com".into(), "{{account.username}}".into()),
+        ("S3cretPassw0rd!".into(), "{{account.password}}".into()),
+    ];
+    let fake = Fake::still(list_page());
+    let s = DeviceServer::new(fake.clone(), c).unwrap();
+
+    // 传入占位符：设备收到真实密码，但返回文案和轨迹只留占位符
+    let m = txt(&s.input_text(Parameters(InputTextArgs { text: "{{account.password}}".into(), element_id: None, clear: None })).await.unwrap());
+    assert!(m.contains("{{account.password}}") && !m.contains("S3cretPassw0rd!"), "返回文案不能泄露密码：{m}");
+    assert_eq!(fake.typed.lock().unwrap()[0].0, "S3cretPassw0rd!", "设备侧应收到运行时注入的真实密码");
+    let trace = std::fs::read_to_string(d.join("trace.json")).unwrap();
+    assert!(trace.contains("{{account.password}}") && !trace.contains("S3cretPassw0rd!"), "轨迹不能泄露密码：{trace}");
+
+    // 设备命令失败时，stderr 里含密码也必须脱敏
+    fake.fail_input_cmd.store(true, Ordering::SeqCst);
+    let err = s.input_text(Parameters(InputTextArgs { text: "{{account.password}}".into(), element_id: None, clear: None })).await.unwrap_err().to_string();
+    assert!(!err.contains("S3cretPassw0rd!") && err.contains("{{account.password}}"), "设备错误里不能泄露密码：{err}");
+}
+
+#[tokio::test]
+async fn 未绑定账号凭证时拒绝直接输入account占位符() {
+    let fake = Fake::still(list_page());
+    let (s, _d) = server(fake.clone(), 40);
+    let m = txt(&s.input_text(Parameters(InputTextArgs { text: "{{account.password}}".into(), element_id: None, clear: None })).await.unwrap());
+    assert!(m.contains("没有可注入的账号凭证占位符"), "{m}");
+    assert!(fake.typed.lock().unwrap().is_empty(), "绝不能把字面占位符输进手机");
+    assert_eq!(status(&s).await["steps"], 0);
+}
+
+#[tokio::test]
+async fn 输入不支持的字符如实返回说明且不计步() {
+    let fake = Fake::still(list_page());
+    fake.fail_input_unsupported.store(true, Ordering::SeqCst);
+    let (s, _d) = server(fake.clone(), 40);
+    let m = txt(&s.input_text(Parameters(InputTextArgs { text: "中文内容".into(), element_id: None, clear: None })).await.unwrap());
+    assert!(m.contains("无法输入这段文字") && m.contains("need_human"), "{m}");
+    assert_eq!(status(&s).await["steps"], 0, "不支持的输入不计步");
+}
+
+#[tokio::test]
+async fn 输入文字指定高危元素被拦截() {
+    let fake = Fake::still(pay_page());
+    let (s, _d) = server(fake.clone(), 40);
+    s.observe().await.unwrap();
+    let reply = s.input_text(Parameters(InputTextArgs { text: "100".into(), element_id: Some(2), clear: None })).await.unwrap();
+    assert_need_human(&reply, "Pay Now");
+    assert!(fake.taps().is_empty() && fake.typed.lock().unwrap().is_empty(), "命中高危绝不能点击或输入");
+    assert_eq!(status(&s).await["steps"], 0);
 }

@@ -101,6 +101,11 @@ impl Reporter {
         tracing::warn!(run_id = %self.run_id, "{msg}");
         self.log("warn", msg);
     }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(node_id: Uuid, run_id: Uuid, tx: mpsc::UnboundedSender<NodeMsg>) -> Self {
+        Self { run_id, node_id, tx, start_confirmed: false, terminal: Arc::new(AtomicBool::new(false)) }
+    }
 }
 
 /// 丢弃时中止任务：外层任务被取消时，里面派生的任务也要一起停。

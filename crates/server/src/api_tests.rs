@@ -2958,3 +2958,79 @@ async fn 生成用例_ui图链接不是必填_不带链接也能创建() {
     assert_eq!(json_body(&bytes)["ui_links"], json!([]));
     assert_eq!(json_body(&bytes)["screenshot_count"], 1, "截图仍然必填，这里带了一张");
 }
+
+#[tokio::test]
+async fn 模块用例_单条新增编辑删除_有历史执行时归档保留证据() {
+    let world = World::new().await;
+    let pool = world.state.pool();
+    let module: Uuid = sqlx::query_scalar("insert into modules (project_id, name) select id, '个人资料' from projects where name = 'hafa' returning id")
+        .fetch_one(pool).await.unwrap();
+    let other_module: Uuid = sqlx::query_scalar("insert into modules (project_id, name) select id, '其他模块' from projects where name = 'hafa' returning id")
+        .fetch_one(pool).await.unwrap();
+    let base = format!("/api/modules/{module}/cases");
+
+    // 1. 新增单条用例（合法，自动已批准）
+    let body = json!({
+        "code": "PROF-01",
+        "title": "修改昵称",
+        "run_env": "app",
+        "level": "高",
+        "preconditions": ["已登录"],
+        "steps": ["进入编辑页", "输入新昵称"],
+        "expected": ["昵称更新成功"]
+    });
+    let (status, _, bytes) = browser_post(&world.app, &base, body.clone()).await;
+    assert_eq!(status, StatusCode::CREATED, "{}", text(&bytes));
+    assert_eq!(json_body(&bytes)["code"], "PROF-01");
+
+    // 2. 重复编号 409；明文密码 400 且不回显密码
+    assert_eq!(browser_post(&world.app, &base, body.clone()).await.0, StatusCode::CONFLICT);
+    let mut bad_pw = body.clone();
+    bad_pw["code"] = json!("PROF-PW");
+    bad_pw["steps"] = json!(["输入密码：hunter2pass"]);
+    let (status, _, bytes) = browser_post(&world.app, &base, bad_pw).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(text(&bytes).contains("明文密码") && !text(&bytes).contains("hunter2pass"));
+
+    // 3. 在线编辑：内容不变不升版本；内容变了版本 +1；跨模块编辑 404
+    let update_path = format!("{base}/PROF-01/update");
+    let update_body = json!({
+        "title": "修改昵称",
+        "run_env": "app",
+        "level": "高",
+        "preconditions": ["已登录"],
+        "steps": ["进入编辑页", "输入新昵称"],
+        "expected": ["昵称更新成功"]
+    });
+    let (status, _, bytes) = browser_post(&world.app, &update_path, update_body.clone()).await;
+    assert_eq!((status, json_body(&bytes)), (StatusCode::OK, json!({"updated": false, "version": 1})));
+    let mut changed = update_body.clone();
+    changed["title"] = json!("修改昵称与签名");
+    changed["run_env"] = json!("h5");
+    let (status, _, bytes) = browser_post(&world.app, &update_path, changed).await;
+    assert_eq!((status, json_body(&bytes)), (StatusCode::OK, json!({"updated": true, "version": 2})));
+    let other_update = format!("/api/modules/{other_module}/cases/PROF-01/update");
+    assert_eq!(browser_post(&world.app, &other_update, update_body).await.0, StatusCode::NOT_FOUND);
+
+    // 4. 删除无历史执行的用例 → 物理删除
+    let (status, _, bytes) = browser_post(&world.app, &format!("{base}/PROF-01/delete"), json!({})).await;
+    assert_eq!((status, json_body(&bytes)), (StatusCode::OK, json!({"deleted": true, "archived": false})));
+    let (_, _, list_bytes) = request(&world.app, Method::GET, &base, &[], "").await;
+    assert_eq!(json_body(&list_bytes).as_array().unwrap().len(), 0);
+
+    // 5. 新增一条并产生执行记录，再删除 → 自动归档隐藏，历史 run 保留不损坏
+    let mut with_run = body.clone();
+    with_run["code"] = json!("PROF-02");
+    assert_eq!(browser_post(&world.app, &base, with_run).await.0, StatusCode::CREATED);
+    let (_task_id, run_ids) = world.create(&["PROF-02"]).await;
+    assert_eq!(run_ids.len(), 1);
+    let (status, _, bytes) = browser_post(&world.app, &format!("{base}/PROF-02/delete"), json!({})).await;
+    assert_eq!((status, json_body(&bytes)), (StatusCode::OK, json!({"deleted": false, "archived": true})));
+    // 模块列表、项目用例列表、CSV 导出都隐藏已归档用例，但历史 run 仍可查
+    let (_, _, list_bytes) = request(&world.app, Method::GET, &base, &[], "").await;
+    assert_eq!(json_body(&list_bytes).as_array().unwrap().len(), 0);
+    let (_, _, proj_bytes) = request(&world.app, Method::GET, "/api/projects/hafa/cases", &[], "").await;
+    assert!(!text(&proj_bytes).contains("PROF-02"));
+    let (run_status, _, _) = request(&world.app, Method::GET, &format!("/api/runs/{}", run_ids[0]), &[], "").await;
+    assert_eq!(run_status, StatusCode::OK, "归档用例不能损坏历史执行记录");
+}

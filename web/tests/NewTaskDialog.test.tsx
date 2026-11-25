@@ -2,6 +2,7 @@ import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import NewTaskDialog from "../src/NewTaskDialog";
+import { retryableRunCodes } from "../src/TasksPage";
 import { rememberUserName } from "../src/identity";
 import { rememberReviewToken } from "../src/reviewLogic";
 
@@ -104,4 +105,29 @@ test("节点没上报角色（旧版节点）：回退用配置文件里的角�
   await waitFor(() => expect(posts()).toHaveLength(1));
   expect(JSON.parse(String(posts()[0][1]?.body))).toMatchObject({ executor: { role: "cfg-exec" }, judge: { role: "cfg-judge" } });
   void within;
+});
+
+test("传入 initialNode 且节点在线时自动选中该节点（一键重跑场景）", async () => {
+  serve({ nodeRoles: [nodeRole("e1", "executor", "牛马测试"), nodeRole("j1", "judge", "找茬")] });
+  const user = userEvent.setup();
+  render(<NewTaskDialog onClose={() => {}} initialCases={["TC-1"]} initialNode={NODE} />);
+  // 不手动选节点，直接发起即可带上原节点与预选用例
+  await waitFor(() => expect(screen.getByRole("button", { name: /发起任务/ })).not.toBeDisabled());
+  await user.click(screen.getByRole("button", { name: /发起任务/ }));
+  await waitFor(() => expect(posts()).toHaveLength(1));
+  expect(JSON.parse(String(posts()[0][1]?.body))).toMatchObject({ node_id: NODE, case_codes: ["TC-1"] });
+});
+
+test("任务详情一键重跑筛选：排除通过、进行中和已跳过，保留失败/待确认/受阻/取消且去重", () => {
+  const got = retryableRunCodes([
+    { code: "A", status: "finished", final_result: "passed", blocked_reason: null },
+    { code: "B", status: "finished", final_result: "failed", blocked_reason: null },
+    { code: "B", status: "finished", final_result: "failed", blocked_reason: null },
+    { code: "C", status: "finished", final_result: "uncertain", blocked_reason: null },
+    { code: "D", status: "blocked", final_result: "blocked", blocked_reason: "link" },
+    { code: "E", status: "blocked", final_result: "blocked", blocked_reason: "skipped" },
+    { code: "F", status: "cancelled", final_result: null, blocked_reason: null },
+    { code: "G", status: "running", final_result: null, blocked_reason: null },
+  ]);
+  expect(got).toEqual(["B", "C", "D", "F"]);
 });
