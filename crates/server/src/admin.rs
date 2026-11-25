@@ -73,9 +73,9 @@ pub async fn project_context(pool: &PgPool, project: &str) -> Result<String, sql
     out.push_str("\n\n【模块】\n");
     let modules = sqlx::query(
         "select m.id, m.name,
-                (select count(*) from test_cases c where c.module_id = m.id) as total,
-                (select count(*) from test_cases c where c.module_id = m.id and c.review_status = 'approved') as approved,
-                (select count(*) from test_cases c where c.module_id = m.id and c.review_status = 'needs_human') as needs_human,
+                (select count(*) from test_cases c where c.module_id = m.id and c.status != 'archived') as total,
+                (select count(*) from test_cases c where c.module_id = m.id and c.status != 'archived' and c.review_status = 'approved') as approved,
+                (select count(*) from test_cases c where c.module_id = m.id and c.status != 'archived' and c.review_status = 'needs_human') as needs_human,
                 (select count(*) from runs x join test_cases c on c.id = x.case_id where c.module_id = m.id and x.status in ('queued','assigned','running','judging')) as active
          from modules m join projects p on p.id = m.project_id where p.name = $1 order by m.created_at, m.name",
     )
@@ -95,7 +95,7 @@ pub async fn project_context(pool: &PgPool, project: &str) -> Result<String, sql
             m.get::<i64, _>("needs_human"),
             m.get::<i64, _>("active"),
         ));
-        let approved = sqlx::query("select code, title from test_cases where module_id = $1 and review_status = 'approved' order by code limit 40").bind(id).fetch_all(pool).await?;
+        let approved = sqlx::query("select code, title from test_cases where module_id = $1 and status != 'archived' and review_status = 'approved' order by code limit 40").bind(id).fetch_all(pool).await?;
         for c in &approved {
             out.push_str(&format!("    已批准用例 {}：{}\n", c.get::<String, _>("code"), c.get::<String, _>("title")));
         }
